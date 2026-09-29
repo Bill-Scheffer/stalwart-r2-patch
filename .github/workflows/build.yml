@@ -1,0 +1,128 @@
+# Builds Stalwart from its own release source with ONE change: the rust-s3 crate is taken from
+# the commit of rust-s3 PR #467, which stops DeleteObject signing headers it never sends. Without
+# it, every blob DELETE against Cloudflare R2 fails with SignatureDoesNotMatch (rust-s3 #466,
+# Stalwart #3185). Everything else is upstream: the tag's source, its Dockerfile, its features.
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [".github/workflows/build.yml"]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  # Upstream Stalwart release, pinned by commit: a tag can move, a commit cannot.
+  STALWART_TAG: v0.16.24
+  STALWART_SHA: af37a234981722493b74623a983581691d2b70b6
+  # rust-s3 PR #467 (https://github.com/durch/rust-s3/pull/467): master at 0.37.2 plus one commit.
+  RUSTS3_GIT: https://github.com/Databanx/rust-s3
+  RUSTS3_REV: 505aded53d2e668bad472bd7834019e8b1f7a4dd
+  IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          path: patch
+
+      - name: Check out Stalwart at the pinned release commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          repository: stalwartlabs/stalwart
+          ref: ${{ env.STALWART_SHA }}
+          path: stalwart
+
+      - name: The release tag still names that commit
+        run: |
+          set -eu
+          tagged=$(git ls-remote https://github.com/stalwartlabs/stalwart "refs/tags/${STALWART_TAG}" | cut -f1)
+          echo "tag ${STALWART_TAG} -> ${tagged}"
+          [ "$tagged" = "$STALWART_SHA" ] || { echo "::error::${STALWART_TAG} no longer points at ${STALWART_SHA}"; exit 1; }
+
+      - name: Pin rust-s3 to the PR commit, and prove nothing else moved
+        working-directory: stalwart
+        run: |
+          set -eu
+          printf '\n[patch.crates-io]\nrust-s3 = { git = "%s", rev = "%s" }\n' "$RUSTS3_GIT" "$RUSTS3_REV" >> Cargo.toml
+          # ⛔ Edit rust-s3's lock entry by hand, NEVER `cargo update -p rust-s3`: that re-resolves and
+          # rewires unrelated edges (measured at v0.16.24: quinn's socket2 0.6.5 -> 0.5.10, and a
+          # thiserror 2 -> 1), so the build would differ from upstream in more than the fix.
+          python3 - "$RUSTS3_GIT" "$RUSTS3_REV" <<'PY'
+          import re, sys
+          git, rev = sys.argv[1], sys.argv[2]
+          s = open("Cargo.lock").read()
+          pat = re.compile(r'(\[\[package\]\]\nname = "rust-s3"\nversion = "0\.37\.2"\n)source = "registry\+https://github\.com/rust-lang/crates\.io-index"\nchecksum = "[0-9a-f]+"\n')
+          new, n = pat.subn(lambda m: f'{m.group(1)}source = "git+{git}?rev={rev}#{rev}"\n', s)
+          assert n == 1, f"expected exactly one rust-s3 0.37.2 registry entry, found {n}"
+          open("Cargo.lock", "w").write(new)
+          PY
+          echo "::group::git diff"; git diff; echo "::endgroup::"
+          # The EXACT change set: two files, and in Cargo.lock only rust-s3's source and checksum.
+          [ "$(git diff --name-only | sort | tr '\n' ' ')" = "Cargo.lock Cargo.toml " ] || { echo "::error::unexpected files changed"; exit 1; }
+          got=$(git diff -U0 Cargo.lock | grep -E '^[-+][^-+]' | sed -E 's/^(-checksum = ).*/\1<sum>/')
+          want=$(printf '%s\n' '-source = "registry+https://github.com/rust-lang/crates.io-index"' '-checksum = <sum>' "+source = \"git+${RUSTS3_GIT}?rev=${RUSTS3_REV}#${RUSTS3_REV}\"")
+          [ "$got" = "$want" ] || { echo "::error::Cargo.lock changed beyond rust-s3's source"; echo "$got"; exit 1; }
+          # And cargo accepts it as-is, so the Docker build will not re-resolve anything.
+          cargo metadata --locked --format-version 1 >/dev/null
+          [ "$(git diff --numstat Cargo.lock | cut -f1,2)" = "$(printf '1\t2')" ] || { echo "::error::cargo rewrote Cargo.lock"; exit 1; }
+
+      - name: Swap, as Stalwart's own CI adds for its release build
+        run: |
+          set -eu
+          sudo fallocate -l 16G /mnt/swapfile && sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile
+          free -h
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build with Stalwart's own Dockerfile, and push
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
+        with:
+          context: stalwart
+          file: stalwart/Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: |
+            ${{ env.IMAGE }}:${{ env.STALWART_TAG }}-rusts3-505aded
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.STALWART_TAG }}-rusts3-505aded
+            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with rust-s3 PR 467 (R2 DeleteObject fix)
+            org.opencontainers.image.licenses=AGPL-3.0-only
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: The pushed image runs, and keeps upstream's capability
+        run: |
+          set -eu
+          ref="${IMAGE}@${{ steps.build.outputs.digest }}"
+          docker run --rm "$ref" --help | head -1
+          docker run --rm --entrypoint getcap "$ref" /usr/local/bin/stalwart
+          {
+            echo "### ${IMAGE}"
+            echo "- tag: \`${STALWART_TAG}-rusts3-505aded\`"
+            echo "- digest: \`${{ steps.build.outputs.digest }}\`"
+            echo "- stalwart: \`${STALWART_TAG}\` @ \`${STALWART_SHA}\`"
+            echo "- rust-s3: \`${RUSTS3_REV}\` (PR #467)"
+          } >> "$GITHUB_STEP_SUMMARY"
