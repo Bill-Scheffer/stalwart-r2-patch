@@ -1,0 +1,175 @@
+diff --git a/crates/imap/src/op/acl.rs b/crates/imap/src/op/acl.rs
+index 8dec273..5bbd87d 100644
+--- a/crates/imap/src/op/acl.rs
++++ b/crates/imap/src/op/acl.rs
+@@ -21,10 +21,12 @@ use imap_proto::{
+     },
+     receiver::Request,
+ };
+-use registry::schema::enums::Permission;
++use registry::schema::{enums::Permission, prelude::ObjectType};
+ use std::time::Instant;
+ use store::{
+     ValueKey,
++    registry::RegistryQuery,
++    roaring::RoaringBitmap,
+     write::{AlignedBytes, Archive, BatchBuilder},
+ };
+ use trc::AddContext;
+@@ -286,6 +288,26 @@ impl<T: SessionStream> Session<T> {
+                         .caused_by(trc::location!())
+                 })?;
+ 
++            // A grantee must be in the caller's tenant (as JMAP sharing and DAV require). Outside
++            // it, answer exactly as for an account that does not exist, so it confirms nothing.
++            if !data
++                .server
++                .registry()
++                .query::<RoaringBitmap>(
++                    RegistryQuery::new(ObjectType::Account)
++                        .with_tenant(data.access_token.tenant_id()),
++                )
++                .await
++                .imap_ctx(&arguments.tag, trc::location!())?
++                .contains(acl_account_id)
++            {
++                return Err(trc::ImapEvent::Error
++                    .into_err()
++                    .details("Account does not exist")
++                    .id(arguments.tag.to_string())
++                    .caused_by(trc::location!()));
++            }
++
+             // Prepare changes
+             let mut mailbox = current_mailbox.inner.clone();
+             let (op, rights) = arguments
+diff --git a/crates/jmap/src/addressbook/set.rs b/crates/jmap/src/addressbook/set.rs
+index 9086aa8..4beec60 100644
+--- a/crates/jmap/src/addressbook/set.rs
++++ b/crates/jmap/src/addressbook/set.rs
+@@ -101,7 +101,7 @@ impl AddressBookSet for Server {
+ 
+             // Validate ACLs
+             if !address_book.acls.is_empty() {
+-                if let Err(err) = self.acl_validate(&address_book.acls).await {
++                if let Err(err) = self.acl_validate(&address_book.acls, access_token).await {
+                     response.not_created.append(id, err.into());
+                     continue 'create;
+                 }
+@@ -202,7 +202,7 @@ impl AddressBookSet for Server {
+                 }
+             }
+             if has_acl_changes {
+-                if let Err(err) = self.acl_validate(&new_address_book.acls).await {
++                if let Err(err) = self.acl_validate(&new_address_book.acls, access_token).await {
+                     response.not_updated.append(id, err.into());
+                     continue 'update;
+                 }
+diff --git a/crates/jmap/src/api/acl.rs b/crates/jmap/src/api/acl.rs
+index 2667bf7..5e97550 100644
+--- a/crates/jmap/src/api/acl.rs
++++ b/crates/jmap/src/api/acl.rs
+@@ -230,6 +230,7 @@ pub trait JmapAcl {
+     fn acl_validate(
+         &self,
+         grants: &[AclGrant],
++        access_token: &AccessToken,
+     ) -> impl Future<Output = Result<(), ShareValidationError>> + Send;
+ }
+ 
+@@ -239,7 +240,11 @@ pub enum ShareValidationError {
+ }
+ 
+ impl JmapAcl for Server {
+-    async fn acl_validate(&self, grants: &[AclGrant]) -> Result<(), ShareValidationError> {
++    async fn acl_validate(
++        &self,
++        grants: &[AclGrant],
++        access_token: &AccessToken,
++    ) -> Result<(), ShareValidationError> {
+         if grants.len() > self.core.groupware.max_shares_per_item {
+             return Err(ShareValidationError::MaxSharesExceeded(
+                 self.core.groupware.max_shares_per_item,
+@@ -248,7 +253,11 @@ impl JmapAcl for Server {
+ 
+         let principal_ids = self
+             .registry()
+-            .query::<RoaringBitmap>(RegistryQuery::new(ObjectType::Account))
++            // A grantee must be in the caller's tenant, as DAV sharing and the JMAP directory
++            // already require: without this, any user could share with any account on the server.
++            .query::<RoaringBitmap>(
++                RegistryQuery::new(ObjectType::Account).with_tenant(access_token.tenant_id()),
++            )
+             .await
+             .unwrap_or_default();
+ 
+diff --git a/crates/jmap/src/calendar/set.rs b/crates/jmap/src/calendar/set.rs
+index f41f10b..7829bc4 100644
+--- a/crates/jmap/src/calendar/set.rs
++++ b/crates/jmap/src/calendar/set.rs
+@@ -105,7 +105,7 @@ impl CalendarSet for Server {
+ 
+             // Validate ACLs
+             if !calendar.acls.is_empty() {
+-                if let Err(err) = self.acl_validate(&calendar.acls).await {
++                if let Err(err) = self.acl_validate(&calendar.acls, access_token).await {
+                     response.not_created.append(id, err.into());
+                     continue 'create;
+                 }
+@@ -206,7 +206,7 @@ impl CalendarSet for Server {
+                 }
+             }
+             if has_acl_changes {
+-                if let Err(err) = self.acl_validate(&new_calendar.acls).await {
++                if let Err(err) = self.acl_validate(&new_calendar.acls, access_token).await {
+                     response.not_updated.append(id, err.into());
+                     continue 'update;
+                 }
+diff --git a/crates/jmap/src/file/copy.rs b/crates/jmap/src/file/copy.rs
+index e1dd511..94f3b40 100644
+--- a/crates/jmap/src/file/copy.rs
++++ b/crates/jmap/src/file/copy.rs
+@@ -370,7 +370,7 @@ impl FileNodeCopy for Server {
+             }
+ 
+             if !file_node.acls.is_empty() {
+-                if let Err(err) = self.acl_validate(&file_node.acls).await {
++                if let Err(err) = self.acl_validate(&file_node.acls, access_token).await {
+                     response.not_created.append(id, err.into());
+                     continue 'create;
+                 }
+diff --git a/crates/jmap/src/file/set.rs b/crates/jmap/src/file/set.rs
+index 0b3d282..2d81051 100644
+--- a/crates/jmap/src/file/set.rs
++++ b/crates/jmap/src/file/set.rs
+@@ -270,7 +270,7 @@ impl FileNodeSet for Server {
+ 
+             // Validate ACLs
+             if !file_node.acls.is_empty() {
+-                if let Err(err) = self.acl_validate(&file_node.acls).await {
++                if let Err(err) = self.acl_validate(&file_node.acls, access_token).await {
+                     response.not_created.append(id, err.into());
+                     continue 'create;
+                 }
+@@ -502,7 +502,7 @@ impl FileNodeSet for Server {
+                 }
+             }
+             if has_acl_changes {
+-                if let Err(err) = self.acl_validate(&new_file_node.acls).await {
++                if let Err(err) = self.acl_validate(&new_file_node.acls, access_token).await {
+                     response.not_updated.append(id, err.into());
+                     continue 'update;
+                 }
+diff --git a/crates/jmap/src/mailbox/set.rs b/crates/jmap/src/mailbox/set.rs
+index 430c469..baee264 100644
+--- a/crates/jmap/src/mailbox/set.rs
++++ b/crates/jmap/src/mailbox/set.rs
+@@ -612,7 +612,7 @@ impl MailboxSet for Server {
+         let current = update.map(|(_, current)| current);
+         if has_acl_changes {
+             if !changes.acls.is_empty()
+-                && let Err(err) = self.acl_validate(&changes.acls).await
++                && let Err(err) = self.acl_validate(&changes.acls, ctx.access_token).await
+             {
+                 return Ok(Err(err.into()));
+             }

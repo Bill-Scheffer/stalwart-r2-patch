@@ -1,14 +1,19 @@
-# Builds Stalwart from its own release source with ONE change: the rust-s3 crate is taken from
-# the commit of rust-s3 PR #467, which stops DeleteObject signing headers it never sends. Without
-# it, every blob DELETE against Cloudflare R2 fails with SignatureDoesNotMatch (rust-s3 #466,
-# Stalwart #3185). Everything else is upstream: the tag's source, its Dockerfile, its features.
+# Builds Stalwart from its own release source with TWO changes, each pinned to its exact files:
+# 1. the rust-s3 crate is taken from the commit of rust-s3 PR #467, which stops DeleteObject signing
+#    headers it never sends. Without it, every blob DELETE against Cloudflare R2 fails with
+#    SignatureDoesNotMatch (rust-s3 #466, Stalwart #3185).
+# 2. patches/0002-tenant-scoped-sharing.patch: a JMAP `shareWith` or IMAP `SETACL` may only name an
+#    account in the caller's own tenant, as DAV sharing and the JMAP directory already require.
+#    Upstream v0.16.24 accepts any account on the server, so one customer could share with another.
+#    This is open (AGPL) code, identical with or without an Enterprise licence.
+# Everything else is upstream: the tag's source, its Dockerfile, its features.
 name: build
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths: [".github/workflows/build.yml"]
+    paths: [".github/workflows/build.yml", "patches/**", "scripts/**"]
 
 permissions:
   contents: read
@@ -78,6 +83,19 @@ jobs:
           cargo metadata --locked --format-version 1 >/dev/null
           [ "$(git diff --numstat Cargo.lock | cut -f1,2)" = "$(printf '1\t2')" ] || { echo "::error::cargo rewrote Cargo.lock"; exit 1; }
 
+      - name: Apply the tenant-scoped sharing patch, and prove it changed only its own files
+        working-directory: stalwart
+        run: |
+          set -eu
+          P=../patch/patches/0002-tenant-scoped-sharing.patch
+          git apply --check "$P" && git apply "$P"
+          want="Cargo.lock Cargo.toml crates/imap/src/op/acl.rs crates/jmap/src/addressbook/set.rs crates/jmap/src/api/acl.rs crates/jmap/src/calendar/set.rs crates/jmap/src/file/copy.rs crates/jmap/src/file/set.rs crates/jmap/src/mailbox/set.rs "
+          got=$(git diff --name-only | sort | tr '\n' ' ')
+          [ "$got" = "$want" ] || { echo "::error::changed files: $got"; exit 1; }
+          # The source change is the patch, byte for byte (index lines aside).
+          diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
+            || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
+
       - name: Swap, as Stalwart's own CI adds for its release build
         run: |
           set -eu
@@ -103,12 +121,12 @@ jobs:
           push: true
           provenance: false
           tags: |
-            ${{ env.IMAGE }}:${{ env.STALWART_TAG }}-rusts3-505aded
+            ${{ env.IMAGE }}:${{ env.STALWART_TAG }}-rusts3-505aded-tenantacl1
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ env.STALWART_TAG }}-rusts3-505aded
-            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with rust-s3 PR 467 (R2 DeleteObject fix)
+            org.opencontainers.image.version=${{ env.STALWART_TAG }}-rusts3-505aded-tenantacl1
+            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with rust-s3 PR 467 (R2 DeleteObject fix) and tenant-scoped sharing
             org.opencontainers.image.licenses=AGPL-3.0-only
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -121,8 +139,11 @@ jobs:
           docker run --rm --entrypoint getcap "$ref" /usr/local/bin/stalwart
           {
             echo "### ${IMAGE}"
-            echo "- tag: \`${STALWART_TAG}-rusts3-505aded\`"
+            echo "- tag: \`${STALWART_TAG}-rusts3-505aded-tenantacl1\`"
             echo "- digest: \`${{ steps.build.outputs.digest }}\`"
             echo "- stalwart: \`${STALWART_TAG}\` @ \`${STALWART_SHA}\`"
             echo "- rust-s3: \`${RUSTS3_REV}\` (PR #467)"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Sharing never crosses tenants (end to end, the pushed image)
+        run: bash patch/scripts/e2e-tenant-sharing.sh "${IMAGE}@${{ steps.build.outputs.digest }}"
