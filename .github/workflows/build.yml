@@ -98,7 +98,7 @@ jobs:
           # The source change is the patch, byte for byte (index lines aside).
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
-          # Stage 0002, so the next step's working-tree diff is 0003 alone.
+          # Stage 0002, so the next step's working-tree diff under crates/ is 0003 alone.
           git add -- crates/
 
       - name: Apply the tenant-scoped DAV ACL patch, and prove it changed only its own file
@@ -107,8 +107,10 @@ jobs:
           set -eu
           P=../patch/patches/0003-tenant-scoped-dav-acl.patch
           git apply --check "$P" && git apply "$P"
-          [ "$(git diff --name-only | tr '\n' ' ')" = "crates/dav/src/common/acl.rs " ] \
-            || { echo "::error::changed files: $(git diff --name-only | tr '\n' ' ')"; exit 1; }
+          # Unstaged: rust-s3's two files (never staged) and 0003's one, nothing else.
+          got=$(git diff --name-only | sort | tr '\n' ' ')
+          [ "$got" = "Cargo.lock Cargo.toml crates/dav/src/common/acl.rs " ] \
+            || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
 
