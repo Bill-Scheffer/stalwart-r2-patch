@@ -1,6 +1,6 @@
 # stalwart-r2-patch
 
-[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **two**
+[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **three**
 changes: it can delete blobs from **Cloudflare R2**, and **sharing never crosses tenants**.
 
 ## The problem
@@ -32,8 +32,8 @@ Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded`. 
 On v0.16.24, a user can grant another account access to their mailbox, calendar, address book or
 files, through JMAP `shareWith` or IMAP `SETACL`, and Stalwart checks only that the grantee
 exists somewhere on the server. With one tenant per customer, that lets a user share with a
-different customer. DAV sharing and the JMAP directory (`Principal/query`, `Principal/get`)
-already limit everything to the caller's tenant; these two paths did not. This is the open
+different customer. The JMAP directory (`Principal/query`, `Principal/get`) already limits
+everything to the caller's tenant; these two paths did not. This is the open
 (AGPL) code, identical with or without an Enterprise licence.
 
 [`patches/0002-tenant-scoped-sharing.patch`](patches/0002-tenant-scoped-sharing.patch) applies the
@@ -47,7 +47,19 @@ tenants and asserts both directions: across tenants, JMAP and IMAP sharing is re
 refusal is identical to an unknown account's); within a tenant, both still work. Against upstream
 v0.16.24 the cross-tenant checks FAIL (measured), which is what makes the test worth having.
 
-Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl1`.
+## The third change: WebDAV sharing stays inside a tenant too
+
+The second change assumed DAV sharing was already tenant-scoped. It is not: a WebDAV `ACL` request
+on a calendar, address book or file folder resolves the grantee by name and checks no tenant (the
+principal check in `crates/dav/src/common/acl.rs` is commented out upstream). Measured on the
+`-tenantacl1` image: the grant to another tenant's user is stored, and that user can then read the
+collection. [`patches/0003-tenant-scoped-dav-acl.patch`](patches/0003-tenant-scoped-dav-acl.patch)
+applies the same tenant filter there, refusing as for a principal that does not exist. The workflow
+applies it after 0002 and fails unless it changed only that one file, byte for byte. The end-to-end
+script asserts both directions for all three collection types; against `-tenantacl1` its nine
+cross-tenant DAV checks FAIL (measured).
+
+Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2`.
 
 ## When this goes away
 

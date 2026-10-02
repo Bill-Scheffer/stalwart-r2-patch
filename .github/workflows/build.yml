@@ -1,11 +1,14 @@
-# Builds Stalwart from its own release source with TWO changes, each pinned to its exact files:
+# Builds Stalwart from its own release source with THREE changes, each pinned to its exact files:
 # 1. the rust-s3 crate is taken from the commit of rust-s3 PR #467, which stops DeleteObject signing
 #    headers it never sends. Without it, every blob DELETE against Cloudflare R2 fails with
 #    SignatureDoesNotMatch (rust-s3 #466, Stalwart #3185).
 # 2. patches/0002-tenant-scoped-sharing.patch: a JMAP `shareWith` or IMAP `SETACL` may only name an
-#    account in the caller's own tenant, as DAV sharing and the JMAP directory already require.
+#    account in the caller's own tenant, as the JMAP directory already requires.
 #    Upstream v0.16.24 accepts any account on the server, so one customer could share with another.
 #    This is open (AGPL) code, identical with or without an Enterprise licence.
+# 3. patches/0003-tenant-scoped-dav-acl.patch: the same rule for a WebDAV `ACL` request (calendars,
+#    address books, file folders). Upstream resolves the grantee by name and checks no tenant (its
+#    principal check is commented out), which 0002 wrongly assumed it did.
 # Everything else is upstream: the tag's source, its Dockerfile, its features.
 name: build
 
@@ -95,6 +98,19 @@ jobs:
           # The source change is the patch, byte for byte (index lines aside).
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
+          # Stage 0002, so the next step's working-tree diff is 0003 alone.
+          git add -- crates/
+
+      - name: Apply the tenant-scoped DAV ACL patch, and prove it changed only its own file
+        working-directory: stalwart
+        run: |
+          set -eu
+          P=../patch/patches/0003-tenant-scoped-dav-acl.patch
+          git apply --check "$P" && git apply "$P"
+          [ "$(git diff --name-only | tr '\n' ' ')" = "crates/dav/src/common/acl.rs " ] \
+            || { echo "::error::changed files: $(git diff --name-only | tr '\n' ' ')"; exit 1; }
+          diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
+            || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
 
       - name: Swap, as Stalwart's own CI adds for its release build
         run: |
@@ -121,12 +137,12 @@ jobs:
           push: true
           provenance: false
           tags: |
-            ${{ env.IMAGE }}:${{ env.STALWART_TAG }}-rusts3-505aded-tenantacl1
+            ${{ env.IMAGE }}:${{ env.STALWART_TAG }}-rusts3-505aded-tenantacl2
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ env.STALWART_TAG }}-rusts3-505aded-tenantacl1
-            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with rust-s3 PR 467 (R2 DeleteObject fix) and tenant-scoped sharing
+            org.opencontainers.image.version=${{ env.STALWART_TAG }}-rusts3-505aded-tenantacl2
+            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with rust-s3 PR 467 (R2 DeleteObject fix) and tenant-scoped sharing (JMAP, IMAP, WebDAV)
             org.opencontainers.image.licenses=AGPL-3.0-only
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -139,7 +155,7 @@ jobs:
           docker run --rm --entrypoint getcap "$ref" /usr/local/bin/stalwart
           {
             echo "### ${IMAGE}"
-            echo "- tag: \`${STALWART_TAG}-rusts3-505aded-tenantacl1\`"
+            echo "- tag: \`${STALWART_TAG}-rusts3-505aded-tenantacl2\`"
             echo "- digest: \`${{ steps.build.outputs.digest }}\`"
             echo "- stalwart: \`${STALWART_TAG}\` @ \`${STALWART_SHA}\`"
             echo "- rust-s3: \`${RUSTS3_REV}\` (PR #467)"

@@ -2,10 +2,10 @@
 # End-to-end: sharing never crosses tenants. usage: e2e-tenant-sharing.sh <stalwart image>
 #
 # Two tenants stand in for two customers: alice@one.test (tenant one) and bob@two.test (tenant two),
-# plus carol@one.test beside alice. Upstream v0.16.24 accepts a JMAP `shareWith` and an IMAP `SETACL`
-# naming an account in ANOTHER tenant (DAV and the JMAP directory already refuse that). The patch
-# makes both refuse it, answering as for an account that does not exist, and leaves sharing inside
-# a tenant working. Every assertion runs in both directions: refused across tenants, allowed within.
+# plus carol@one.test beside alice. Upstream v0.16.24 accepts a JMAP `shareWith`, an IMAP `SETACL`
+# and a WebDAV `ACL` (calendar, address book, file folder) naming an account in ANOTHER tenant (the
+# JMAP directory already refuses that). The patches make all three refuse it, answering as for an
+# account that does not exist, and leave sharing inside a tenant working. Every assertion runs in both directions: refused across tenants, allowed within.
 set -euo pipefail
 IMG=${1:?usage: $0 <stalwart image>}
 CLI=stalwartlabs/cli:1.0.13
@@ -63,5 +63,20 @@ check(t!="OK" and str(d)==str(d2), "IMAP: the refusal is the same as for an acco
 t,d=M._simple_command("SETACL","Drafts","carol@one.test","lr")
 check(t=="OK", f"IMAP: SETACL Drafts carol@one.test allowed ({t})")
 M.logout()
+def dav(method,path,a,body=None,depth=None):
+    h={"Authorization":a,"Content-Type":"application/xml"}
+    if depth is not None: h["Depth"]=depth
+    try:
+        with urllib.request.urlopen(urllib.request.Request(B+path,data=body,method=method,headers=h)) as x: return x.status,x.read()
+    except urllib.error.HTTPError as e: return e.code,e.read()
+acl=lambda who: f'<?xml version="1.0"?><D:acl xmlns:D="DAV:"><D:ace><D:principal><D:href>/dav/pal/{who}/</D:href></D:principal><D:grant><D:privilege><D:read/></D:privilege></D:grant></D:ace></D:acl>'.encode()
+check(dav("MKCOL","/dav/file/alice%40one.test/shared/",aa)[0]==201, "DAV: alice creates a file folder")
+for coll in ["/dav/cal/alice%40one.test/default/","/dav/card/alice%40one.test/default/","/dav/file/alice%40one.test/shared/"]:
+    s,b=dav("ACL",coll,aa,acl("bob%40two.test")); s2,b2=dav("ACL",coll,aa,acl("nobody%40two.test"))
+    check(s==403, f"DAV: ACL on {coll} naming bob (another tenant) refused ({s})")
+    check((s,b)==(s2,b2), f"DAV: on {coll} the refusal is the same as for a principal that does not exist")
+    check(dav("PROPFIND",coll,ab,depth="1")[0]==403, f"DAV: bob still cannot read {coll}")
+    check(dav("ACL",coll,aa,acl("carol%40one.test"))[0]==200, f"DAV: ACL on {coll} naming carol (same tenant) allowed")
+    check(dav("PROPFIND",coll,ac,depth="1")[0]==207, f"DAV: carol can then read {coll}")
 print("RESULT", "fail" if fails else "pass", len(fails)); sys.exit(1 if fails else 0)
 PY
