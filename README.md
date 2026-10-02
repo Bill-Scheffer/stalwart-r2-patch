@@ -42,7 +42,7 @@ as an account that does not exist, so it confirms nothing. The workflow applies 
 rust-s3 step and fails unless the changed files are exactly rust-s3's two plus the patch's seven,
 and the source diff is the patch, byte for byte.
 
-[`scripts/e2e-tenant-sharing.sh`](scripts/e2e-tenant-sharing.sh) runs the pushed image with two
+[`scripts/e2e-tenant-sharing.sh`](scripts/e2e-tenant-sharing.sh) runs the built image (pushed only after every check passes) with two
 tenants and asserts both directions: across tenants, JMAP and IMAP sharing is refused (the IMAP
 refusal is identical to an unknown account's); within a tenant, both still work. Against upstream
 v0.16.24 the cross-tenant checks FAIL (measured), which is what makes the test worth having.
@@ -72,7 +72,7 @@ replace a copied file's content with a caller's blob) stream each file to it bef
 storing, and refuse it if infected (WebDAV 422, so a client can tell it from a permission 403; JMAP `forbidden`) or if it could not be scanned
 (WebDAV 503, JMAP `forbidden`): fail closed, as the milter is. Unset, nothing is scanned. JMAP also
 gets WebDAV's file-size cap (`tooLarge`). Infected and unscanned refusals log as milter events.
-[`scripts/e2e-file-scan.sh`](scripts/e2e-file-scan.sh) runs the pushed image beside a real clamd:
+[`scripts/e2e-file-scan.sh`](scripts/e2e-file-scan.sh) runs the built image beside a real clamd:
 clean files stored (one of exactly 25 MiB too, so clamd's stream limit cannot refuse a legitimate file;
 MainThrive's clamd allows 100 MiB), EICAR refused and absent on both paths, one byte over the cap refused
 as too large on both, an EICAR replacement blob refused by `FileNode/copy`, and with clamd stopped,

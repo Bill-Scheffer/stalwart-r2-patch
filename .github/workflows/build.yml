@@ -168,14 +168,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build with Stalwart's own Dockerfile, and push
-        id: build
+      - name: Build with Stalwart's own Dockerfile (loaded locally, not pushed yet)
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
         with:
           context: stalwart
           file: stalwart/Dockerfile
           platforms: linux/amd64
-          push: true
+          load: true
+          push: false
           provenance: false
           tags: |
             ${{ env.IMAGE }}:${{ env.STALWART_TAG }}-${{ env.VARIANT }}
@@ -188,22 +188,31 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: The pushed image runs, and keeps upstream's capability
+      # ⛔ Every check runs on the LOCAL image and the push comes last, so a failing build publishes
+      # nothing under the tag (MAI-263 DEFERRED E23: run 36992985168 pushed an image, then failed).
+      - name: The built image runs, and keeps upstream's capability
         run: |
           set -eu
-          ref="${IMAGE}@${{ steps.build.outputs.digest }}"
+          ref="${IMAGE}:${STALWART_TAG}-${VARIANT}"
           docker run --rm "$ref" --help | head -1
           docker run --rm --entrypoint getcap "$ref" /usr/local/bin/stalwart
+
+      - name: Sharing never crosses tenants (end to end, the built image)
+        run: bash patch/scripts/e2e-tenant-sharing.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
+
+      - name: Every stored file and every message written into a mailbox is scanned (end to end, a real clamd)
+        run: bash patch/scripts/e2e-file-scan.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
+
+      - name: Push, only after every check passed
+        run: |
+          set -eu
+          docker push "${IMAGE}:${STALWART_TAG}-${VARIANT}"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "${IMAGE}:${STALWART_TAG}-${VARIANT}")
+          echo "pushed ${digest}"
           {
             echo "### ${IMAGE}"
             echo "- tag: \`${STALWART_TAG}-${VARIANT}\`"
-            echo "- digest: \`${{ steps.build.outputs.digest }}\`"
+            echo "- digest: \`${digest#*@}\`"
             echo "- stalwart: \`${STALWART_TAG}\` @ \`${STALWART_SHA}\`"
             echo "- rust-s3: \`${RUSTS3_REV}\` (PR #467)"
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Sharing never crosses tenants (end to end, the pushed image)
-        run: bash patch/scripts/e2e-tenant-sharing.sh "${IMAGE}@${{ steps.build.outputs.digest }}"
-
-      - name: Every stored file and every message written into a mailbox is scanned (end to end, a real clamd)
-        run: bash patch/scripts/e2e-file-scan.sh "${IMAGE}@${{ steps.build.outputs.digest }}"
