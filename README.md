@@ -72,8 +72,10 @@ storing, and refuse it if infected (WebDAV 403, JMAP `forbidden`) or if it could
 (WebDAV 503, JMAP `forbidden`): fail closed, as the milter is. Unset, nothing is scanned. JMAP also
 gets WebDAV's file-size cap (`tooLarge`). Infected and unscanned refusals log as milter events.
 [`scripts/e2e-file-scan.sh`](scripts/e2e-file-scan.sh) runs the pushed image beside a real clamd:
-clean files stored, EICAR refused and absent on both paths, the 30 MiB JMAP file refused, and with
-clamd stopped, uploads refused. Against `-tenantacl2` its seven checks FAIL (measured).
+clean files stored (one of exactly 25 MiB too, so clamd's stream limit cannot refuse a legitimate file;
+MainThrive's clamd allows 100 MiB), EICAR refused and absent on both paths, one byte over the cap refused
+as too large on both, and with clamd stopped, uploads refused. Against `-tenantacl2` its seven checks
+FAIL (measured).
 
 Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan1`.
 
