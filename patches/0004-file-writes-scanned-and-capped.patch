@@ -193,7 +193,7 @@ index 94f3b40..e2ce688 100644
                              } else {
                                  response.not_created.append(
 diff --git a/crates/jmap/src/file/set.rs b/crates/jmap/src/file/set.rs
-index 2d81051..5d4c979 100644
+index 2d81051..b487e3b 100644
 --- a/crates/jmap/src/file/set.rs
 +++ b/crates/jmap/src/file/set.rs
 @@ -109,6 +109,12 @@ impl FileNodeSet for Server {
@@ -222,7 +222,7 @@ index 2d81051..5d4c979 100644
                                  file_details.size = blob_contents.len() as u32;
                              } else {
                                  response.not_updated.append(
-@@ -660,6 +672,30 @@ impl ResolveCreatedReference<FileNodeProperty, FileNodeValue> for NoResolver {
+@@ -660,6 +672,36 @@ impl ResolveCreatedReference<FileNodeProperty, FileNodeValue> for NoResolver {
      }
  }
  
@@ -235,8 +235,14 @@ index 2d81051..5d4c979 100644
 +) -> Option<SetError<FileNodeProperty>> {
 +    let max = server.core.groupware.max_file_size;
 +    if contents.len() > max {
++        // Readable as a client shows it ("25 MB"), since webmail displays this text as-is.
++        let limit = if max % (1024 * 1024) == 0 {
++            format!("{} MB", max / (1024 * 1024))
++        } else {
++            format!("{max} byte")
++        };
 +        return Some(SetError::too_large().with_description(format!(
-+            "File is larger than the {max} byte limit."
++            "The file is larger than the {limit} limit."
 +        )));
 +    }
 +    match common::file_scan::scan_file(account_id, contents).await {
