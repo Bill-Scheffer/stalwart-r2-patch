@@ -10,7 +10,7 @@
 #    address books, file folders). Upstream resolves the grantee by name and checks no tenant (its
 #    principal check is commented out), which 0002 wrongly assumed it did.
 # 4. patches/0004-file-writes-scanned-and-capped.patch: every file stored through WebDAV PUT or JMAP
-#    FileNode/set is streamed to clamd (STALWART_FILE_SCAN_CLAMD) first and refused if infected, or
+#    FileNode/set or FileNode/copy (a replacement blobId) is streamed to clamd (STALWART_FILE_SCAN_CLAMD) first and refused if infected, or
 #    if it could not be scanned (fail closed); and JMAP gets the file-size cap WebDAV already has.
 #    Upstream scans mail (the milter) but never files, and JMAP checked no file size (both measured).
 # Everything else is upstream: the tag's source, its Dockerfile, its features.
@@ -38,6 +38,8 @@ env:
   RUSTS3_GIT: https://github.com/Databanx/rust-s3
   RUSTS3_REV: 505aded53d2e668bad472bd7834019e8b1f7a4dd
   IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch
+  # The tag after the Stalwart release: bump it with any change to what is built.
+  VARIANT: rusts3-505aded-tenantacl2-filescan2
 
 jobs:
   build:
@@ -129,7 +131,7 @@ jobs:
           # Its one new file is untracked until marked, and the diff below must see it.
           git add -N -- crates/common/src/file_scan.rs
           got=$(git diff --name-only | sort | tr '\n' ' ')
-          [ "$got" = "Cargo.lock Cargo.toml crates/common/src/file_scan.rs crates/common/src/lib.rs crates/dav/src/file/update.rs crates/jmap/src/file/set.rs " ] \
+          [ "$got" = "Cargo.lock Cargo.toml crates/common/src/file_scan.rs crates/common/src/lib.rs crates/dav/src/file/update.rs crates/jmap/src/file/copy.rs crates/jmap/src/file/set.rs " ] \
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
@@ -159,11 +161,11 @@ jobs:
           push: true
           provenance: false
           tags: |
-            ${{ env.IMAGE }}:${{ env.STALWART_TAG }}-rusts3-505aded-tenantacl2-filescan1
+            ${{ env.IMAGE }}:${{ env.STALWART_TAG }}-${{ env.VARIANT }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ env.STALWART_TAG }}-rusts3-505aded-tenantacl2-filescan1
+            org.opencontainers.image.version=${{ env.STALWART_TAG }}-${{ env.VARIANT }}
             org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with rust-s3 PR 467 (R2 DeleteObject fix) tenant-scoped sharing (JMAP, IMAP, WebDAV), and scanned, capped file writes
             org.opencontainers.image.licenses=AGPL-3.0-only
           cache-from: type=gha
@@ -177,7 +179,7 @@ jobs:
           docker run --rm --entrypoint getcap "$ref" /usr/local/bin/stalwart
           {
             echo "### ${IMAGE}"
-            echo "- tag: \`${STALWART_TAG}-rusts3-505aded-tenantacl2-filescan1\`"
+            echo "- tag: \`${STALWART_TAG}-${VARIANT}\`"
             echo "- digest: \`${{ steps.build.outputs.digest }}\`"
             echo "- stalwart: \`${STALWART_TAG}\` @ \`${STALWART_SHA}\`"
             echo "- rust-s3: \`${RUSTS3_REV}\` (PR #467)"

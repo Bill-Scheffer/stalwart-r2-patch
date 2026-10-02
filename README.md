@@ -67,17 +67,19 @@ ClamAV attached as a milter (measured). And JMAP `FileNode/set` checks no file s
 JMAP client could store past the cap WebDAV enforces (measured: 30 MiB stored against 25 MiB).
 [`patches/0004-file-writes-scanned-and-capped.patch`](patches/0004-file-writes-scanned-and-capped.patch)
 adds a small clamd client (`crates/common/src/file_scan.rs`, `INSTREAM`): when
-`STALWART_FILE_SCAN_CLAMD` names a clamd (`host:port`), both paths stream each file to it before
+`STALWART_FILE_SCAN_CLAMD` names a clamd (`host:port`), both paths (and JMAP `FileNode/copy`, which can
+replace a copied file's content with a caller's blob) stream each file to it before
 storing, and refuse it if infected (WebDAV 403, JMAP `forbidden`) or if it could not be scanned
 (WebDAV 503, JMAP `forbidden`): fail closed, as the milter is. Unset, nothing is scanned. JMAP also
 gets WebDAV's file-size cap (`tooLarge`). Infected and unscanned refusals log as milter events.
 [`scripts/e2e-file-scan.sh`](scripts/e2e-file-scan.sh) runs the pushed image beside a real clamd:
 clean files stored (one of exactly 25 MiB too, so clamd's stream limit cannot refuse a legitimate file;
 MainThrive's clamd allows 100 MiB), EICAR refused and absent on both paths, one byte over the cap refused
-as too large on both, and with clamd stopped, uploads refused. Against `-tenantacl2` its seven checks
-FAIL (measured).
+as too large on both, an EICAR replacement blob refused by `FileNode/copy`, and with clamd stopped,
+uploads refused. Against `-tenantacl2` eight checks FAIL; against the first `-filescan1` build, which
+missed `FileNode/copy`, that one check FAILs (both measured).
 
-Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan1`.
+Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan2`.
 
 ## When this goes away
 

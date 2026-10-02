@@ -1,5 +1,5 @@
 diff --git a/crates/dav/src/common/acl.rs b/crates/dav/src/common/acl.rs
-index b3a5c79..7c633c7 100644
+index b3a5c79..ac9d9ca 100644
 --- a/crates/dav/src/common/acl.rs
 +++ b/crates/dav/src/common/acl.rs
 @@ -27,7 +27,10 @@ use store::{
@@ -14,36 +14,29 @@ index b3a5c79..7c633c7 100644
  use trc::AddContext;
  use types::{
      acl::{Acl, AclGrant, ArchivedAclGrant},
-@@ -293,6 +296,7 @@ impl DavAclHandler for Server {
+@@ -293,6 +296,15 @@ impl DavAclHandler for Server {
          collection: Collection,
      ) -> crate::Result<Vec<AclGrant>> {
          let mut grants = Vec::with_capacity(acl.aces.len());
-+        let mut tenant_accounts: Option<RoaringBitmap> = None;
++        // A grantee must be in the caller's tenant (as JMAP sharing and IMAP SETACL require). Upstream
++        // checks no tenant here, so one customer could share with another.
++        let tenant_accounts = self
++            .registry()
++            .query::<RoaringBitmap>(
++                RegistryQuery::new(ObjectType::Account).with_tenant(access_token.tenant_id()),
++            )
++            .await
++            .caused_by(trc::location!())?;
          for ace in acl.aces {
              if ace.invert {
                  return Err(DavError::Condition(DavErrorCondition::new(
-@@ -423,6 +427,30 @@ impl DavAclHandler for Server {
+@@ -423,6 +435,15 @@ impl DavAclHandler for Server {
                      ))
                  })?;
  
-+            // A grantee must be in the caller's tenant (as JMAP sharing and IMAP SETACL require).
-+            // Outside it, refuse exactly as for a principal that does not exist, so it confirms
-+            // nothing. Upstream checks no tenant here, so one customer could share with another.
-+            if tenant_accounts.is_none() {
-+                tenant_accounts = Some(
-+                    self.registry()
-+                        .query::<RoaringBitmap>(
-+                            RegistryQuery::new(ObjectType::Account)
-+                                .with_tenant(access_token.tenant_id()),
-+                        )
-+                        .await
-+                        .caused_by(trc::location!())?,
-+                );
-+            }
-+            if !tenant_accounts
-+                .as_ref()
-+                .is_some_and(|ids| ids.contains(principal_id))
-+            {
++            // Outside the caller's tenant: refuse exactly as for a principal that does not exist, so
++            // it confirms nothing.
++            if !tenant_accounts.contains(principal_id) {
 +                return Err(DavError::Condition(DavErrorCondition::new(
 +                    StatusCode::FORBIDDEN,
 +                    BaseCondition::AllowedPrincipal,

@@ -1,9 +1,9 @@
 diff --git a/crates/common/src/file_scan.rs b/crates/common/src/file_scan.rs
 new file mode 100644
-index 0000000..d03faba
+index 0000000..b13a49e
 --- /dev/null
 +++ b/crates/common/src/file_scan.rs
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,116 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 MainThrive
 + *
@@ -11,9 +11,9 @@ index 0000000..d03faba
 + */
 +
 +//! Antivirus for stored files. When `STALWART_FILE_SCAN_CLAMD` names a clamd (`host:port`), every file
-+//! written through WebDAV or JMAP `FileNode/set` is streamed to it (`INSTREAM`) before it is stored,
-+//! the way the milter scans mail. It fails closed: a file that could not be scanned is refused. Unset,
-+//! nothing is scanned (upstream's behaviour).
++//! written through WebDAV or JMAP `FileNode/set`/`FileNode/copy` is streamed to it (`INSTREAM`) before
++//! it is stored, the way the milter scans mail. It fails closed: a file that could not be scanned is
++//! refused. Unset, nothing is scanned (upstream's behaviour). Refusals log as milter events.
 +
 +use std::{sync::OnceLock, time::Duration};
 +use tokio::{
@@ -21,13 +21,18 @@ index 0000000..d03faba
 +    net::TcpStream,
 +};
 +
-+pub enum FileScan {
++pub enum FileRefusal {
++    Infected,
++    Unscanned,
++}
++
++enum Verdict {
 +    Clean,
 +    Infected(String),
 +    Failed(String),
 +}
 +
-+const CHUNK: usize = 64 * 1024;
++const CHUNK: usize = 1024 * 1024;
 +const TIMEOUT: Duration = Duration::from_secs(60);
 +
 +fn clamd() -> Option<&'static str> {
@@ -40,14 +45,35 @@ index 0000000..d03faba
 +    .as_deref()
 +}
 +
-+pub async fn scan_file(contents: &[u8]) -> FileScan {
++pub async fn scan_file(account_id: u32, contents: &[u8]) -> Result<(), FileRefusal> {
 +    let Some(addr) = clamd() else {
-+        return FileScan::Clean;
++        return Ok(());
 +    };
-+    match tokio::time::timeout(TIMEOUT, instream(addr, contents)).await {
++    let verdict = match tokio::time::timeout(TIMEOUT, instream(addr, contents)).await {
 +        Ok(Ok(reply)) => verdict(&reply),
-+        Ok(Err(err)) => FileScan::Failed(format!("clamd {addr}: {err}")),
-+        Err(_) => FileScan::Failed(format!("clamd {addr}: timed out")),
++        Ok(Err(err)) => Verdict::Failed(format!("clamd {addr}: {err}")),
++        Err(_) => Verdict::Failed(format!("clamd {addr}: timed out")),
++    };
++    match verdict {
++        Verdict::Clean => Ok(()),
++        Verdict::Infected(signature) => {
++            trc::event!(
++                Milter(trc::MilterEvent::ActionReject),
++                AccountId = account_id,
++                Details = "file scan: infected",
++                Reason = signature,
++            );
++            Err(FileRefusal::Infected)
++        }
++        Verdict::Failed(reason) => {
++            trc::event!(
++                Milter(trc::MilterEvent::ActionConnectionFailure),
++                AccountId = account_id,
++                Details = "file scan: not scanned",
++                Reason = reason,
++            );
++            Err(FileRefusal::Unscanned)
++        }
 +    }
 +}
 +
@@ -67,31 +93,31 @@ index 0000000..d03faba
 +}
 +
 +/// clamd answers `stream: OK`, `stream: <signature> FOUND`, or `<message> ERROR`.
-+fn verdict(reply: &str) -> FileScan {
++fn verdict(reply: &str) -> Verdict {
 +    match reply.strip_prefix("stream: ") {
-+        Some("OK") => FileScan::Clean,
++        Some("OK") => Verdict::Clean,
 +        Some(found) if found.ends_with(" FOUND") => {
-+            FileScan::Infected(found.trim_end_matches(" FOUND").to_string())
++            Verdict::Infected(found.trim_end_matches(" FOUND").to_string())
 +        }
-+        _ => FileScan::Failed(format!("clamd answered {reply:?}")),
++        _ => Verdict::Failed(format!("clamd answered {reply:?}")),
 +    }
 +}
 +
 +#[cfg(test)]
 +mod tests {
-+    use super::{FileScan, verdict};
++    use super::{Verdict, verdict};
 +
 +    #[test]
 +    fn reads_each_clamd_answer() {
-+        assert!(matches!(verdict("stream: OK"), FileScan::Clean));
++        assert!(matches!(verdict("stream: OK"), Verdict::Clean));
 +        assert!(
-+            matches!(verdict("stream: Eicar-Test-Signature FOUND"), FileScan::Infected(name) if name == "Eicar-Test-Signature")
++            matches!(verdict("stream: Eicar-Test-Signature FOUND"), Verdict::Infected(name) if name == "Eicar-Test-Signature")
 +        );
 +        assert!(matches!(
 +            verdict("INSTREAM size limit exceeded. ERROR"),
-+            FileScan::Failed(_)
++            Verdict::Failed(_)
 +        ));
-+        assert!(matches!(verdict(""), FileScan::Failed(_)));
++        assert!(matches!(verdict(""), Verdict::Failed(_)));
 +    }
 +}
 diff --git a/crates/common/src/lib.rs b/crates/common/src/lib.rs
@@ -107,73 +133,104 @@ index a481877..100ac23 100644
  pub mod ipc;
  pub mod manager;
 diff --git a/crates/dav/src/file/update.rs b/crates/dav/src/file/update.rs
-index 85fffe9..9b73cb2 100644
+index 85fffe9..1afbf2f 100644
 --- a/crates/dav/src/file/update.rs
 +++ b/crates/dav/src/file/update.rs
-@@ -76,6 +76,29 @@ impl FileUpdateRequestHandler for Server {
-             return Err(DavError::Code(StatusCode::PAYLOAD_TOO_LARGE));
-         }
+@@ -170,6 +170,8 @@ impl FileUpdateRequestHandler for Server {
+                     .await?;
+             }
  
-+        // Antivirus (common::file_scan): refuse a file that is infected or could not be scanned.
-+        match common::file_scan::scan_file(&bytes).await {
-+            common::file_scan::FileScan::Clean => {}
-+            common::file_scan::FileScan::Infected(signature) => {
-+                trc::event!(
-+                    Milter(trc::MilterEvent::ActionReject),
-+                    AccountId = account_id,
-+                    Details = "file scan: infected",
-+                    Reason = signature,
-+                );
-+                return Err(DavError::Code(StatusCode::FORBIDDEN));
-+            }
-+            common::file_scan::FileScan::Failed(reason) => {
-+                trc::event!(
-+                    Milter(trc::MilterEvent::ActionConnectionFailure),
-+                    AccountId = account_id,
-+                    Details = "file scan: not scanned",
-+                    Reason = reason,
-+                );
-+                return Err(DavError::Code(StatusCode::SERVICE_UNAVAILABLE));
-+            }
-+        }
++            scanned(account_id, &bytes).await?;
 +
-         if let Some(document_id) = resources
-             .by_path(resource_name.as_ref())
-             .map(|r| r.document_id())
-diff --git a/crates/jmap/src/file/set.rs b/crates/jmap/src/file/set.rs
-index 2d81051..5f95215 100644
---- a/crates/jmap/src/file/set.rs
-+++ b/crates/jmap/src/file/set.rs
-@@ -109,6 +109,10 @@ impl FileNodeSet for Server {
+             // Write blob
+             let (blob_hash, blob_hold) = self
+                 .put_temporary_blob(account_id, &bytes, 60)
+@@ -250,6 +252,8 @@ impl FileUpdateRequestHandler for Server {
+                 .await?;
+             }
+ 
++            scanned(account_id, &bytes).await?;
++
+             // Write blob
+             let (blob_hash, blob_hold) = self
+                 .put_temporary_blob(account_id, &bytes, 60)
+@@ -303,3 +307,16 @@ impl FileUpdateRequestHandler for Server {
+         }
+     }
+ }
++
++/// Antivirus (common::file_scan), run after every cheaper check: refuse what is infected (403) or
++/// could not be scanned (503).
++async fn scanned(account_id: u32, bytes: &[u8]) -> crate::Result<()> {
++    common::file_scan::scan_file(account_id, bytes)
++        .await
++        .map_err(|refusal| {
++            DavError::Code(match refusal {
++                common::file_scan::FileRefusal::Infected => StatusCode::FORBIDDEN,
++                common::file_scan::FileRefusal::Unscanned => StatusCode::SERVICE_UNAVAILABLE,
++            })
++        })
++}
+diff --git a/crates/jmap/src/file/copy.rs b/crates/jmap/src/file/copy.rs
+index 94f3b40..e2ce688 100644
+--- a/crates/jmap/src/file/copy.rs
++++ b/crates/jmap/src/file/copy.rs
+@@ -189,6 +189,16 @@ impl FileNodeCopy for Server {
                                  .get_blob(blob_id.hash.as_slice(), 0..usize::MAX)
                                  .await?
                              {
-+                                if let Some(err) = file_write_refusal(self, &blob_contents).await {
++                                if let Some(err) = super::set::file_write_refusal(
++                                    self,
++                                    account_id,
++                                    &blob_contents,
++                                )
++                                .await
++                                {
 +                                    response.not_created.append(id, err);
 +                                    continue 'create;
 +                                }
                                  file_details.size = blob_contents.len() as u32;
                              } else {
                                  response.not_created.append(
-@@ -371,6 +375,10 @@ impl FileNodeSet for Server {
+diff --git a/crates/jmap/src/file/set.rs b/crates/jmap/src/file/set.rs
+index 2d81051..5d4c979 100644
+--- a/crates/jmap/src/file/set.rs
++++ b/crates/jmap/src/file/set.rs
+@@ -109,6 +109,12 @@ impl FileNodeSet for Server {
                                  .get_blob(blob_id.hash.as_slice(), 0..usize::MAX)
                                  .await?
                              {
-+                                if let Some(err) = file_write_refusal(self, &blob_contents).await {
++                                if let Some(err) =
++                                    file_write_refusal(self, account_id, &blob_contents).await
++                                {
++                                    response.not_created.append(id, err);
++                                    continue 'create;
++                                }
+                                 file_details.size = blob_contents.len() as u32;
+                             } else {
+                                 response.not_created.append(
+@@ -371,6 +377,12 @@ impl FileNodeSet for Server {
+                                 .get_blob(blob_id.hash.as_slice(), 0..usize::MAX)
+                                 .await?
+                             {
++                                if let Some(err) =
++                                    file_write_refusal(self, account_id, &blob_contents).await
++                                {
 +                                    response.not_updated.append(id, err);
 +                                    continue 'update;
 +                                }
                                  file_details.size = blob_contents.len() as u32;
                              } else {
                                  response.not_updated.append(
-@@ -660,6 +668,41 @@ impl ResolveCreatedReference<FileNodeProperty, FileNodeValue> for NoResolver {
+@@ -660,6 +672,30 @@ impl ResolveCreatedReference<FileNodeProperty, FileNodeValue> for NoResolver {
      }
  }
  
-+/// The checks every stored file gets (WebDAV applies the same in crates/dav/src/file/update.rs):
-+/// the groupware file-size cap, which upstream JMAP did not apply, and antivirus.
-+async fn file_write_refusal(
++/// The checks every stored file gets (WebDAV applies the same in crates/dav/src/file/update.rs): the
++/// groupware file-size cap, which upstream JMAP did not apply, and antivirus (common::file_scan).
++pub(super) async fn file_write_refusal(
 +    server: &Server,
++    account_id: u32,
 +    contents: &[u8],
 +) -> Option<SetError<FileNodeProperty>> {
 +    let max = server.core.groupware.max_file_size;
@@ -182,26 +239,14 @@ index 2d81051..5f95215 100644
 +            "File is larger than the {max} byte limit."
 +        )));
 +    }
-+    match common::file_scan::scan_file(contents).await {
-+        common::file_scan::FileScan::Clean => None,
-+        common::file_scan::FileScan::Infected(signature) => {
-+            trc::event!(
-+                Milter(trc::MilterEvent::ActionReject),
-+                Details = "file scan: infected",
-+                Reason = signature,
-+            );
++    match common::file_scan::scan_file(account_id, contents).await {
++        Ok(()) => None,
++        Err(common::file_scan::FileRefusal::Infected) => {
 +            Some(SetError::forbidden().with_description("The file contains malware."))
 +        }
-+        common::file_scan::FileScan::Failed(reason) => {
-+            trc::event!(
-+                Milter(trc::MilterEvent::ActionConnectionFailure),
-+                Details = "file scan: not scanned",
-+                Reason = reason,
-+            );
-+            Some(SetError::forbidden().with_description(
-+                "The file could not be scanned for malware; try again later.",
-+            ))
-+        }
++        Err(common::file_scan::FileRefusal::Unscanned) => Some(SetError::forbidden().with_description(
++            "The file could not be scanned for malware; try again later.",
++        )),
 +    }
 +}
 +

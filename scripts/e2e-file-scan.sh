@@ -7,7 +7,9 @@
 # (both measured). The patch refuses EICAR on both paths and stores nothing, still stores clean files
 # INCLUDING one of exactly 25 MiB (so clamd's own stream limit cannot refuse a legitimate file), refuses
 # one byte over by the size check on both paths (WebDAV 413, JMAP tooLarge, not a scan error), and fails
-# CLOSED: with clamd gone, an upload is refused. Against -tenantacl2, seven checks FAIL (measured).
+# CLOSED: with clamd gone, an upload is refused. FileNode/copy, which can replace the copied file's
+# content with a blob of the caller's, is checked too. Against -tenantacl2 eight checks FAIL; against
+# the first -filescan1 build, which missed FileNode/copy, that one check FAILs (both measured).
 set -euo pipefail
 IMG=${1:?usage: $0 <stalwart image>}
 CLI=stalwartlabs/cli:1.0.13
@@ -41,9 +43,10 @@ for _ in range(120):
 else: raise SystemExit('clamd never answered PING')"
 id_of() { awk '/Created/ {print $3}'; }
 D1=$(cli create Domain --json '{"name":"one.test","dkimManagement":{"@type":"Manual"},"dnsManagement":{"@type":"Manual"}}' | id_of)
-# Three users, because Stalwart caps each account's PENDING uploads (a 429 after two 25 MiB files):
-# alice for the scan and the at-cap files, bob for the one-over JMAP file, carol for clamd-down.
-for u in alice bob carol; do
+# Several users, because Stalwart caps each account's PENDING uploads (a 429 after two 25 MiB files):
+# alice for the scan and the at-cap files, bob for the one-over JMAP file, carol for clamd-down, and
+# erin sharing a folder with dave for FileNode/copy (which only copies across accounts).
+for u in alice bob carol dave erin; do
   cli create Account/User --json "{\"name\":\"$u\",\"domainId\":\"$D1\",\"credentials\":{\"0\":{\"@type\":\"Password\",\"secret\":\"$PA\"}}}" >/dev/null
 done
 probe() { # $1 = phase: scan | down
@@ -90,6 +93,26 @@ if PHASE=="scan":
     check(st==413, f"WebDAV: one byte over is refused as too large ({st})")
     t=node("jover-cap.bin",over,"bob")
     check(t=="tooLarge", f"JMAP: one byte over is refused as too large, like WebDAV ({t})")
+    # FileNode/copy may REPLACE the copied file's content with a blobId of the caller's: a third path.
+    eh="/dav/file/erin%40one.test/shared/"
+    req("MKCOL",eh,user="erin"); req("PUT",eh+"orig.txt",CLEAN,"text/plain","erin")
+    acl=b'<?xml version="1.0"?><D:acl xmlns:D="DAV:"><D:ace><D:principal><D:href>/dav/pal/dave%40one.test/</D:href></D:principal><D:grant><D:privilege><D:read/></D:privilege></D:grant></D:ace></D:acl>'
+    req("ACL",eh,acl,"application/xml","erin")
+    ds=json.loads(req("GET","/jmap/session",user="dave")[1]); dacct=ds["primaryAccounts"]["urn:ietf:params:jmap:mail"]
+    eacct=[a for a,v in ds["accounts"].items() if a!=dacct][0]
+    FN=["urn:ietf:params:jmap:core","urn:ietf:params:jmap:filenode"]
+    def jm(calls): return json.loads(req("POST","/jmap/",json.dumps({"using":FN,"methodCalls":calls}).encode(),"application/json","dave")[1])["methodResponses"]
+    orig=[n["id"] for n in jm([["FileNode/get",{"accountId":eacct,"properties":["name"]},"g"]])[0][1]["list"] if n["name"]=="orig.txt"][0]
+    dup=ds["uploadUrl"].replace("{accountId}",dacct); dup=dup[dup.index("/jmap"):]
+    def copy(payload,name):
+        blob=json.loads(req("POST",dup,payload,"application/octet-stream","dave")[1])["blobId"]
+        # Stalwart keys a copy's create by the SOURCE id (an `id` property is refused as immutable).
+        r=jm([["FileNode/copy",{"fromAccountId":eacct,"accountId":dacct,"create":{orig:{"blobId":blob,"name":name,"parentId":None}}},"c"]])[0][1]
+        return (r.get("notCreated") or {}).get(orig,{}).get("type") or ("created" if (r.get("created") or {}).get(orig) else json.dumps(r)[:120])
+    t=copy(CLEAN,"copy-clean.txt")
+    check(t=="created", f"JMAP FileNode/copy: a clean replacement blob is copied ({t})")
+    t=copy(EICAR,"copy-eicar.com")
+    check(t=="forbidden", f"JMAP FileNode/copy: an EICAR replacement blob is refused ({t})")
 else:
     st=req("PUT","/dav/file/carol%40one.test/later.txt",CLEAN,"text/plain",user="carol")[0]
     check(st==503, f"WebDAV: with clamd gone, an upload is refused, not stored unscanned ({st})")
