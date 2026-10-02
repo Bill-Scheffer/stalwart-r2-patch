@@ -1,4 +1,4 @@
-# Builds Stalwart from its own release source with FIVE changes, each pinned to its exact files:
+# Builds Stalwart from its own release source with SIX changes, each pinned to its exact files:
 # 1. the rust-s3 crate is taken from the commit of rust-s3 PR #467, which stops DeleteObject signing
 #    headers it never sends. Without it, every blob DELETE against Cloudflare R2 fails with
 #    SignatureDoesNotMatch (rust-s3 #466, Stalwart #3185).
@@ -16,6 +16,10 @@
 # 5. patches/0005-mail-written-into-a-mailbox-scanned.patch: mail written straight into a mailbox (IMAP
 #    APPEND, JMAP Email/import, a JMAP draft) never passes the SMTP milter; email_ingest now scans it
 #    with 0004's clamd client and refuses it if infected or unscannable (measured: all three stored EICAR).
+# 6. patches/0006-expired-ban-replaced.patch: a ban that has EXPIRED is replaced when the same address
+#    earns a new one, in memory and in the stored list, here and on every node. Upstream keeps the
+#    expired entry (a set compared by address alone; a conflicting insert), so with a ban period set
+#    every ban after the first is logged and never enforced (measured). All four ban kinds use it.
 # Everything else is upstream: the tag's source, its Dockerfile, its features.
 name: build
 
@@ -42,7 +46,9 @@ env:
   RUSTS3_REV: 505aded53d2e668bad472bd7834019e8b1f7a4dd
   IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch
   # The tag after the Stalwart release: bump it with any change to what is built.
-  VARIANT: rusts3-505aded-tenantacl2-filescan3
+  VARIANT: rusts3-505aded-tenantacl2-filescan3-banexpiry1
+  # The previous published image, which must FAIL the ban-expiry check (proves the check can fail).
+  PREVIOUS: rusts3-505aded-tenantacl2-filescan3
 
 jobs:
   build:
@@ -152,6 +158,20 @@ jobs:
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
+          # Stage 0005, so the next step's diff under crates/ is 0006 alone.
+          git add -- crates/
+
+      - name: Apply the expired-ban patch, and prove it changed only its own files
+        working-directory: stalwart
+        run: |
+          set -eu
+          P=../patch/patches/0006-expired-ban-replaced.patch
+          git apply --check "$P" && git apply "$P"
+          got=$(git diff --name-only | sort | tr '\n' ' ')
+          [ "$got" = "Cargo.lock Cargo.toml crates/common/src/cache/reload.rs crates/common/src/network/security.rs " ] \
+            || { echo "::error::changed files: $got"; exit 1; }
+          diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
+            || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
 
       - name: Swap, as Stalwart's own CI adds for its release build
         run: |
@@ -183,7 +203,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ env.STALWART_TAG }}-${{ env.VARIANT }}
-            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with rust-s3 PR 467 (R2 DeleteObject fix) tenant-scoped sharing (JMAP, IMAP, WebDAV), and scanned, capped file writes
+            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with rust-s3 PR 467 (R2 DeleteObject fix) tenant-scoped sharing (JMAP, IMAP, WebDAV), scanned, capped file writes, and expired bans replaced
             org.opencontainers.image.licenses=AGPL-3.0-only
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -202,6 +222,17 @@ jobs:
 
       - name: Every stored file and every message written into a mailbox is scanned (end to end, a real clamd)
         run: bash patch/scripts/e2e-file-scan.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
+
+      - name: A ban that expired is enforced again on the next one (end to end, the built image)
+        run: bash patch/scripts/e2e-ban-expiry.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
+
+      - name: The same check FAILS on the previous image, so it can tell the two apart
+        run: |
+          set -u
+          docker pull -q "${IMAGE}:${STALWART_TAG}-${PREVIOUS}"
+          if bash patch/scripts/e2e-ban-expiry.sh "${IMAGE}:${STALWART_TAG}-${PREVIOUS}"; then
+            echo "::error::the ban-expiry check PASSED on ${PREVIOUS}, which has the bug: it proves nothing"; exit 1
+          fi
 
       - name: Push, only after every check passed
         run: |

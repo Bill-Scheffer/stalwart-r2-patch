@@ -1,7 +1,8 @@
 # stalwart-r2-patch
 
-[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **four**
-changes: it can delete blobs from **Cloudflare R2**, and **sharing never crosses tenants**.
+[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **six**
+changes: it can delete blobs from **Cloudflare R2**, **sharing never crosses tenants**, stored files
+and mail written into a mailbox are **scanned**, and a ban that expired is **enforced again**.
 
 ## The problem
 
@@ -92,7 +93,21 @@ also turns a draft that fails to parse into `invalidEmail` rather than failing t
 IMAP `NO [CANNOT]`. Our own operator restore (`Restore`) is not scanned. The same e2e covers all three
 both ways; against `-tenantacl2-filescan2` its five mail checks FAIL (measured).
 
-Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3`.
+## The sixth change: a ban that expired is enforced again
+
+With a ban period set (`authBanPeriod` and its three siblings), upstream v0.16.24 lifts the first ban
+on time, but every later ban of the same address is logged (`security.authentication-ban`) and never
+enforced (measured). `block_ip` `insert`s into a set that compares by address alone, so the expired
+entry stays; the stored `BlockedIp` insert conflicts with the expired one and changes nothing; and a
+node receiving the broadcast `insert`s the same way. Expired entries go only on a restart or
+`ReloadBlockedIps`. [`patches/0006-expired-ban-replaced.patch`](patches/0006-expired-ban-replaced.patch)
+replaces the entry in memory and on every node, and replaces the stored one (delete, then insert).
+All four ban kinds (auth failures, RCPT abuse, loitering, port scans) go through `block_ip`.
+`scripts/e2e-ban-expiry.sh` bans, waits out a 20 s ban, earns a new one and checks it holds; it FAILS
+on upstream v0.16.24 and `-tenantacl1` (measured), and the build requires it to fail on the previous
+image.
+
+Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3-banexpiry1`.
 
 ## When this goes away
 
