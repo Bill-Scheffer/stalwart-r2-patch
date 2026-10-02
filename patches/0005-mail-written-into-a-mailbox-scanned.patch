@@ -1,19 +1,20 @@
 diff --git a/crates/email/src/message/ingest.rs b/crates/email/src/message/ingest.rs
-index 7538ee4..1c17ddd 100644
+index 7538ee4..f4f13ac 100644
 --- a/crates/email/src/message/ingest.rs
 +++ b/crates/email/src/message/ingest.rs
-@@ -152,6 +152,27 @@ impl EmailIngest for Server {
-             .await
-             .caused_by(trc::location!())?;
+@@ -160,6 +160,28 @@ impl EmailIngest for Server {
+                 .ctx(trc::Key::Reason, "Failed to parse e-mail message.")
+         })?;
  
 +        // Antivirus (common::file_scan): mail written straight into a mailbox (JMAP Email/import, a
 +        // JMAP draft, IMAP APPEND) never passes the SMTP milter, so it is scanned here and refused if
-+        // infected or if it could not be scanned (fail closed). SMTP mail was scanned by the milter.
-+        if matches!(
-+            params.source,
-+            IngestSource::Jmap { .. } | IngestSource::Imap { .. }
-+        ) && let Err(refusal) =
-+            common::file_scan::scan_file(account_id, params.raw_message).await
++        // infected or if it could not be scanned (fail closed). Every source is named, so a new one
++        // must decide: SMTP mail was scanned by the milter; Restore re-stores our own backups.
++        let scan = match params.source {
++            IngestSource::Jmap { .. } | IngestSource::Imap { .. } => true,
++            IngestSource::Smtp { .. } | IngestSource::Restore => false,
++        };
++        if scan && let Err(refusal) = common::file_scan::scan_file(account_id, params.raw_message).await
 +        {
 +            let reason = match refusal {
 +                common::file_scan::FileRefusal::Infected => "The message contains malware.",
@@ -27,9 +28,9 @@ index 7538ee4..1c17ddd 100644
 +                .details(reason));
 +        }
 +
-         // Parse message
-         let mut raw_message = Cow::from(params.raw_message);
-         let mut message = params.message.ok_or_else(|| {
+         // Obtain message references and thread name
+         let mut message_id = None;
+         let mut message_ids = Vec::new();
 diff --git a/crates/imap/src/op/append.rs b/crates/imap/src/op/append.rs
 index beadb15..a9c4c8d 100644
 --- a/crates/imap/src/op/append.rs
