@@ -87,7 +87,8 @@ JMAP `Email/import`, and a JMAP draft with an attachment all stored EICAR with t
 (measured). [`patches/0005-mail-written-into-a-mailbox-scanned.patch`](patches/0005-mail-written-into-a-mailbox-scanned.patch)
 scans in `email_ingest`, the one function all three (and nothing SMTP-delivered) store through when
 their source is JMAP or IMAP, with 0004's clamd client: refused if infected or unscannable (fail
-closed). JMAP answers `invalidEmail` with the reason (Email/import already did; drafts now do too),
+closed). JMAP answers `invalidEmail` with the reason (Email/import already did; drafts now do too, which
+also turns a draft that fails to parse into `invalidEmail` rather than failing the whole request),
 IMAP `NO [CANNOT]`. Our own operator restore (`Restore`) is not scanned. The same e2e covers all three
 both ways; against `-tenantacl2-filescan2` its five mail checks FAIL (measured).
 
