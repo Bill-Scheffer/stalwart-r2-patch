@@ -43,8 +43,12 @@ r=json.load(urllib.request.urlopen(urllib.request.Request(B+"/jmap/",headers=h,d
 assert "singleton" in (r["methodResponses"][0][1].get("updated") or {}), r
 PY
 cli create action/ReloadSettings >/dev/null
-docker exec -i "$K" python3 - <<'PY'
-import base64,imaplib,json,os,ssl,time,urllib.request
+# The client keeps one address throughout. Phase 1 bans it, lets the ban lapse, earns a second ban;
+# phase 2 checks the second one lifts on time. In between, a DIFFERENT container reads the stored list:
+# the client's own address is banned then, HTTP included.
+client() {
+docker exec -i -e PHASE="$1" "$K" python3 - <<'PY'
+import imaplib,os,ssl,time
 fails=[]
 def check(ok,msg): print(("PASS " if ok else "FAIL ")+msg); ok or fails.append(msg)
 ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE
@@ -55,26 +59,35 @@ def login(user,pw):
     except (OSError,imaplib.IMAP4.abort): return "blocked"   # dropped at connect or LOGIN: blocked
 good=lambda: login("alice@one.test",os.environ["PA"])
 bad=lambda: login("nobody@one.test","wrong")
-def blocked_ip():
-    B="http://stalwart:8080"; h={"Authorization":"Basic "+base64.b64encode(f"admin:{os.environ['ADMIN']}".encode()).decode(),"Content-Type":"application/json"}
-    aid=json.load(urllib.request.urlopen(urllib.request.Request(B+"/jmap/session",headers=h)))["primaryAccounts"]["urn:stalwart:jmap"]
-    r=json.load(urllib.request.urlopen(urllib.request.Request(B+"/jmap/",headers=h,data=json.dumps({"using":["urn:ietf:params:jmap:core","urn:stalwart:jmap"],
-      "methodCalls":[["x:BlockedIp/query",{"accountId":aid},"q"],["x:BlockedIp/get",{"accountId":aid,"#ids":{"resultOf":"q","name":"x:BlockedIp/query","path":"/ids"}},"g"]]}).encode())))
-    return r["methodResponses"][1][1]["list"]
-check(good()=="ok", "before any failure, alice signs in")
-for _ in range(4): bad()
-check(good()=="blocked", "after 4 failures (limit 3/h) the address is banned")
-time.sleep(25)
-check(good()=="ok", "25 s later (ban period 20 s) the first ban has lifted")
-bad()   # the hour's counter is still over the limit, so this one failure earns a new ban
-check(good()=="blocked", "one more failure: the address is banned AGAIN and the ban is ENFORCED")
-time.sleep(3)
-check(good()=="blocked", "3 s later the new ban still holds")
-entries=blocked_ip(); now=time.time()
-import datetime
-exp=[datetime.datetime.fromisoformat(e["expiresAt"].replace("Z","+00:00")).timestamp() for e in entries if e.get("expiresAt")]
-check(len(entries)==1 and exp and exp[0]>now, f"exactly one stored ban for the address, expiring in the future ({len(entries)} stored)")
-time.sleep(25)
-check(good()=="ok", "and the second ban lifts on time too")
+if os.environ["PHASE"]=="1":
+    check(good()=="ok", "before any failure, alice signs in")
+    for _ in range(4): bad()
+    check(good()=="blocked", "after 4 failures (limit 3/h) the address is banned")
+    time.sleep(25)
+    check(good()=="ok", "25 s later (ban period 20 s) the first ban has lifted")
+    bad()   # the hour's counter is still over the limit, so this one failure earns a new ban
+    check(good()=="blocked", "one more failure: the address is banned AGAIN and the ban is ENFORCED")
+    time.sleep(3)
+    check(good()=="blocked", "3 s later the new ban still holds")
+else:
+    time.sleep(25)
+    check(good()=="ok", "and the second ban lifts on time too")
 print(f"{len(fails)} failure(s)"); raise SystemExit(1 if fails else 0)
 PY
+}
+rc=0
+client 1 || rc=1
+docker run --rm -i --network "$NET" -e ADMIN="$ADMIN" python:3.12-alpine python3 - <<'PY' || rc=1
+import base64,datetime,json,os,time,urllib.request
+B="http://stalwart:8080"; h={"Authorization":"Basic "+base64.b64encode(f"admin:{os.environ['ADMIN']}".encode()).decode(),"Content-Type":"application/json"}
+aid=json.load(urllib.request.urlopen(urllib.request.Request(B+"/jmap/session",headers=h)))["primaryAccounts"]["urn:stalwart:jmap"]
+r=json.load(urllib.request.urlopen(urllib.request.Request(B+"/jmap/",headers=h,data=json.dumps({"using":["urn:ietf:params:jmap:core","urn:stalwart:jmap"],
+  "methodCalls":[["x:BlockedIp/query",{"accountId":aid},"q"],["x:BlockedIp/get",{"accountId":aid,"#ids":{"resultOf":"q","name":"x:BlockedIp/query","path":"/ids"}},"g"]]}).encode())))
+entries=r["methodResponses"][1][1]["list"]
+exp=[datetime.datetime.fromisoformat(e["expiresAt"].replace("Z","+00:00")).timestamp() for e in entries if e.get("expiresAt")]
+ok=len(entries)==1 and bool(exp) and exp[0]>time.time()
+print(("PASS " if ok else "FAIL ")+f"exactly one stored ban for the address, expiring in the future ({len(entries)} stored)")
+raise SystemExit(0 if ok else 1)
+PY
+client 2 || rc=1
+exit $rc
