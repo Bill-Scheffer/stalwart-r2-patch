@@ -89,5 +89,7 @@ ok=len(entries)==1 and bool(exp) and exp[0]>time.time()
 print(("PASS " if ok else "FAIL ")+f"exactly one stored ban for the address, expiring in the future ({len(entries)} stored)")
 raise SystemExit(0 if ok else 1)
 PY
-client 2 || rc=1
+# Phase 2 only matters once phase 1 passed (and on the previous image, which must fail, it would
+# only spend 25 s).
+[ $rc -ne 0 ] || client 2 || rc=1
 exit $rc

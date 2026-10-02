@@ -101,7 +101,8 @@ enforced (measured). `block_ip` `insert`s into a set that compares by address al
 entry stays; the stored `BlockedIp` insert conflicts with the expired one and changes nothing; and a
 node receiving the broadcast `insert`s the same way. Expired entries go only on a restart or
 `ReloadBlockedIps`. [`patches/0006-expired-ban-replaced.patch`](patches/0006-expired-ban-replaced.patch)
-replaces the entry in memory and on every node, and replaces the stored one (delete, then insert).
+replaces an expired entry in memory and on every node, and updates an expired stored one in
+place (as upstream updates a conflicting spam rule); a live ban is never shortened.
 All four ban kinds (auth failures, RCPT abuse, loitering, port scans) go through `block_ip`.
 `scripts/e2e-ban-expiry.sh` bans, waits out a 20 s ban, earns a new one and checks it holds; it FAILS
 on upstream v0.16.24 and `-tenantacl1` (measured), and the build requires it to fail on the previous

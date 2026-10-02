@@ -14,37 +14,23 @@ index a4f6151..754e1bf 100644
                                  ips.blocked_ip_networks
                                      .push(IpWithTtl::new(ip.address, expires_at));
 diff --git a/crates/common/src/network/security.rs b/crates/common/src/network/security.rs
-index 7ca0306..bacde60 100644
+index 7ca0306..217defd 100644
 --- a/crates/common/src/network/security.rs
 +++ b/crates/common/src/network/security.rs
-@@ -327,28 +327,41 @@ impl Server {
+@@ -327,29 +327,69 @@ impl Server {
              .security
              .ban_period(reason)
              .map(|v| now + v);
-+        // `replace`, not `insert`: the set compares by IP alone, so after an earlier ban on this IP
-+        // expired, `insert` kept the expired entry and the new ban was never enforced.
-         self.inner
-             .data
-             .blocked_ips
-             .write()
-             .blocked_ip_addresses
+-        self.inner
+-            .data
+-            .blocked_ips
+-            .write()
+-            .blocked_ip_addresses
 -            .insert(IpWithTtl::new(ip, expires_at.unwrap_or(u64::MAX)));
 -
 -        // Write blocked IP to config
 -        let RegistryWriteResult::Success(id) = self
-+            .replace(IpWithTtl::new(ip, expires_at.unwrap_or(u64::MAX)));
-+
-+        // Write blocked IP to config. An expired entry for this IP is still stored (they are only
-+        // removed on a full reload), and the insert conflicts with it: replace it.
-+        let blocked: Object = BlockedIp {
-+            address: IpAddrOrMask::from_ip(ip),
-+            created_at: UTCDateTime::from_timestamp(now as i64),
-+            expires_at: expires_at.map(|ts| UTCDateTime::from_timestamp(ts as i64)),
-+            reason,
-+        }
-+        .into();
-+        let mut result = self
-             .registry()
+-            .registry()
 -            .write(RegistryWrite::insert(
 -                &BlockedIp {
 -                    address: IpAddrOrMask::from_ip(ip),
@@ -54,23 +40,71 @@ index 7ca0306..bacde60 100644
 -                }
 -                .into(),
 -            ))
-+            .write(RegistryWrite::insert(&blocked))
-             .await
--            .caused_by(trc::location!())?
--        else {
-+            .caused_by(trc::location!())?;
-+        if let RegistryWriteResult::PrimaryKeyConflict { existing_id, .. } = result {
-+            self.registry()
-+                .write(RegistryWrite::delete(existing_id))
-+                .await
-+                .caused_by(trc::location!())?;
-+            result = self
-+                .registry()
-+                .write(RegistryWrite::insert(&blocked))
-+                .await
-+                .caused_by(trc::location!())?;
++        // The set compares by IP alone, so `insert` would keep an EXPIRED entry for this IP and the
++        // new ban would never be enforced. Replace an expired entry; never shorten a live one.
++        {
++            let mut blocked_ips = self.inner.data.blocked_ips.write();
++            let entry = IpWithTtl::new(ip, expires_at.unwrap_or(u64::MAX));
++            if blocked_ips
++                .blocked_ip_addresses
++                .get(&entry)
++                .is_none_or(|existing| existing.is_expired())
++            {
++                blocked_ips.blocked_ip_addresses.replace(entry);
++            }
 +        }
-+        let RegistryWriteResult::Success(id) = result else {
-             return Ok(());
++
++        // Write blocked IP to config. Expired entries stay stored until a full reload, so the insert
++        // conflicts with one: update it in place if it has expired, as upstream updates a
++        // conflicting spam rule, and leave a live one alone.
++        let blocked = BlockedIp {
++            address: IpAddrOrMask::from_ip(ip),
++            created_at: UTCDateTime::from_timestamp(now as i64),
++            expires_at: expires_at.map(|ts| UTCDateTime::from_timestamp(ts as i64)),
++            reason,
++        };
++        let registry = self.registry();
++        let id = match registry
++            .write(RegistryWrite::insert(&blocked.clone().into()))
+             .await
+             .caused_by(trc::location!())?
+-        else {
+-            return Ok(());
++        {
++            RegistryWriteResult::Success(id) => id,
++            RegistryWriteResult::PrimaryKeyConflict { existing_id, .. }
++                if existing_id.object() == ObjectType::BlockedIp =>
++            {
++                let Some(stored) = registry
++                    .get(existing_id)
++                    .await
++                    .caused_by(trc::location!())?
++                else {
++                    return Ok(());
++                };
++                let revision = stored.revision;
++                let stored = BlockedIp::from(stored);
++                if stored
++                    .expires_at
++                    .as_ref()
++                    .is_none_or(|dt| dt.timestamp() > now as i64)
++                {
++                    return Ok(());
++                }
++                let RegistryWriteResult::Success(id) = registry
++                    .write(RegistryWrite::update(
++                        existing_id.id(),
++                        &blocked.into(),
++                        &Object::with_revision(stored.into(), revision),
++                    ))
++                    .await
++                    .caused_by(trc::location!())?
++                else {
++                    return Ok(());
++                };
++                id
++            }
++            _ => return Ok(()),
          };
  
+         // Increment version
