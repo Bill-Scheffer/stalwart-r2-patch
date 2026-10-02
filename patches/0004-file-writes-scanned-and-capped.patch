@@ -133,7 +133,7 @@ index a481877..100ac23 100644
  pub mod ipc;
  pub mod manager;
 diff --git a/crates/dav/src/file/update.rs b/crates/dav/src/file/update.rs
-index 85fffe9..1afbf2f 100644
+index 85fffe9..318b388 100644
 --- a/crates/dav/src/file/update.rs
 +++ b/crates/dav/src/file/update.rs
 @@ -170,6 +170,8 @@ impl FileUpdateRequestHandler for Server {
@@ -159,14 +159,14 @@ index 85fffe9..1afbf2f 100644
      }
  }
 +
-+/// Antivirus (common::file_scan), run after every cheaper check: refuse what is infected (403) or
-+/// could not be scanned (503).
++/// Antivirus (common::file_scan), run after every cheaper check: refuse what is infected (422, so a
++/// client can tell it from a permission 403) or could not be scanned (503).
 +async fn scanned(account_id: u32, bytes: &[u8]) -> crate::Result<()> {
 +    common::file_scan::scan_file(account_id, bytes)
 +        .await
 +        .map_err(|refusal| {
 +            DavError::Code(match refusal {
-+                common::file_scan::FileRefusal::Infected => StatusCode::FORBIDDEN,
++                common::file_scan::FileRefusal::Infected => StatusCode::UNPROCESSABLE_ENTITY,
 +                common::file_scan::FileRefusal::Unscanned => StatusCode::SERVICE_UNAVAILABLE,
 +            })
 +        })

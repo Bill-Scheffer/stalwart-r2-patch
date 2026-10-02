@@ -69,7 +69,7 @@ JMAP client could store past the cap WebDAV enforces (measured: 30 MiB stored ag
 adds a small clamd client (`crates/common/src/file_scan.rs`, `INSTREAM`): when
 `STALWART_FILE_SCAN_CLAMD` names a clamd (`host:port`), both paths (and JMAP `FileNode/copy`, which can
 replace a copied file's content with a caller's blob) stream each file to it before
-storing, and refuse it if infected (WebDAV 403, JMAP `forbidden`) or if it could not be scanned
+storing, and refuse it if infected (WebDAV 422, so a client can tell it from a permission 403; JMAP `forbidden`) or if it could not be scanned
 (WebDAV 503, JMAP `forbidden`): fail closed, as the milter is. Unset, nothing is scanned. JMAP also
 gets WebDAV's file-size cap (`tooLarge`). Infected and unscanned refusals log as milter events.
 [`scripts/e2e-file-scan.sh`](scripts/e2e-file-scan.sh) runs the pushed image beside a real clamd:

@@ -78,7 +78,7 @@ def node(name,payload,user="alice"):
 if PHASE=="scan":
     check(req("PUT",home+"clean.txt",CLEAN,"text/plain")[0]==201, "WebDAV: a clean file is stored (201)")
     st=req("PUT",home+"eicar.com",EICAR,"application/octet-stream")[0]
-    check(st==403, f"WebDAV: EICAR is refused ({st})")
+    check(st==422, f"WebDAV: EICAR is refused with 422, not a permission 403 ({st})")
     check(req("GET",home+"eicar.com")[0]==404, "WebDAV: and nothing was stored")
     check(node("jclean.txt",CLEAN)=="created", "JMAP: a clean file is stored")
     t=node("jeicar.com",EICAR)
