@@ -1,0 +1,74 @@
+diff --git a/crates/email/src/message/ingest.rs b/crates/email/src/message/ingest.rs
+index 7538ee4..76a3aeb 100644
+--- a/crates/email/src/message/ingest.rs
++++ b/crates/email/src/message/ingest.rs
+@@ -152,6 +152,27 @@ impl EmailIngest for Server {
+             .await
+             .caused_by(trc::location!())?;
+ 
++        // Antivirus (common::file_scan): mail written straight into a mailbox (JMAP Email/import, a
++        // JMAP draft, IMAP APPEND) never passes the SMTP milter, so it is scanned here and refused if
++        // infected or if it could not be scanned (fail closed). SMTP mail was scanned by the milter.
++        if matches!(
++            params.source,
++            IngestSource::Jmap { .. } | IngestSource::Imap { .. }
++        ) && let Err(refusal) =
++            common::file_scan::scan_file(account_id, params.raw_message).await
++        {
++            let reason = match refusal {
++                common::file_scan::FileRefusal::Infected => "The message contains malware.",
++                common::file_scan::FileRefusal::Unscanned => {
++                    "The message could not be scanned for malware; try again later."
++                }
++            };
++            return Err(trc::EventType::MessageIngest(trc::MessageIngestEvent::Error)
++                .ctx(trc::Key::Code, 554)
++                .ctx(trc::Key::Reason, reason)
++                .details(reason));
++        }
++
+         // Parse message
+         let mut raw_message = Cow::from(params.raw_message);
+         let mut message = params.message.ok_or_else(|| {
+diff --git a/crates/imap/src/op/append.rs b/crates/imap/src/op/append.rs
+index beadb15..a9c4c8d 100644
+--- a/crates/imap/src/op/append.rs
++++ b/crates/imap/src/op/append.rs
+@@ -154,6 +154,11 @@ impl<T: SessionStream> SessionData<T> {
+                         } else if err.matches(trc::EventType::Limit(trc::LimitEvent::TenantQuota)) {
+                             err.details("Organization disk quota exceeded.")
+                                 .code(ResponseCode::OverQuota)
++                        } else if err.matches(trc::EventType::MessageIngest(
++                            trc::MessageIngestEvent::Error,
++                        )) {
++                            // A refused message (e.g. malware); its details carry the reason.
++                            err.code(ResponseCode::Cannot)
+                         } else {
+                             err
+                         }
+diff --git a/crates/jmap/src/email/set.rs b/crates/jmap/src/email/set.rs
+index 57d245e..8f3c1d3 100644
+--- a/crates/jmap/src/email/set.rs
++++ b/crates/jmap/src/email/set.rs
+@@ -797,6 +797,21 @@ impl EmailSet for Server {
+                             .with_description("You have exceeded your disk quota."),
+                     );
+                 }
++                // A refused message (e.g. malware in an attachment), as Email/import answers it.
++                Err(mut err)
++                    if err.matches(trc::EventType::MessageIngest(
++                        trc::MessageIngestEvent::Error,
++                    )) =>
++                {
++                    response.not_created.append(
++                        id,
++                        SetError::new(SetErrorType::InvalidEmail).with_description(
++                            err.take_value(trc::Key::Reason)
++                                .and_then(|v| v.into_string())
++                                .unwrap_or_default(),
++                        ),
++                    );
++                }
+                 Err(err) => return Err(err),
+             }
+         }

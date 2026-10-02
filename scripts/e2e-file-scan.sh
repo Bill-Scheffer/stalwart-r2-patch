@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# End-to-end: every stored file is scanned, and capped. usage: e2e-file-scan.sh <stalwart image>
+# End-to-end: every stored file, and every message written straight into a mailbox, is scanned; files
+# are capped. usage: e2e-file-scan.sh <stalwart image>
 #
 # A real clamd (clamav/clamav 1.4.5, MainThrive's) beside the image, which is started with
 # STALWART_FILE_SCAN_CLAMD naming it. Upstream v0.16.24 stores the EICAR test file through both
@@ -45,13 +46,15 @@ id_of() { awk '/Created/ {print $3}'; }
 D1=$(cli create Domain --json '{"name":"one.test","dkimManagement":{"@type":"Manual"},"dnsManagement":{"@type":"Manual"}}' | id_of)
 # Several users, because Stalwart caps each account's PENDING uploads (a 429 after two 25 MiB files):
 # alice for the scan and the at-cap files, bob for the one-over JMAP file, carol for clamd-down, and
-# erin sharing a folder with dave for FileNode/copy (which only copies across accounts).
-for u in alice bob carol dave erin; do
+# erin sharing a folder with dave for FileNode/copy (which only copies across accounts), and frank for
+# mail written straight into a mailbox (IMAP APPEND, JMAP Email/import, a JMAP draft).
+for u in alice bob carol dave erin frank; do
   cli create Account/User --json "{\"name\":\"$u\",\"domainId\":\"$D1\",\"credentials\":{\"0\":{\"@type\":\"Password\",\"secret\":\"$PA\"}}}" >/dev/null
 done
 probe() { # $1 = phase: scan | down
 docker run --rm -i --network "$NET" -e PA="$PA" -e PHASE="$1" python:3.12-alpine python3 - <<'PY'
-import base64,json,os,sys,urllib.request,urllib.error
+import base64,imaplib,json,os,ssl,sys,urllib.request,urllib.error
+from email.message import EmailMessage
 B="http://stalwart:8080"; fails=[]; PHASE=os.environ["PHASE"]
 EICAR=rb"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
 CLEAN=b"a clean file\n"
@@ -118,6 +121,47 @@ else:
     check(st==503, f"WebDAV: with clamd gone, an upload is refused, not stored unscanned ({st})")
     t=node("jlater.txt",CLEAN,"carol")
     check(t=="forbidden", f"JMAP: with clamd gone, an upload is refused ({t})")
+def mail(subject,payload):
+    m=EmailMessage(); m["From"]="frank@one.test"; m["To"]="frank@one.test"; m["Subject"]=subject
+    m.set_content("test"); m.add_attachment(payload,maintype="application",subtype="octet-stream",filename="t.com")
+    return m.as_bytes()
+def mail_paths(tag):
+    # (APPEND status, import outcome, draft outcome, ids that were stored), as frank.
+    MC=["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"]
+    def jm(calls): return json.loads(req("POST","/jmap/",json.dumps({"using":MC,"methodCalls":calls}).encode(),"application/json","frank")[1])["methodResponses"]
+    s=json.loads(req("GET","/jmap/session",user="frank")[1]); acct=s["primaryAccounts"]["urn:ietf:params:jmap:mail"]
+    up=s["uploadUrl"].replace("{accountId}",acct); up=up[up.index("/jmap"):]
+    role={m.get("role"):m["id"] for m in jm([["Mailbox/get",{"accountId":acct,"properties":["role"]},"m"]])[0][1]["list"]}
+    ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE
+    M=imaplib.IMAP4_SSL("stalwart",993,ssl_context=ctx); M.login("frank@one.test",os.environ["PA"])
+    before=int(M.status("INBOX","(MESSAGES)")[1][0].split()[-1].strip(b")"))
+    try: t,d=M.append("INBOX",None,None,mail(f"append {tag}",PAY[tag])); app=f"{t} {d[0][:60]!r}"
+    except imaplib.IMAP4.error as e: app=f"NO {str(e)[:80]}"
+    after=int(M.status("INBOX","(MESSAGES)")[1][0].split()[-1].strip(b")")); M.logout()
+    blob=json.loads(req("POST",up,mail(f"import {tag}",PAY[tag]),"message/rfc822","frank")[1])["blobId"]
+    r=jm([["Email/import",{"accountId":acct,"emails":{"e":{"blobId":blob,"mailboxIds":{role["inbox"]:True}}}},"i"]])[0][1]
+    imp=(r.get("notCreated") or {}).get("e",{}).get("type") or ("created" if (r.get("created") or {}).get("e") else json.dumps(r)[:100])
+    att=json.loads(req("POST",up,PAY[tag],"application/octet-stream","frank")[1])["blobId"]
+    r=jm([["Email/set",{"accountId":acct,"create":{"d":{"mailboxIds":{role["drafts"]:True},"keywords":{"$draft":True},
+        "subject":f"draft {tag}","from":[{"email":"frank@one.test"}],"to":[{"email":"frank@one.test"}],
+        "bodyValues":{"t":{"value":"test"}},"textBody":[{"partId":"t","type":"text/plain"}],
+        "attachments":[{"blobId":att,"type":"application/octet-stream","name":"t.com"}]}}},"s"]])[0][1]
+    dr=(r.get("notCreated") or {}).get("d",{}).get("type") or ("created" if (r.get("created") or {}).get("d") else json.dumps(r)[:100])
+    return app, after-before, imp, dr
+PAY={"clean":CLEAN,"eicar":EICAR,"later":CLEAN}
+if PHASE=="scan":
+    app,n,imp,dr=mail_paths("clean")
+    check(app.startswith("OK") and n==1, f"IMAP APPEND: a clean message is stored ({app}, +{n})")
+    check(imp=="created", f"JMAP Email/import: a clean message is stored ({imp})")
+    check(dr=="created", f"JMAP draft: a clean attachment is stored ({dr})")
+    app,n,imp,dr=mail_paths("eicar")
+    check(app.startswith("NO") and "CANNOT" in app and n==0, f"IMAP APPEND: EICAR is refused, NO [CANNOT], nothing stored ({app}, +{n})")
+    check(imp=="invalidEmail", f"JMAP Email/import: EICAR is refused ({imp})")
+    check(dr=="invalidEmail", f"JMAP draft: an EICAR attachment is refused ({dr})")
+else:
+    app,n,imp,dr=mail_paths("later")
+    check(app.startswith("NO") and n==0, f"IMAP APPEND: with clamd gone, refused ({app}, +{n})")
+    check(imp=="invalidEmail", f"JMAP Email/import: with clamd gone, refused ({imp})")
 print("RESULT", "fail" if fails else "pass", len(fails)); sys.exit(1 if fails else 0)
 PY
 }

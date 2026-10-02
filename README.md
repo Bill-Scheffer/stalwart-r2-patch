@@ -79,7 +79,19 @@ as too large on both, an EICAR replacement blob refused by `FileNode/copy`, and 
 uploads refused. Against `-tenantacl2` eight checks FAIL; against the first `-filescan1` build, which
 missed `FileNode/copy`, that one check FAILs (both measured).
 
-Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan2`.
+## The fifth change: mail written straight into a mailbox is scanned too
+
+The milter sees only SMTP sessions (inbound, submission, and webmail Send, which JMAP hands to one). A
+message written straight into a mailbox never passes it: IMAP `APPEND` (also how a migration imports),
+JMAP `Email/import`, and a JMAP draft with an attachment all stored EICAR with the milter attached
+(measured). [`patches/0005-mail-written-into-a-mailbox-scanned.patch`](patches/0005-mail-written-into-a-mailbox-scanned.patch)
+scans in `email_ingest`, the one function all three (and nothing SMTP-delivered) store through when
+their source is JMAP or IMAP, with 0004's clamd client: refused if infected or unscannable (fail
+closed). JMAP answers `invalidEmail` with the reason (Email/import already did; drafts now do too),
+IMAP `NO [CANNOT]`. Our own operator restore (`Restore`) is not scanned. The same e2e covers all three
+both ways; against `-tenantacl2-filescan2` its five mail checks FAIL (measured).
+
+Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3`.
 
 ## When this goes away
 

@@ -1,4 +1,4 @@
-# Builds Stalwart from its own release source with FOUR changes, each pinned to its exact files:
+# Builds Stalwart from its own release source with FIVE changes, each pinned to its exact files:
 # 1. the rust-s3 crate is taken from the commit of rust-s3 PR #467, which stops DeleteObject signing
 #    headers it never sends. Without it, every blob DELETE against Cloudflare R2 fails with
 #    SignatureDoesNotMatch (rust-s3 #466, Stalwart #3185).
@@ -13,6 +13,9 @@
 #    FileNode/set or FileNode/copy (a replacement blobId) is streamed to clamd (STALWART_FILE_SCAN_CLAMD) first and refused if infected, or
 #    if it could not be scanned (fail closed); and JMAP gets the file-size cap WebDAV already has.
 #    Upstream scans mail (the milter) but never files, and JMAP checked no file size (both measured).
+# 5. patches/0005-mail-written-into-a-mailbox-scanned.patch: mail written straight into a mailbox (IMAP
+#    APPEND, JMAP Email/import, a JMAP draft) never passes the SMTP milter; email_ingest now scans it
+#    with 0004's clamd client and refuses it if infected or unscannable (measured: all three stored EICAR).
 # Everything else is upstream: the tag's source, its Dockerfile, its features.
 name: build
 
@@ -39,7 +42,7 @@ env:
   RUSTS3_REV: 505aded53d2e668bad472bd7834019e8b1f7a4dd
   IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch
   # The tag after the Stalwart release: bump it with any change to what is built.
-  VARIANT: rusts3-505aded-tenantacl2-filescan2
+  VARIANT: rusts3-505aded-tenantacl2-filescan3
 
 jobs:
   build:
@@ -135,6 +138,20 @@ jobs:
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
+          # Stage 0004 (its new file included), so the next step's diff under crates/ is 0005 alone.
+          git add -- crates/
+
+      - name: Apply the mail-ingest scan patch, and prove it changed only its own files
+        working-directory: stalwart
+        run: |
+          set -eu
+          P=../patch/patches/0005-mail-written-into-a-mailbox-scanned.patch
+          git apply --check "$P" && git apply "$P"
+          got=$(git diff --name-only | sort | tr '\n' ' ')
+          [ "$got" = "Cargo.lock Cargo.toml crates/email/src/message/ingest.rs crates/imap/src/op/append.rs crates/jmap/src/email/set.rs " ] \
+            || { echo "::error::changed files: $got"; exit 1; }
+          diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
+            || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
 
       - name: Swap, as Stalwart's own CI adds for its release build
         run: |
@@ -188,5 +205,5 @@ jobs:
       - name: Sharing never crosses tenants (end to end, the pushed image)
         run: bash patch/scripts/e2e-tenant-sharing.sh "${IMAGE}@${{ steps.build.outputs.digest }}"
 
-      - name: Every stored file is scanned and capped (end to end, the pushed image, a real clamd)
+      - name: Every stored file and every message written into a mailbox is scanned (end to end, a real clamd)
         run: bash patch/scripts/e2e-file-scan.sh "${IMAGE}@${{ steps.build.outputs.digest }}"
