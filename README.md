@@ -61,7 +61,7 @@ cross-tenant DAV checks FAIL (measured).
 
 ## The fourth change: every stored file is scanned, and capped
 
-Stalwart scans mail through a milter, but nothing scans a file stored through WebDAV `PUT` or JMAP
+Stalwart scans mail that travels over SMTP through a milter, but nothing scans a file stored through WebDAV `PUT` or JMAP
 `FileNode/set`: on v0.16.24 both stored the EICAR test file and read it back unchanged, with
 ClamAV attached as a milter (measured). And JMAP `FileNode/set` checks no file size at all, so a
 JMAP client could store past the cap WebDAV enforces (measured: 30 MiB stored against 25 MiB).
