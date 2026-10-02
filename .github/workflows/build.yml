@@ -1,4 +1,4 @@
-# Builds Stalwart from its own release source with THREE changes, each pinned to its exact files:
+# Builds Stalwart from its own release source with FOUR changes, each pinned to its exact files:
 # 1. the rust-s3 crate is taken from the commit of rust-s3 PR #467, which stops DeleteObject signing
 #    headers it never sends. Without it, every blob DELETE against Cloudflare R2 fails with
 #    SignatureDoesNotMatch (rust-s3 #466, Stalwart #3185).
@@ -9,6 +9,10 @@
 # 3. patches/0003-tenant-scoped-dav-acl.patch: the same rule for a WebDAV `ACL` request (calendars,
 #    address books, file folders). Upstream resolves the grantee by name and checks no tenant (its
 #    principal check is commented out), which 0002 wrongly assumed it did.
+# 4. patches/0004-file-writes-scanned-and-capped.patch: every file stored through WebDAV PUT or JMAP
+#    FileNode/set is streamed to clamd (STALWART_FILE_SCAN_CLAMD) first and refused if infected, or
+#    if it could not be scanned (fail closed); and JMAP gets the file-size cap WebDAV already has.
+#    Upstream scans mail (the milter) but never files, and JMAP checked no file size (both measured).
 # Everything else is upstream: the tag's source, its Dockerfile, its features.
 name: build
 
@@ -113,6 +117,22 @@ jobs:
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
+          # Stage 0003, so the next step's working-tree diff under crates/ is 0004 alone.
+          git add -- crates/
+
+      - name: Apply the file-write patch (scan and cap), and prove it changed only its own files
+        working-directory: stalwart
+        run: |
+          set -eu
+          P=../patch/patches/0004-file-writes-scanned-and-capped.patch
+          git apply --check "$P" && git apply "$P"
+          # Its one new file is untracked until marked, and the diff below must see it.
+          git add -N -- crates/common/src/file_scan.rs
+          got=$(git diff --name-only | sort | tr '\n' ' ')
+          [ "$got" = "Cargo.lock Cargo.toml crates/common/src/file_scan.rs crates/common/src/lib.rs crates/dav/src/file/update.rs crates/jmap/src/file/set.rs " ] \
+            || { echo "::error::changed files: $got"; exit 1; }
+          diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
+            || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
 
       - name: Swap, as Stalwart's own CI adds for its release build
         run: |
@@ -139,12 +159,12 @@ jobs:
           push: true
           provenance: false
           tags: |
-            ${{ env.IMAGE }}:${{ env.STALWART_TAG }}-rusts3-505aded-tenantacl2
+            ${{ env.IMAGE }}:${{ env.STALWART_TAG }}-rusts3-505aded-tenantacl2-filescan1
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ env.STALWART_TAG }}-rusts3-505aded-tenantacl2
-            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with rust-s3 PR 467 (R2 DeleteObject fix) and tenant-scoped sharing (JMAP, IMAP, WebDAV)
+            org.opencontainers.image.version=${{ env.STALWART_TAG }}-rusts3-505aded-tenantacl2-filescan1
+            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with rust-s3 PR 467 (R2 DeleteObject fix) tenant-scoped sharing (JMAP, IMAP, WebDAV), and scanned, capped file writes
             org.opencontainers.image.licenses=AGPL-3.0-only
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -157,7 +177,7 @@ jobs:
           docker run --rm --entrypoint getcap "$ref" /usr/local/bin/stalwart
           {
             echo "### ${IMAGE}"
-            echo "- tag: \`${STALWART_TAG}-rusts3-505aded-tenantacl2\`"
+            echo "- tag: \`${STALWART_TAG}-rusts3-505aded-tenantacl2-filescan1\`"
             echo "- digest: \`${{ steps.build.outputs.digest }}\`"
             echo "- stalwart: \`${STALWART_TAG}\` @ \`${STALWART_SHA}\`"
             echo "- rust-s3: \`${RUSTS3_REV}\` (PR #467)"
@@ -165,3 +185,6 @@ jobs:
 
       - name: Sharing never crosses tenants (end to end, the pushed image)
         run: bash patch/scripts/e2e-tenant-sharing.sh "${IMAGE}@${{ steps.build.outputs.digest }}"
+
+      - name: Every stored file is scanned and capped (end to end, the pushed image, a real clamd)
+        run: bash patch/scripts/e2e-file-scan.sh "${IMAGE}@${{ steps.build.outputs.digest }}"

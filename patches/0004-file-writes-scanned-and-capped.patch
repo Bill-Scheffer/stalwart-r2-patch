@@ -1,0 +1,210 @@
+diff --git a/crates/common/src/file_scan.rs b/crates/common/src/file_scan.rs
+new file mode 100644
+index 0000000..d03faba
+--- /dev/null
++++ b/crates/common/src/file_scan.rs
+@@ -0,0 +1,90 @@
++/*
++ * SPDX-FileCopyrightText: 2026 MainThrive
++ *
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++//! Antivirus for stored files. When `STALWART_FILE_SCAN_CLAMD` names a clamd (`host:port`), every file
++//! written through WebDAV or JMAP `FileNode/set` is streamed to it (`INSTREAM`) before it is stored,
++//! the way the milter scans mail. It fails closed: a file that could not be scanned is refused. Unset,
++//! nothing is scanned (upstream's behaviour).
++
++use std::{sync::OnceLock, time::Duration};
++use tokio::{
++    io::{AsyncReadExt, AsyncWriteExt},
++    net::TcpStream,
++};
++
++pub enum FileScan {
++    Clean,
++    Infected(String),
++    Failed(String),
++}
++
++const CHUNK: usize = 64 * 1024;
++const TIMEOUT: Duration = Duration::from_secs(60);
++
++fn clamd() -> Option<&'static str> {
++    static ADDR: OnceLock<Option<String>> = OnceLock::new();
++    ADDR.get_or_init(|| {
++        std::env::var("STALWART_FILE_SCAN_CLAMD")
++            .ok()
++            .filter(|addr| !addr.is_empty())
++    })
++    .as_deref()
++}
++
++pub async fn scan_file(contents: &[u8]) -> FileScan {
++    let Some(addr) = clamd() else {
++        return FileScan::Clean;
++    };
++    match tokio::time::timeout(TIMEOUT, instream(addr, contents)).await {
++        Ok(Ok(reply)) => verdict(&reply),
++        Ok(Err(err)) => FileScan::Failed(format!("clamd {addr}: {err}")),
++        Err(_) => FileScan::Failed(format!("clamd {addr}: timed out")),
++    }
++}
++
++async fn instream(addr: &str, contents: &[u8]) -> std::io::Result<String> {
++    let mut stream = TcpStream::connect(addr).await?;
++    stream.write_all(b"zINSTREAM\0").await?;
++    for chunk in contents.chunks(CHUNK) {
++        stream.write_all(&(chunk.len() as u32).to_be_bytes()).await?;
++        stream.write_all(chunk).await?;
++    }
++    stream.write_all(&0u32.to_be_bytes()).await?;
++    let mut reply = Vec::new();
++    stream.read_to_end(&mut reply).await?;
++    Ok(String::from_utf8_lossy(&reply)
++        .trim_end_matches(['\0', '\n'])
++        .to_string())
++}
++
++/// clamd answers `stream: OK`, `stream: <signature> FOUND`, or `<message> ERROR`.
++fn verdict(reply: &str) -> FileScan {
++    match reply.strip_prefix("stream: ") {
++        Some("OK") => FileScan::Clean,
++        Some(found) if found.ends_with(" FOUND") => {
++            FileScan::Infected(found.trim_end_matches(" FOUND").to_string())
++        }
++        _ => FileScan::Failed(format!("clamd answered {reply:?}")),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{FileScan, verdict};
++
++    #[test]
++    fn reads_each_clamd_answer() {
++        assert!(matches!(verdict("stream: OK"), FileScan::Clean));
++        assert!(
++            matches!(verdict("stream: Eicar-Test-Signature FOUND"), FileScan::Infected(name) if name == "Eicar-Test-Signature")
++        );
++        assert!(matches!(
++            verdict("INSTREAM size limit exceeded. ERROR"),
++            FileScan::Failed(_)
++        ));
++        assert!(matches!(verdict(""), FileScan::Failed(_)));
++    }
++}
+diff --git a/crates/common/src/lib.rs b/crates/common/src/lib.rs
+index a481877..100ac23 100644
+--- a/crates/common/src/lib.rs
++++ b/crates/common/src/lib.rs
+@@ -63,6 +63,7 @@ pub mod auth;
+ pub mod cache;
+ pub mod config;
+ pub mod expr;
++pub mod file_scan;
+ pub mod i18n;
+ pub mod ipc;
+ pub mod manager;
+diff --git a/crates/dav/src/file/update.rs b/crates/dav/src/file/update.rs
+index 85fffe9..9b73cb2 100644
+--- a/crates/dav/src/file/update.rs
++++ b/crates/dav/src/file/update.rs
+@@ -76,6 +76,29 @@ impl FileUpdateRequestHandler for Server {
+             return Err(DavError::Code(StatusCode::PAYLOAD_TOO_LARGE));
+         }
+ 
++        // Antivirus (common::file_scan): refuse a file that is infected or could not be scanned.
++        match common::file_scan::scan_file(&bytes).await {
++            common::file_scan::FileScan::Clean => {}
++            common::file_scan::FileScan::Infected(signature) => {
++                trc::event!(
++                    Milter(trc::MilterEvent::ActionReject),
++                    AccountId = account_id,
++                    Details = "file scan: infected",
++                    Reason = signature,
++                );
++                return Err(DavError::Code(StatusCode::FORBIDDEN));
++            }
++            common::file_scan::FileScan::Failed(reason) => {
++                trc::event!(
++                    Milter(trc::MilterEvent::ActionConnectionFailure),
++                    AccountId = account_id,
++                    Details = "file scan: not scanned",
++                    Reason = reason,
++                );
++                return Err(DavError::Code(StatusCode::SERVICE_UNAVAILABLE));
++            }
++        }
++
+         if let Some(document_id) = resources
+             .by_path(resource_name.as_ref())
+             .map(|r| r.document_id())
+diff --git a/crates/jmap/src/file/set.rs b/crates/jmap/src/file/set.rs
+index 2d81051..5f95215 100644
+--- a/crates/jmap/src/file/set.rs
++++ b/crates/jmap/src/file/set.rs
+@@ -109,6 +109,10 @@ impl FileNodeSet for Server {
+                                 .get_blob(blob_id.hash.as_slice(), 0..usize::MAX)
+                                 .await?
+                             {
++                                if let Some(err) = file_write_refusal(self, &blob_contents).await {
++                                    response.not_created.append(id, err);
++                                    continue 'create;
++                                }
+                                 file_details.size = blob_contents.len() as u32;
+                             } else {
+                                 response.not_created.append(
+@@ -371,6 +375,10 @@ impl FileNodeSet for Server {
+                                 .get_blob(blob_id.hash.as_slice(), 0..usize::MAX)
+                                 .await?
+                             {
++                                if let Some(err) = file_write_refusal(self, &blob_contents).await {
++                                    response.not_updated.append(id, err);
++                                    continue 'update;
++                                }
+                                 file_details.size = blob_contents.len() as u32;
+                             } else {
+                                 response.not_updated.append(
+@@ -660,6 +668,41 @@ impl ResolveCreatedReference<FileNodeProperty, FileNodeValue> for NoResolver {
+     }
+ }
+ 
++/// The checks every stored file gets (WebDAV applies the same in crates/dav/src/file/update.rs):
++/// the groupware file-size cap, which upstream JMAP did not apply, and antivirus.
++async fn file_write_refusal(
++    server: &Server,
++    contents: &[u8],
++) -> Option<SetError<FileNodeProperty>> {
++    let max = server.core.groupware.max_file_size;
++    if contents.len() > max {
++        return Some(SetError::too_large().with_description(format!(
++            "File is larger than the {max} byte limit."
++        )));
++    }
++    match common::file_scan::scan_file(contents).await {
++        common::file_scan::FileScan::Clean => None,
++        common::file_scan::FileScan::Infected(signature) => {
++            trc::event!(
++                Milter(trc::MilterEvent::ActionReject),
++                Details = "file scan: infected",
++                Reason = signature,
++            );
++            Some(SetError::forbidden().with_description("The file contains malware."))
++        }
++        common::file_scan::FileScan::Failed(reason) => {
++            trc::event!(
++                Milter(trc::MilterEvent::ActionConnectionFailure),
++                Details = "file scan: not scanned",
++                Reason = reason,
++            );
++            Some(SetError::forbidden().with_description(
++                "The file could not be scanned for malware; try again later.",
++            ))
++        }
++    }
++}
++
+ pub(super) fn update_file_node<R: ResolveCreatedReference<FileNodeProperty, FileNodeValue>>(
+     expected_id: Option<Id>,
+     updates: Value<'_, FileNodeProperty, FileNodeValue>,

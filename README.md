@@ -1,6 +1,6 @@
 # stalwart-r2-patch
 
-[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **three**
+[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **four**
 changes: it can delete blobs from **Cloudflare R2**, and **sharing never crosses tenants**.
 
 ## The problem
@@ -59,7 +59,23 @@ applies it after 0002 and fails unless it changed only that one file, byte for b
 script asserts both directions for all three collection types; against `-tenantacl1` its nine
 cross-tenant DAV checks FAIL (measured).
 
-Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2`.
+## The fourth change: every stored file is scanned, and capped
+
+Stalwart scans mail through a milter, but nothing scans a file stored through WebDAV `PUT` or JMAP
+`FileNode/set`: on v0.16.24 both stored the EICAR test file and read it back unchanged, with
+ClamAV attached as a milter (measured). And JMAP `FileNode/set` checks no file size at all, so a
+JMAP client could store past the cap WebDAV enforces (measured: 30 MiB stored against 25 MiB).
+[`patches/0004-file-writes-scanned-and-capped.patch`](patches/0004-file-writes-scanned-and-capped.patch)
+adds a small clamd client (`crates/common/src/file_scan.rs`, `INSTREAM`): when
+`STALWART_FILE_SCAN_CLAMD` names a clamd (`host:port`), both paths stream each file to it before
+storing, and refuse it if infected (WebDAV 403, JMAP `forbidden`) or if it could not be scanned
+(WebDAV 503, JMAP `forbidden`): fail closed, as the milter is. Unset, nothing is scanned. JMAP also
+gets WebDAV's file-size cap (`tooLarge`). Infected and unscanned refusals log as milter events.
+[`scripts/e2e-file-scan.sh`](scripts/e2e-file-scan.sh) runs the pushed image beside a real clamd:
+clean files stored, EICAR refused and absent on both paths, the 30 MiB JMAP file refused, and with
+clamd stopped, uploads refused. Against `-tenantacl2` its seven checks FAIL (measured).
+
+Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan1`.
 
 ## When this goes away
 

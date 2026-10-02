@@ -66,7 +66,7 @@ index 9086aa8..4beec60 100644
                      continue 'update;
                  }
 diff --git a/crates/jmap/src/api/acl.rs b/crates/jmap/src/api/acl.rs
-index 2667bf7..5e97550 100644
+index 2667bf7..b16f582 100644
 --- a/crates/jmap/src/api/acl.rs
 +++ b/crates/jmap/src/api/acl.rs
 @@ -230,6 +230,7 @@ pub trait JmapAcl {
@@ -95,8 +95,8 @@ index 2667bf7..5e97550 100644
          let principal_ids = self
              .registry()
 -            .query::<RoaringBitmap>(RegistryQuery::new(ObjectType::Account))
-+            // A grantee must be in the caller's tenant, as DAV sharing and the JMAP directory
-+            // already require: without this, any user could share with any account on the server.
++            // A grantee must be in the caller's tenant, as the JMAP directory already requires
++            // (and DAV ACL, with 0003): without this, any user could share with any account.
 +            .query::<RoaringBitmap>(
 +                RegistryQuery::new(ObjectType::Account).with_tenant(access_token.tenant_id()),
 +            )
