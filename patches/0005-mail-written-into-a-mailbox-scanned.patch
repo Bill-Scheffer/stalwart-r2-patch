@@ -1,5 +1,5 @@
 diff --git a/crates/email/src/message/ingest.rs b/crates/email/src/message/ingest.rs
-index 7538ee4..76a3aeb 100644
+index 7538ee4..1c17ddd 100644
 --- a/crates/email/src/message/ingest.rs
 +++ b/crates/email/src/message/ingest.rs
 @@ -152,6 +152,27 @@ impl EmailIngest for Server {
@@ -21,8 +21,8 @@ index 7538ee4..76a3aeb 100644
 +                    "The message could not be scanned for malware; try again later."
 +                }
 +            };
++            // No numeric Code: IMAP reads the FIRST Code key, and APPEND sets CANNOT on this error.
 +            return Err(trc::EventType::MessageIngest(trc::MessageIngestEvent::Error)
-+                .ctx(trc::Key::Code, 554)
 +                .ctx(trc::Key::Reason, reason)
 +                .details(reason));
 +        }
