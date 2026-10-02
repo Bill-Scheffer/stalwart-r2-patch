@@ -47,8 +47,9 @@ D1=$(cli create Domain --json '{"name":"one.test","dkimManagement":{"@type":"Man
 # Several users, because Stalwart caps each account's PENDING uploads (a 429 after two 25 MiB files):
 # alice for the scan and the at-cap files, bob for the one-over JMAP file, carol for clamd-down, and
 # erin sharing a folder with dave for FileNode/copy (which only copies across accounts), and frank for
-# mail written straight into a mailbox (IMAP APPEND, JMAP Email/import, a JMAP draft).
-for u in alice bob carol dave erin frank; do
+# mail written straight into a mailbox (IMAP APPEND, JMAP Email/import, a JMAP draft), and gina for
+# a draft's size boundary (one large upload, which fills an account's pending-upload quota).
+for u in alice bob carol dave erin frank gina; do
   cli create Account/User --json "{\"name\":\"$u\",\"domainId\":\"$D1\",\"credentials\":{\"0\":{\"@type\":\"Password\",\"secret\":\"$PA\"}}}" >/dev/null
 done
 probe() { # $1 = phase: scan | down
@@ -162,6 +163,24 @@ if PHASE=="scan":
     check(app.startswith("NO") and "CANNOT" in app and n==0, f"IMAP APPEND: EICAR is refused, NO [CANNOT], nothing stored ({app}, +{n})")
     check(imp=="invalidEmail", f"JMAP Email/import: EICAR is refused ({imp})")
     check(dr=="invalidEmail", f"JMAP draft: an EICAR attachment is refused ({dr})")
+    # Could a draft outgrow clamd's 100 MiB stream limit (and read as "could not be scanned")? No:
+    # upstream Email/set caps a draft's attachments at 50 MB (measured), before ingest and the scan. A
+    # draft at the edge is scanned and stored; past it, it is refused by that size check.
+    MC=["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"]
+    def gm(calls): return json.loads(req("POST","/jmap/",json.dumps({"using":MC,"methodCalls":calls}).encode(),"application/json","gina")[1])["methodResponses"]
+    gs=json.loads(req("GET","/jmap/session",user="gina")[1]); ga=gs["primaryAccounts"]["urn:ietf:params:jmap:mail"]
+    gup=gs["uploadUrl"].replace("{accountId}",ga); gup=gup[gup.index("/jmap"):]
+    gdrafts=[m["id"] for m in gm([["Mailbox/get",{"accountId":ga,"properties":["role"]},"m"]])[0][1]["list"] if m.get("role")=="drafts"][0]
+    big=json.loads(req("POST",gup,os.urandom(45*1024*1024),"application/octet-stream","gina")[1])["blobId"]
+    def gdraft(n):
+        r=gm([["Email/set",{"accountId":ga,"create":{"d":{"mailboxIds":{gdrafts:True},"keywords":{"$draft":True},"subject":f"big draft x{n}",
+            "from":[{"email":"gina@one.test"}],"bodyValues":{"t":{"value":"test"}},"textBody":[{"partId":"t","type":"text/plain"}],
+            "attachments":[{"blobId":big,"type":"application/octet-stream","name":f"b{i}.bin"} for i in range(n)]}}},"s"]])[0][1]
+        return outcome(r,"d"), (r.get("notCreated") or {}).get("d",{}).get("description","")
+    t,_=gdraft(1)
+    check(t=="created", f"JMAP draft: a clean 45 MiB attachment (about 61 MB encoded) is scanned and stored ({t})")
+    t,d=gdraft(2)
+    check(t=="invalidProperties" and "exceeds maximum size" in d, f"JMAP draft: two of them (90 MiB) are refused by size, not as unscannable ({t}: {d})")
 else:
     app,n,imp,dr=mail_paths("later")
     check(app.startswith("NO") and n==0, f"IMAP APPEND: with clamd gone, refused ({app}, +{n})")
