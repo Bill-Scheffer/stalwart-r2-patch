@@ -106,7 +106,10 @@ place (as upstream updates a conflicting spam rule); a live ban is never shorten
 All four ban kinds (auth failures, RCPT abuse, loitering, port scans) go through `block_ip`.
 `scripts/e2e-ban-expiry.sh` bans, waits out a 20 s ban, earns a new one and checks it holds; it FAILS
 on upstream v0.16.24 and `-tenantacl1` (measured), and the build requires it to fail on the previous
-image.
+image, named by its full tag in `PREVIOUS_IMAGE`, and to fail on the bug's own check line:
+`scripts/previous-must-fail.sh` refuses a previous image it cannot pull and an e2e that fails for any other
+reason (`tests/previous-must-fail.test.sh`). Before that, a new Stalwart tag made the pull fail silently and the
+step passed having measured nothing.
 
 Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3-banexpiry1`.
 
