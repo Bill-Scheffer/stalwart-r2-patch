@@ -47,9 +47,11 @@ env:
   IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch
   # The tag after the Stalwart release: bump it with any change to what is built.
   VARIANT: rusts3-505aded-tenantacl2-filescan3-banexpiry1
-  # The previous published image, which must FAIL the ban-expiry check on the bug (proves the check can fail).
-  # Its FULL tag: a new STALWART_TAG must not silently point it at an image that was never built.
-  PREVIOUS_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:v0.16.24-rusts3-505aded-tenantacl2-filescan3
+  # A FIXED image that HAS the expired-ban bug (the last build before 0006), which the ban-expiry check must FAIL
+  # on the bug's own line: that proves the check can fail. ⛔ NEVER bumped with releases: every build after 0006
+  # lacks the bug and PASSES the check, so it could never be the reference. Pinned by tag AND digest, because a tag
+  # can be re-pushed (a push to main rebuilds and re-pushes the current tag).
+  BAN_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:v0.16.24-rusts3-505aded-tenantacl2-filescan3@sha256:6d15a5ade004aadec046b10541dccce7135122d3c8cd5361df61ec6e3822f9db
 
 jobs:
   build:
@@ -68,7 +70,7 @@ jobs:
           ref: ${{ env.STALWART_SHA }}
           path: stalwart
 
-      - name: The build's own previous-image check refuses a missing image or a broken harness
+      - name: The build's own bug-reference check refuses a missing image, a bug-free reference or a broken harness
         run: bash patch/tests/previous-must-fail.test.sh
 
       - name: The release tag still names that commit
@@ -230,8 +232,8 @@ jobs:
       - name: A ban that expired is enforced again on the next one (end to end, the built image)
         run: bash patch/scripts/e2e-ban-expiry.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
 
-      - name: The same check FAILS on the previous image, on the bug itself, so it can tell the two apart
-        run: bash patch/scripts/previous-must-fail.sh "${PREVIOUS_IMAGE}"
+      - name: The same check FAILS on the fixed bug-reference image, on the bug itself, so it can tell the two apart
+        run: bash patch/scripts/previous-must-fail.sh "${BAN_BUG_REFERENCE_IMAGE}"
 
       - name: Push, only after every check passed
         run: |

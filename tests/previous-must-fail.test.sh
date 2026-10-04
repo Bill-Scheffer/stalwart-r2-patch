@@ -10,9 +10,9 @@ BUGLINE='FAIL one more failure: the address is banned AGAIN and the ban is ENFOR
 fail=0
 t() { local want=$1 name=$2; PATH="$W/bin:$PATH" PULL=$PULL bash "$S" img:prev "$W/e2e.sh" >"$W/out" 2>&1; local got=$?
   if { [ "$want" = pass ] && [ $got -eq 0 ]; } || { [ "$want" = fail ] && [ $got -ne 0 ]; }; then echo "ok   $name"; else echo "FAIL $name (exit $got)"; sed 's/^/     /' "$W/out"; fail=1; fi; }
-PULL=ok;  e2e "$BUGLINE" 1;                  t pass "the previous image fails the check on the bug's line"
-PULL=bad; e2e "$BUGLINE" 1;                  t fail "⛔ the previous image cannot be pulled (a new release: the old fail-open)"
-PULL=ok;  e2e "PASS all good" 0;             t fail "the check passes on the previous image"
+PULL=ok;  e2e "$BUGLINE" 1;                  t pass "the bug-reference image fails the check on the bug's line"
+PULL=bad; e2e "$BUGLINE" 1;                  t fail "⛔ the reference cannot be pulled (the old fail-open on a new release)"
+PULL=ok;  e2e "PASS all good" 0;             t fail "⛔ the reference was bumped by mistake to a bug-free build: the check passes on it"
 PULL=ok;  e2e "FAIL before any failure, alice signs in" 1; t fail "the check fails, but not on the bug (a broken harness)"
 PULL=ok;  e2e "Error: no such image" 125;    t fail "the e2e cannot even start"
 [ $fail = 0 ] && echo PASS || { echo FAILED; exit 1; }
