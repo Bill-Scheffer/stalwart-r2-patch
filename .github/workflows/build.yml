@@ -39,8 +39,8 @@ concurrency:
 
 env:
   # Upstream Stalwart release, pinned by commit: a tag can move, a commit cannot.
-  STALWART_TAG: v0.16.24
-  STALWART_SHA: af37a234981722493b74623a983581691d2b70b6
+  STALWART_TAG: v0.16.25
+  STALWART_SHA: 3f657330c0f49a015a3a372fb59669b5cccbca6d
   # rust-s3 PR #467 (https://github.com/durch/rust-s3/pull/467): master at 0.37.2 plus one commit.
   RUSTS3_GIT: https://github.com/Databanx/rust-s3
   RUSTS3_REV: 505aded53d2e668bad472bd7834019e8b1f7a4dd
