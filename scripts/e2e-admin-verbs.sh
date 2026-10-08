@@ -217,14 +217,15 @@ r=r1(K,["Identity/set",{"accountId":ALICE,"update":{iid:{"name":"Alice Example"}
 for what,auth,acc in TARGETS:
     r=r1(auth,["Identity/set",{"accountId":acc,"update":{"x":{"name":"x"}}},"u"]); check(refused(r), f"0008 Identity/set: refused on {what}")
 # 7 and 8. issue an app password: Replace within the key's grants; the import shape works over IMAP
-NET="0.0.0.0/0"; exp=time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime(time.time()+3600))
-ap=lambda a,p:["x:AppPassword/set",{"accountId":a,"create":{"p":{"description":"import","permissions":p,"allowedIps":{NET:True},"expiresAt":exp}}},"p"]
+# allowedIps: the private ranges a docker network lives in (Stalwart refuses 0.0.0.0/0 as a key).
+IPS={n:True for n in ("10.0.0.0/8","172.16.0.0/12","192.168.0.0/16")}; exp=time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime(time.time()+3600))
+ap=lambda a,p:["x:AppPassword/set",{"accountId":a,"create":{"p":{"description":"import","permissions":p,"allowedIps":IPS,"expiresAt":exp}}},"p"]
 IMAPP={"@type":"Replace","permissions":{p:True for p in ["authenticate","imapAuthenticate","imapSelect","imapExamine","imapList","imapAppend","imapCreate","imapStatus","imapFetch"]}}
-r=r1(K,ap(ALICE,IMAPP)); c=(r[1].get("created") or {}).get("p"); check(bool(c), f"0008 x:AppPassword/set create: the import credential is issued on alice ({json.dumps(r)[:120]})")
+r=r1(K,ap(ALICE,IMAPP)); c=(r[1].get("created") or {}).get("p"); check(bool(c), f"0008 x:AppPassword/set create: the import credential is issued on alice ({json.dumps(r)[:200]})")
 if c:
     M=imaplib.IMAP4_SSL("stalwart",993,ssl_context=ctx); t,_=M.login("alice@one.test",c["secret"])
     check(t=="OK" and M.select("INBOX")[0]=="OK", "0008: alice's IMAP opens with it (the import worker's path)"); M.logout()
-r=r1(K,ap(ALICE,{"@type":"Inherit"})); check(r[0]=="x:AppPassword/set" and "p" in (r[1].get("notCreated") or {}), f"0008 x:AppPassword/set: Inherit is refused by the grant rule ({json.dumps(r)[:120]})")
+r=r1(K,ap(ALICE,{"@type":"Inherit"})); check(r[0]=="x:AppPassword/set" and "grant" in ((r[1].get("notCreated") or {}).get("p") or {}).get("description",""), f"0008 x:AppPassword/set: Inherit is refused by the grant rule ({json.dumps(r)[:200]})")
 for what,auth,acc in TARGETS:
     r=r1(auth,ap(acc,IMAPP)); check(refused(r), f"0008 x:AppPassword/set create: refused on {what}")
 if c:
