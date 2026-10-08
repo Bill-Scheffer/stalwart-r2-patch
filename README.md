@@ -1,8 +1,10 @@
 # stalwart-r2-patch
 
-[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **six**
+[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **eight**
 changes: it can delete blobs from **Cloudflare R2**, **sharing never crosses tenants**, stored files
-and mail written into a mailbox are **scanned**, and a ban that expired is **enforced again**.
+and mail written into a mailbox are **scanned**, a ban that expired is **enforced again**, a narrow
+key **cannot take over an Admin**, and an operator can run **admin verbs on a mailbox without reading
+its mail**.
 
 ## The problem
 
@@ -112,7 +114,65 @@ NEVER bumped with releases (every later build lacks the bug and passes). It must
 other reason (`tests/previous-must-fail.test.sh`). Before that, a new Stalwart tag made the pull fail silently and
 the step passed having measured nothing.
 
-Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3-banexpiry1`.
+## The seventh change: an account is written only by a caller that could have created it
+
+With `sysAccountUpdate`, an API key can update or destroy **every** account. Stalwart's grant rule
+(`can_set_permissions`, `crates/common/src/auth/permissions.rs`) checks what a write *grants*, never
+*whose* account it writes, and every permission is per operation, not per target. So a key holding a
+narrow list (no `impersonate`, nothing server-wide) could reset an Admin's password and clear its TOTP,
+sign in as it, and read every tenant's mail; or do the same to the Admin that owns the key; or destroy
+an Admin (all measured on v0.16.25). No permission list closes it.
+
+[`patches/0007-account-writes-within-the-callers-grant.patch`](patches/0007-account-writes-within-the-callers-grant.patch)
+applies the grant rule once more, to the account **as stored**: an `x:Account` update or destroy is
+refused (*"This account's permissions exceed yours."*) unless the caller holds every permission the
+account has now, i.e. it could have created it. An Admin, the key's own owner, or any account with a
+permission the key lacks is out of reach; an ordinary User, whose permissions a provisioning key must
+hold to create one, is not. A full Admin's key holds everything, so nothing it did changes. Two call
+sites: `validate_account` (every update) and the registry's destroy path.
+
+## The eighth change: admin verbs on a mailbox, without `impersonate`
+
+The methods an operator needs on a customer's mailbox (its Sieve scripts, which is where a forward
+lives; its out-of-office; its sender identities; issuing it an app password) pass upstream's
+`assert_is_member` only for the account itself, a group it belongs to, or `impersonate`. And
+`impersonate` also opens every message, so the only key that could switch a forward off could also
+read the mail it was forwarding.
+
+[`patches/0008-admin-verbs-without-impersonate.patch`](patches/0008-admin-verbs-without-impersonate.patch)
+lets exactly these pass for a caller that is not an owner, when it holds the method's own permission,
+**`sysAccountUpdate`**, the target inside its tenant (any tenant for an untenanted caller), and passes
+0007's rule on the target (one helper, `Server::can_administer_account`):
+
+| Verb | Methods |
+|---|---|
+| list scripts, see which is active | `SieveScript/query`, `SieveScript/get` |
+| switch a forward off or on; delete a script | `SieveScript/set` (deactivate, activate, destroy) |
+| read a script's content | `GET /jmap/download/…` for a blob linked to a **SieveScript only** |
+| edit a script | the caller uploads to **its own** account, then `SieveScript/validate` and `SieveScript/set update` on the target. Nothing opens the target's own uploads |
+| out-of-office | `VacationResponse/get`, `VacationResponse/set` |
+| sender identities | `Identity/get`, `Identity/set` |
+| issue an app password | `x:AppPassword/set` **create only**, within the caller's grants (`Inherit` stays refused; at sign-in a `Replace` list is intersected with the mailbox's own permissions, so it never exceeds the mailbox) |
+
+Nothing that reads mail widens: `Email*`, `Mailbox*`, `Thread`, `SearchSnippet`, `EmailSubmission*`,
+`Blob/get`, `Blob/copy`, `Blob/lookup`, calendars, contacts and files keep upstream's check, and so do
+`x:AppPassword` get, update and destroy (revoking stays on `x:Account`, under 0007). A script set this
+way can `redirect` future mail, which is no more than `sysAccountUpdate` already gives (it can set the
+mailbox's password); that is why the predicate requires it. Without an Enterprise licence a tenanted
+account cannot hold `sysAccountUpdate` at all (Stalwart caps tenanted accounts at the user set), so the
+tenant clause matters only on a licensed deployment.
+
+[`scripts/e2e-admin-verbs.sh`](scripts/e2e-admin-verbs.sh) runs the built image production-shaped: an
+untenanted Admin owns a key with exactly the API's 264 permissions ([`e2e-admin-verbs.perms`](scripts/e2e-admin-verbs.perms),
+no `impersonate`). Every verb is allowed on a User and refused on an Admin and without
+`sysAccountUpdate`; mail stays refused (`Email/get`, `Email/query`, `Blob/get` and a download of a mail
+blob); the forward proof switches a mailbox's forward off and the next message stops reaching the
+forward's target; the import credential (`Replace {authenticate, imap…}` with `expiresAt`) opens IMAP;
+and the key can no longer reset a TOTP Admin, reset its own owner, change or destroy an Admin, while it
+still resets and destroys a User. Against the last image before 0007 and 0008 it fails 26 checks
+(measured), and the build requires it to fail on both bugs' lines there.
+
+Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant1-verbs1`.
 
 ## When this goes away
 
