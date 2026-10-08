@@ -5,7 +5,9 @@
 # Production-shaped: an untenanted Admin `mailadmin` owns an API key limited to exactly the API's
 # permission list (e2e-admin-verbs.perms, 264 permissions, no `impersonate`). 0007: account writes beyond the
 # key's grant are refused, ordinary ones still pass. 0008: Sieve, out-of-office, identity and app-password issue
-# pass on a customer's mailbox, and nothing here may read mail. Every allowed row has a refused twin.
+# pass on a customer's mailbox, and nothing here may read mail through JMAP or a blob download. (An issued app
+# password or a Sieve redirect reaches future mail, as sysAccountUpdate's password reset already does.)
+# Every allowed row has a refused twin.
 set -euo pipefail
 IMG=${1:?usage: $0 <stalwart image>}
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -93,13 +95,16 @@ r1(OA,["x:AccountPassword/set",{"accountId":session(OA)[1]["primaryAccounts"]["u
 check(session(OA)[0]==402, "setup: opsadm's password alone no longer opens a session (TOTP enrolled)")
 
 ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE
-def send(subject):
+def send(subject,to="alice@one.test"):
     with smtplib.SMTP_SSL("stalwart",465,context=ctx,timeout=30) as m:
         m.login("bob@two.test",PW["bob"])
-        m.sendmail("bob@two.test",["alice@one.test"],f"From: bob@two.test\r\nTo: alice@one.test\r\nSubject: {subject}\r\nMessage-ID: <{uuid.uuid4()}@t>\r\n\r\nbody\r\n")
+        m.sendmail("bob@two.test",[to],f"From: bob@two.test\r\nTo: {to}\r\nSubject: {subject}\r\nMessage-ID: <{uuid.uuid4()}@t>\r\n\r\nbody\r\n")
 def has(auth,acc,subject):
-    r=r1(auth,["Email/query",{"accountId":acc,"filter":{"subject":subject}},"q"])
-    return bool(r[1].get("ids"))
+    # Subjects read back directly, not through a full-text filter: indexing is asynchronous, so a
+    # filtered query can miss a message that has arrived (and a "no copy" row would pass for that).
+    ids=r1(auth,["Email/query",{"accountId":acc},"q"])[1].get("ids") or []
+    got=r1(auth,["Email/get",{"accountId":acc,"ids":ids,"properties":["subject"]},"g"])[1].get("list") or [] if ids else []
+    return any(m.get("subject")==subject for m in got)
 def wait_for(auth,acc,subject,secs=30):
     for _ in range(secs):
         if has(auth,acc,subject): return True
@@ -135,16 +140,18 @@ def reset(auth,acc,i,totp=False):
     if totp: u[f"credentials/{ck}/otpAuth"]=None
     r=r1(auth,["x:Account/set",{"accountId":acc,"update":{i:u}},"u"])
     return i in (r[1].get("updated") or {}), r
-up,r=reset(K,KA,ID["opsadm"],True); check(not up, f"0007: the key cannot reset a TOTP Admin's password and TOTP ({json.dumps(r)[:140]})")
-up,r=reset(K,KA,ID["mailadmin"]); check(not up, f"0007: the key cannot reset its own owner mailadmin's password ({json.dumps(r)[:140]})")
+G7="This account's permissions exceed yours."
+by0007=lambda r,kind,i: ((r[1].get(kind) or {}).get(i) or {}).get("description")==G7
+up,r=reset(K,KA,ID["opsadm"],True); check(not up and by0007(r,"notUpdated",ID["opsadm"]), f"0007: the key cannot reset a TOTP Admin's password and TOTP ({json.dumps(r)[:140]})")
+up,r=reset(K,KA,ID["mailadmin"]); check(not up and by0007(r,"notUpdated",ID["mailadmin"]), f"0007: the key cannot reset its own owner mailadmin's password ({json.dumps(r)[:140]})")
 check(session(MA)[0]==200, "0007: mailadmin's password is unchanged")
 # Each destructive row gets its own Admin, so one row's success on an unpatched image cannot make
 # a later row pass for the wrong reason.
 user("yan",DOPS,admin=True); user("zed",DOPS,admin=True)
 r=r1(K,["x:Account/set",{"accountId":KA,"update":{ID["yan"]:{"description":"x"}}},"u"])
-check(ID["yan"] not in (r[1].get("updated") or {}), "0007: the key cannot make ANY change to an Admin (a description)")
+check(ID["yan"] not in (r[1].get("updated") or {}) and by0007(r,"notUpdated",ID["yan"]), "0007: the key cannot make ANY change to an Admin (a description)")
 r=r1(K,["x:Account/set",{"accountId":KA,"destroy":[ID["zed"]]},"d"])
-check(ID["zed"] not in (r[1].get("destroyed") or []), "0007: the key cannot destroy an Admin")
+check(ID["zed"] not in (r[1].get("destroyed") or []) and by0007(r,"notDestroyed",ID["zed"]), "0007: the key cannot destroy an Admin")
 user("dave",D1,T1); user("erin",D2,T2)
 up,_=reset(K,KA,ID["dave"]); check(up, "0007: the key still resets a User's password")
 r=r1(K,["x:Account/set",{"accountId":KA,"destroy":[ID["erin"]]},"d"])
@@ -159,8 +166,8 @@ TARGETS=[("an Admin (opsadm)",K,OPS),("alice without sysAccountUpdate",KN,ALICE)
 def both(name,call_for):
     r=r1(K,call_for(ALICE)); check(ok(r,call_for(ALICE)[0]), f"0008 {name}: allowed on alice ({json.dumps(r)[:120]})")
     for what,auth,acc in TARGETS:
-        r=r1(auth,call_for(acc)); check(refused(r), f"0008 {name}: refused on {what} ({json.dumps(r)[:100]})")
-    return r1(K,call_for(ALICE))
+        rr=r1(auth,call_for(acc)); check(refused(rr), f"0008 {name}: refused on {what} ({json.dumps(rr)[:100]})")
+    return r
 # 1. list scripts and see which is active
 both("SieveScript/query",lambda a:["SieveScript/query",{"accountId":a},"q"])
 g=both("SieveScript/get",lambda a:["SieveScript/get",{"accountId":a},"g"])
@@ -196,6 +203,8 @@ both("SieveScript/set deactivate",lambda a:["SieveScript/set",{"accountId":a,"on
 g=r1(K,["SieveScript/get",{"accountId":ALICE},"g"]); check("list" in g[1] and not any(s["isActive"] for s in g[1]["list"]), "0008: alice has no active script now")
 send("after")
 check(wait_for(AL,ALICE,"after"), "forward proof: alice still receives mail")
+# A sentinel sent straight to carol after "after": once it is in, anything the forward sent would be too.
+send("sentinel","carol@one.test"); check(wait_for(CA,CAROL,"sentinel"), "forward proof: carol receives the sentinel sent after it")
 time.sleep(5); check(not has(CA,CAROL,"after"), "forward proof: carol got NO copy: the forward stopped")
 r=r1(K,["SieveScript/set",{"accountId":ALICE,"onSuccessActivateScript":SPARE},"s"]); check(ok(r,"SieveScript/set") and not r[1].get("notUpdated"), "0008 SieveScript/set activate: allowed on alice")
 r=r1(K,["SieveScript/set",{"accountId":ALICE,"onSuccessDeactivateScript":True},"s"])
@@ -226,6 +235,15 @@ for what,auth,acc in TARGETS:
 if c:
     r=r1(K,["x:AppPassword/set",{"accountId":ALICE,"destroy":[c["id"]]},"d"]); check(refused(r), "0008 x:AppPassword/set destroy on alice: still refused (only issuing passes)")
     r=r1(K,["x:AppPassword/get",{"accountId":ALICE},"g"]); check(refused(r), "0008 x:AppPassword/get on alice: still refused")
+# Only issuing an app password opened: an API key on alice, and a create carrying an update, stay walled.
+r=r1(K,["x:ApiKey/set",{"accountId":ALICE,"create":{"k":{"description":"x","permissions":{"@type":"Replace","permissions":{"authenticate":True}}}}},"k"])
+check(refused(r), "0008: x:ApiKey/set create on alice is still refused (only app passwords opened)")
+r=r1(K,["x:AppPassword/set",{"accountId":ALICE,"create":{"p":{"description":"x","permissions":IMAPP,"allowedIps":IPS}},"update":{"zz":{"description":"x"}}},"p"])
+check(refused(r), "0008: x:AppPassword/set with a create AND an update is refused whole")
+# A third account's mail blob cannot be read through a Sieve verb on alice.
+cm=r1(CA,["Email/query",{"accountId":CAROL},"q"])[1]["ids"][0]
+cb=r1(CA,["Email/get",{"accountId":CAROL,"ids":[cm],"properties":["blobId"]},"g"])[1]["list"][0]["blobId"]
+r=r1(K,["SieveScript/validate",{"accountId":ALICE,"blobId":cb},"v"]); check((r[1].get("error") or {}).get("type")=="blobNotFound", f"mail reach: SieveScript/validate on alice cannot read carol's mail blob ({json.dumps(r)[:120]})")
 # Still refused, as upstream: settings, and minting a wider key
 r=r1(K,["x:Security/set",{"accountId":KA,"update":{"singleton":{"authBanPeriod":86400000}}},"u"]); check(not (r[1].get("updated") or {}), "the key still cannot change server settings")
 r=r1(K,["x:ApiKey/set",{"accountId":MAA,"create":{"k":{"description":"wider","permissions":{"@type":"Inherit"}}}},"k"]); check(not (r[1].get("created") or {}).get("k"), "the key still cannot mint an Inherit key on its owner")

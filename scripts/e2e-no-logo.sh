@@ -54,10 +54,12 @@ ics=(f"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//e2e//EN\r\nBEGIN:VEVENT\r\nUI
      "END:VEVENT\r\nEND:VCALENDAR\r\n").encode()
 s,_=req("/dav/cal/org%40one.test/default/e1.ics",au("org"),raw=ics,ctype="text/calendar",method="PUT")
 check(s==201, f"setup: org creates the event inviting att, with an email reminder ({s})")
+MID={n:mid(n) for n in PW}
 def mail(n,prefix):
-    for i in r1(au(n),["Email/query",{"accountId":mid(n)},"q"])[1].get("ids",[]):
-        g=r1(au(n),["Email/get",{"accountId":mid(n),"ids":[i],"properties":["subject","blobId"]},"g"])[1]["list"][0]
-        if g["subject"].startswith(prefix): return req(f"/jmap/download/{mid(n)}/{g['blobId']}/m",au(n))[1]
+    a,acc=au(n),MID[n]
+    for i in r1(a,["Email/query",{"accountId":acc},"q"])[1].get("ids",[]):
+        g=r1(a,["Email/get",{"accountId":acc,"ids":[i],"properties":["subject","blobId"]},"g"])[1]["list"][0]
+        if g["subject"].startswith(prefix): return req(f"/jmap/download/{acc}/{g['blobId']}/m",a)[1]
 inv=rem=None
 for _ in range(60):
     inv=inv or mail("att","Invitation:"); rem=rem or mail("org","Notification:")

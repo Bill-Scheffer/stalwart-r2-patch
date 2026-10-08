@@ -150,11 +150,13 @@ lets exactly these pass for a caller that is not an owner, when it holds the met
 | sender identities | `Identity/get`, `Identity/set` |
 | issue an app password | `x:AppPassword/set` **create only**, within the caller's grants (`Inherit` stays refused; at sign-in a `Replace` list is intersected with the mailbox's own permissions, so it never exceeds the mailbox) |
 
-Nothing that reads mail widens: `Email*`, `Mailbox*`, `Thread`, `SearchSnippet`, `EmailSubmission*`,
+No JMAP method or blob path that reads mail widens: `Email*`, `Mailbox*`, `Thread`, `SearchSnippet`, `EmailSubmission*`,
 `Blob/get`, `Blob/copy`, `Blob/lookup`, calendars, contacts and files keep upstream's check, and so do
 `x:AppPassword` get, update and destroy (revoking stays on `x:Account`, under 0007). A script set this
-way can `redirect` future mail, which is no more than `sysAccountUpdate` already gives (it can set the
-mailbox's password); that is why the predicate requires it. Without an Enterprise licence a tenanted
+way can `redirect` future mail, and an issued app password signs in to the mailbox: neither is more than
+`sysAccountUpdate` already gives (it can set the mailbox's password), which is why the predicate requires it.
+Two upstream behaviours are left as they are: SCIM (Enterprise-only) deletes accounts on its own path, and a
+Sieve or out-of-office write is counted against the caller's tenant quota rather than the target's. Without an Enterprise licence a tenanted
 account cannot hold `sysAccountUpdate` at all (Stalwart caps tenanted accounts at the user set), so the
 tenant clause matters only on a licensed deployment.
 
@@ -164,7 +166,7 @@ no `impersonate`). Every verb is allowed on a User and refused on an Admin and w
 `sysAccountUpdate`; mail stays refused (`Email/get`, `Email/query`, `Blob/get` and a download of a mail
 blob); the forward proof switches a mailbox's forward off and the next message stops reaching the
 forward's target; the import credential (`Replace {authenticate, imap…}` with `expiresAt`) opens IMAP;
-and accounts beyond the key's grant are refused while a User is still updated and destroyed. Against the last image before 0007 and 0008 it fails 26 checks
+and accounts beyond the key's grant are refused while a User is still updated and destroyed. Against the last image before 0007 and 0008 it fails 27 checks
 (measured), and the build requires it to fail on both bugs' lines there.
 
 ## The ninth change: no Stalwart logo on calendar mail or the RSVP page
