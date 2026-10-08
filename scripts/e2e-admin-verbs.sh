@@ -6,7 +6,7 @@
 # permission list (e2e-admin-verbs.perms, 264 permissions, no `impersonate`). 0007: account writes beyond the
 # key's grant are refused, ordinary ones still pass. 0008: Sieve, out-of-office, identity and app-password issue
 # pass on a customer's mailbox, and nothing here may read mail through JMAP or a blob download. (An issued app
-# password or a Sieve redirect reaches future mail, as sysAccountUpdate's password reset already does.)
+# password reads all of the mailbox's mail over IMAP, as a password reset does; a Sieve redirect copies future mail.)
 # Every allowed row has a refused twin.
 set -euo pipefail
 IMG=${1:?usage: $0 <stalwart image>}

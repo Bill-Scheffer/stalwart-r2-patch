@@ -152,9 +152,9 @@ lets exactly these pass for a caller that is not an owner, when it holds the met
 
 No JMAP method or blob path that reads mail widens: `Email*`, `Mailbox*`, `Thread`, `SearchSnippet`, `EmailSubmission*`,
 `Blob/get`, `Blob/copy`, `Blob/lookup`, calendars, contacts and files keep upstream's check, and so do
-`x:AppPassword` get, update and destroy (revoking stays on `x:Account`, under 0007). A script set this
-way can `redirect` future mail, and an issued app password signs in to the mailbox: neither is more than
-`sysAccountUpdate` already gives (it can set the mailbox's password), which is why the predicate requires it.
+`x:AppPassword` get, update and destroy (revoking stays on `x:Account`, under 0007). An issued app password signs in to the mailbox over IMAP and reads all of its mail, past and future, as a
+password reset does; a script set this way can `redirect` future mail. Neither is more than `sysAccountUpdate`
+already gives (it can set the mailbox's password), which is why the predicate requires it.
 Two upstream behaviours are left as they are: SCIM (Enterprise-only) deletes accounts on its own path, and a
 Sieve or out-of-office write is counted against the caller's tenant quota rather than the target's. Without an Enterprise licence a tenanted
 account cannot hold `sysAccountUpdate` at all (Stalwart caps tenanted accounts at the user set), so the

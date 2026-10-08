@@ -51,7 +51,7 @@ index b02f11a..911acbd 100644
      pub fn can_grant_permissions(
          &self,
 diff --git a/crates/jmap/src/api/request.rs b/crates/jmap/src/api/request.rs
-index 8ccd544..6be431e 100644
+index 8ccd544..d3372a8 100644
 --- a/crates/jmap/src/api/request.rs
 +++ b/crates/jmap/src/api/request.rs
 @@ -47,6 +47,7 @@ use crate::{
@@ -149,15 +149,16 @@ index 8ccd544..6be431e 100644
  
                  self.sieve_script_validate(*req, access_token).await?.into()
              }
-@@ -716,6 +725,27 @@ impl RequestHandler for Server {
+@@ -716,6 +725,28 @@ impl RequestHandler for Server {
      }
  }
  
 +/// MainThrive patch 0008: `assert_is_member`, or an admin verb's caller that
 +/// `Server::can_administer_account` admits. Used only by the methods MainThrive lists, none of
 +/// which reads mail through JMAP: Identity, SieveScript, VacationResponse, and issuing an app
-+/// password. (A Sieve redirect or an issued app password reaches future mail, which the
-+/// `sysAccountUpdate` this requires already can, by setting the account's password.)
++/// password. An issued app password signs in to the mailbox over IMAP and reads all of its mail,
++/// past and future, as a password reset does; a Sieve redirect copies future mail. Both are within
++/// what the `sysAccountUpdate` this requires already allows.
 +async fn assert_can_administer(
 +    server: &Server,
 +    access_token: &AccessToken,
