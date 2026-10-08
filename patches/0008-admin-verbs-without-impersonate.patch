@@ -1,0 +1,197 @@
+diff --git a/crates/common/src/auth/permissions.rs b/crates/common/src/auth/permissions.rs
+index b02f11a..911acbd 100644
+--- a/crates/common/src/auth/permissions.rs
++++ b/crates/common/src/auth/permissions.rs
+@@ -145,6 +145,47 @@ impl Server {
+     }
+ }
+ 
++impl Server {
++    /// MainThrive patch 0008: whether `access_token` may run one of the admin verbs on
++    /// `account_id` (Sieve, out-of-office, identities, issuing an app password) without being
++    /// one of its owners. Upstream allows only owners or `impersonate`, and `impersonate` also
++    /// reads all mail. This needs `sysAccountUpdate`, the account inside the caller's tenant
++    /// (any tenant for an untenanted caller), and the grant rule on the account as stored, so
++    /// it never reaches an Admin or any account holding a permission the caller lacks.
++    pub async fn can_administer_account(
++        &self,
++        access_token: &AccessToken,
++        account_id: u32,
++    ) -> trc::Result<bool> {
++        if !access_token.has_permission(Permission::SysAccountUpdate) {
++            return Ok(false);
++        }
++        let Some(account) = self
++            .registry()
++            .object::<Account>(account_id.into())
++            .await
++            .caused_by(trc::location!())?
++        else {
++            return Ok(false);
++        };
++        let tenant_id = match &account {
++            Account::User(account) => account.member_tenant_id,
++            Account::Group(account) => account.member_tenant_id,
++        };
++        if access_token
++            .tenant_id()
++            .is_some_and(|caller_tenant_id| tenant_id != Some(Id::from(caller_tenant_id)))
++        {
++            return Ok(false);
++        }
++
++        Ok(self
++            .can_set_permissions(access_token, &account)
++            .await?
++            .is_ok())
++    }
++}
++
+ impl AccessToken {
+     pub fn can_grant_permissions(
+         &self,
+diff --git a/crates/jmap/src/api/request.rs b/crates/jmap/src/api/request.rs
+index 8ccd544..e75778f 100644
+--- a/crates/jmap/src/api/request.rs
++++ b/crates/jmap/src/api/request.rs
+@@ -47,6 +47,7 @@ use crate::{
+ };
+ use common::{Server, auth::AccessToken};
+ use http_proto::HttpSessionData;
++use registry::schema::prelude::ObjectType;
+ use jmap_proto::{
+     request::{
+         Call, CopyRequestMethod, GetRequestMethod, INVALID_ACCOUNT_ID, ParseRequestMethod,
+@@ -270,7 +271,7 @@ impl RequestHandler for Server {
+                 }
+                 GetRequestMethod::Identity(mut req) => {
+                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
+-                    access_token.assert_is_member(req.account_id)?;
++                    assert_can_administer(self, access_token, req.account_id).await?;
+ 
+                     self.identity_get(*req).await?.into()
+                 }
+@@ -286,13 +287,13 @@ impl RequestHandler for Server {
+                 }
+                 GetRequestMethod::Sieve(mut req) => {
+                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
+-                    access_token.assert_is_member(req.account_id)?;
++                    assert_can_administer(self, access_token, req.account_id).await?;
+ 
+                     self.sieve_script_get(*req).await?.into()
+                 }
+                 GetRequestMethod::VacationResponse(mut req) => {
+                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
+-                    access_token.assert_is_member(req.account_id)?;
++                    assert_can_administer(self, access_token, req.account_id).await?;
+ 
+                     self.vacation_response_get(*req).await?.into()
+                 }
+@@ -399,7 +400,7 @@ impl RequestHandler for Server {
+                 }
+                 QueryRequestMethod::Sieve(mut req) => {
+                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
+-                    access_token.assert_is_member(req.account_id)?;
++                    assert_can_administer(self, access_token, req.account_id).await?;
+ 
+                     self.sieve_script_query(*req).await?.into()
+                 }
+@@ -484,7 +485,7 @@ impl RequestHandler for Server {
+                 }
+                 SetRequestMethod::Identity(mut req) => {
+                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
+-                    access_token.assert_is_member(req.account_id)?;
++                    assert_can_administer(self, access_token, req.account_id).await?;
+ 
+                     self.identity_set(*req).await?.into()
+                 }
+@@ -502,7 +503,7 @@ impl RequestHandler for Server {
+                 }
+                 SetRequestMethod::Sieve(mut req) => {
+                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
+-                    access_token.assert_is_member(req.account_id)?;
++                    assert_can_administer(self, access_token, req.account_id).await?;
+ 
+                     self.sieve_script_set(*req, access_token, session)
+                         .await?
+@@ -510,7 +511,7 @@ impl RequestHandler for Server {
+                 }
+                 SetRequestMethod::VacationResponse(mut req) => {
+                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
+-                    access_token.assert_is_member(req.account_id)?;
++                    assert_can_administer(self, access_token, req.account_id).await?;
+ 
+                     self.vacation_response_set(*req, access_token).await?.into()
+                 }
+@@ -574,7 +575,15 @@ impl RequestHandler for Server {
+                 }
+                 SetRequestMethod::Registry(mut req) => {
+                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
+-                    access_token.assert_is_member(req.account_id)?;
++                    // MainThrive patch 0008: issuing an app password, and only issuing one.
++                    if method_name.obj.unwrap_registry() == ObjectType::AppPassword
++                        && req.update.is_none()
++                        && req.destroy.is_none()
++                    {
++                        assert_can_administer(self, access_token, req.account_id).await?;
++                    } else {
++                        access_token.assert_is_member(req.account_id)?;
++                    }
+ 
+                     Box::pin(self.registry_set(
+                         method_name.obj.unwrap_registry(),
+@@ -684,7 +693,7 @@ impl RequestHandler for Server {
+             }
+             RequestMethod::ValidateScript(mut req) => {
+                 resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
+-                access_token.assert_is_member(req.account_id)?;
++                assert_can_administer(self, access_token, req.account_id).await?;
+ 
+                 self.sieve_script_validate(*req, access_token).await?.into()
+             }
+@@ -716,6 +725,25 @@ impl RequestHandler for Server {
+     }
+ }
+ 
++/// MainThrive patch 0008: `assert_is_member`, or an admin verb's caller that
++/// `Server::can_administer_account` admits. Used only by the methods MainThrive lists, none of
++/// which reads mail: Identity, SieveScript, VacationResponse, and issuing an app password.
++async fn assert_can_administer(
++    server: &Server,
++    access_token: &AccessToken,
++    account_id: Id,
++) -> trc::Result<()> {
++    if access_token.is_member(account_id.document_id())
++        || server
++            .can_administer_account(access_token, account_id.document_id())
++            .await?
++    {
++        Ok(())
++    } else {
++        access_token.assert_is_member(account_id).map(|_| ())
++    }
++}
++
+ pub(crate) fn resolve_account_id(
+     account_id: &mut Id,
+     obj: MethodObject,
+diff --git a/crates/jmap/src/blob/download.rs b/crates/jmap/src/blob/download.rs
+index 741aa9a..845f57f 100644
+--- a/crates/jmap/src/blob/download.rs
++++ b/crates/jmap/src/blob/download.rs
+@@ -136,6 +136,15 @@ impl BlobDownload for Server {
+                                         .caused_by(trc::location!())?
+                                         .shared_items(access_token, [Acl::ReadItems], true)
+                                         .contains(*document_id),
++                                    // MainThrive patch 0008: a script's content, for an admin
++                                    // verb's caller. No other collection widens.
++                                    Collection::SieveScript => {
++                                        access_token.has_permission(Permission::JmapSieveScriptGet)
++                                            && self
++                                                .can_administer_account(access_token, *account_id)
++                                                .await
++                                                .caused_by(trc::location!())?
++                                    }
+                                     _ => false,
+                                 }
+                             }
