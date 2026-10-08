@@ -225,7 +225,7 @@ for what,auth,acc in TARGETS:
 IPS={n:True for n in ("10.0.0.0/8","172.16.0.0/12","192.168.0.0/16")}; exp=time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime(time.time()+3600))
 ap=lambda a,p:["x:AppPassword/set",{"accountId":a,"create":{"p":{"description":"import","permissions":p,"allowedIps":IPS,"expiresAt":exp}}},"p"]
 IMAPP={"@type":"Replace","permissions":{p:True for p in ["authenticate","imapAuthenticate","imapSelect","imapExamine","imapList","imapAppend","imapCreate","imapStatus","imapFetch"]}}
-r=r1(K,ap(ALICE,IMAPP)); c=(r[1].get("created") or {}).get("p"); check(bool(c), f"0008 x:AppPassword/set create: the import credential is issued on alice ({json.dumps(r)[:200]})")
+r=r1(K,ap(ALICE,IMAPP)); c=(r[1].get("created") or {}).get("p"); check(bool(c), "0008 x:AppPassword/set create: the import credential is issued on alice"+("" if c else f" ({json.dumps(r)[:200]})"))  # never print the secret
 if c:
     M=imaplib.IMAP4_SSL("stalwart",993,ssl_context=ctx); t,_=M.login("alice@one.test",c["secret"])
     check(t=="OK" and M.select("INBOX")[0]=="OK", "0008: alice's IMAP opens with it (the import worker's path)"); M.logout()
