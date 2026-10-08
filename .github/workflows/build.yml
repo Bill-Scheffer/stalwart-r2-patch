@@ -22,8 +22,6 @@
 #    every ban after the first is logged and never enforced (measured). All four ban kinds use it.
 # 7. patches/0007-account-writes-within-the-callers-grant.patch: an account may be updated or destroyed only
 #    by a caller that holds every permission it has (the grant rule, applied to the target as stored).
-#    Upstream's sysAccountUpdate reaches every account, so a narrow API key could reset an Admin's password,
-#    or its own owner's, and take it over (measured).
 # 8. patches/0008-admin-verbs-without-impersonate.patch: Sieve, out-of-office, identities and issuing an app
 #    password on another account, for a caller with sysAccountUpdate that 0007's rule admits. Upstream passes
 #    them only for the account itself or `impersonate`, which also reads all mail. Nothing that reads mail widens.

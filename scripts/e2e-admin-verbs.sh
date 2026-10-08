@@ -3,14 +3,9 @@
 # a narrow key. usage: e2e-admin-verbs.sh <stalwart image>
 #
 # Production-shaped: an untenanted Admin `mailadmin` owns an API key limited to exactly the API's
-# permission list (e2e-admin-verbs.perms, 264 permissions, no `impersonate`). Upstream v0.16.25:
-#   - that key resets an Admin's password and TOTP, or its own owner's, and takes it over (0007);
-#   - it cannot run Sieve, out-of-office, identity or app-password issue on a customer's mailbox,
-#     because each passes only for the account itself or `impersonate`, which also reads all mail
-#     (0008).
-# The patches refuse the first and allow the second, and nothing here may read mail. Every allowed
-# row has a refused twin: an Admin target, the key's own owner, another tenant through a tenant
-# key, and a key without `sysAccountUpdate`.
+# permission list (e2e-admin-verbs.perms, 264 permissions, no `impersonate`). 0007: account writes beyond the
+# key's grant are refused, ordinary ones still pass. 0008: Sieve, out-of-office, identity and app-password issue
+# pass on a customer's mailbox, and nothing here may read mail. Every allowed row has a refused twin.
 set -euo pipefail
 IMG=${1:?usage: $0 <stalwart image>}
 HERE=$(cd "$(dirname "$0")" && pwd)

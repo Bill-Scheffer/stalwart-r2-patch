@@ -116,12 +116,8 @@ the step passed having measured nothing.
 
 ## The seventh change: an account is written only by a caller that could have created it
 
-With `sysAccountUpdate`, an API key can update or destroy **every** account. Stalwart's grant rule
-(`can_set_permissions`, `crates/common/src/auth/permissions.rs`) checks what a write *grants*, never
-*whose* account it writes, and every permission is per operation, not per target. So a key holding a
-narrow list (no `impersonate`, nothing server-wide) could reset an Admin's password and clear its TOTP,
-sign in as it, and read every tenant's mail; or do the same to the Admin that owns the key; or destroy
-an Admin (all measured on v0.16.25). No permission list closes it.
+Stalwart's grant rule (`can_set_permissions`, `crates/common/src/auth/permissions.rs`) checks what an account
+write *grants*. It does not check *whose* account is written, and `sysAccountUpdate` applies to every account.
 
 [`patches/0007-account-writes-within-the-callers-grant.patch`](patches/0007-account-writes-within-the-callers-grant.patch)
 applies the grant rule once more, to the account **as stored**: an `x:Account` update or destroy is
@@ -168,8 +164,7 @@ no `impersonate`). Every verb is allowed on a User and refused on an Admin and w
 `sysAccountUpdate`; mail stays refused (`Email/get`, `Email/query`, `Blob/get` and a download of a mail
 blob); the forward proof switches a mailbox's forward off and the next message stops reaching the
 forward's target; the import credential (`Replace {authenticate, imap…}` with `expiresAt`) opens IMAP;
-and the key can no longer reset a TOTP Admin, reset its own owner, change or destroy an Admin, while it
-still resets and destroys a User. Against the last image before 0007 and 0008 it fails 26 checks
+and accounts beyond the key's grant are refused while a User is still updated and destroyed. Against the last image before 0007 and 0008 it fails 26 checks
 (measured), and the build requires it to fail on both bugs' lines there.
 
 ## The ninth change: no Stalwart logo on calendar mail or the RSVP page
