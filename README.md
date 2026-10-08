@@ -1,10 +1,10 @@
 # stalwart-r2-patch
 
-[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **eight**
+[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **nine**
 changes: it can delete blobs from **Cloudflare R2**, **sharing never crosses tenants**, stored files
 and mail written into a mailbox are **scanned**, a ban that expired is **enforced again**, a narrow
-key **cannot take over an Admin**, and an operator can run **admin verbs on a mailbox without reading
-its mail**.
+key **cannot take over an Admin**, an operator can run **admin verbs on a mailbox without reading
+its mail**, and calendar mail carries **no Stalwart logo**.
 
 ## The problem
 
@@ -172,7 +172,26 @@ and the key can no longer reset a TOTP Admin, reset its own owner, change or des
 still resets and destroys a User. Against the last image before 0007 and 0008 it fails 26 checks
 (measured), and the build requires it to fail on both bugs' lines there.
 
-Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant1-verbs1`.
+## The ninth change: no Stalwart logo on calendar mail or the RSVP page
+
+Every calendar invitation and reminder upstream sends carries Stalwart's logo: the compiled-in templates
+(`resources/html-templates/calendar-{invite,alarm}.html`, through `include_str!`) place `<img src="{{logo_cid}}">`,
+and `imip.rs` and `alarm.rs` attach the image as an inline part, falling back to the built-in
+`DEFAULT_LOGO_BASE64` because the per-domain logo is Enterprise-only. The guest RSVP page draws Stalwart's SVG
+logo while it tries `/logo`, also Enterprise-only. There is no setting for any of it in either edition:
+Enterprise can only swap the image, never remove it.
+
+[`patches/0009-no-logo-on-calendar-mail-and-rsvp.patch`](patches/0009-no-logo-on-calendar-mail-and-rsvp.patch)
+replaces the logo row in both templates (and their `.min` builds) with a 16 px spacer, stops attaching the
+image part, and removes the RSVP page's SVG and the 72 px box it sat in (`.html`, `.min`, and the `.min.gz` the
+server actually serves, regenerated so Stalwart's own sync test holds). Stalwart's admin login page is left
+as it is: it is not customer-facing.
+[`scripts/e2e-no-logo.sh`](scripts/e2e-no-logo.sh) sends a real invitation and a real reminder (a CalDAV event
+with an attendee and an email alarm) and asserts that neither carries an image part or a `cid:logo`, that
+both keep their HTML (and the invitation its `text/calendar`), and that the RSVP page carries no logo SVG.
+Against the last image before 0009 its five logo checks fail (measured), and the build requires them to.
+
+Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant1-verbs1-nologo1`.
 
 ## When this goes away
 
