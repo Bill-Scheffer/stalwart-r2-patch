@@ -3,7 +3,7 @@
 # a narrow key. usage: e2e-admin-verbs.sh <stalwart image>
 #
 # Production-shaped: an untenanted Admin `mailadmin` owns an API key limited to exactly the API's
-# permission list (e2e-admin-verbs.perms, 264 permissions, no `impersonate`). 0007: account writes beyond the
+# permission list (e2e-admin-verbs.perms, 264 permissions, no `impersonate`). 0007: account writes (and group joins) beyond the
 # key's grant are refused, ordinary ones still pass. 0008: Sieve, out-of-office, identity and app-password issue
 # pass on a customer's mailbox, and nothing here may read mail through JMAP or a blob download. (An issued app
 # password reads all of the mailbox's mail over IMAP, as a password reset does; a Sieve redirect copies future mail.)
@@ -157,6 +157,21 @@ up,_=reset(K,KA,ID["dave"]); check(up, "0007: the key still resets a User's pass
 r=r1(K,["x:Account/set",{"accountId":KA,"destroy":[ID["erin"]]},"d"])
 check(ID["erin"] in (r[1].get("destroyed") or []), "0007: the key still destroys a User")
 up,_=reset(ADM,A,ID["yan"]); check(up, "0007: a full Admin still resets an Admin (the control that has to say yes)")
+# 0007, groups: joining a group needs the caller's grant to cover the group's permissions; leaving one does not.
+def group(n,perms=None):
+    v={"@type":"Group","name":n,"domainId":DOPS}
+    if perms: v["permissions"]={"@type":"Merge","enabledPermissions":{p:True for p in perms}}
+    ID[n]=created(r1(ADM,["x:Account/set",{"accountId":A,"create":{"g":v}},"g"]),"g")["id"]
+group("privg",["impersonate"]); group("plaing"); user("gus",DOPS)
+GG="This group's permissions exceed yours."
+join=lambda auth,acc,i,g,on=True: r1(auth,["x:Account/set",{"accountId":acc,"update":{i:{f"memberGroupIds/{g}":on}}},"u"])
+r=join(K,KA,ID["gus"],ID["privg"])
+check(ID["gus"] not in (r[1].get("updated") or {}) and ((r[1].get("notUpdated") or {}).get(ID["gus"]) or {}).get("description")==GG, f"0007: the key cannot add a User to a group holding a permission it lacks ({json.dumps(r)[:140]})")
+r=r1(K,["x:Account/set",{"accountId":KA,"create":{"c":{"@type":"User","name":"hal","domainId":DOPS,"memberGroupIds":{ID["privg"]:True}}}},"c"])
+check(not (r[1].get("created") or {}).get("c") and ((r[1].get("notCreated") or {}).get("c") or {}).get("description")==GG, f"0007: the key cannot create a User inside that group ({json.dumps(r)[:140]})")
+r=join(K,KA,ID["gus"],ID["plaing"]); check(ID["gus"] in (r[1].get("updated") or {}), f"0007: the key still adds a User to a group within its grant ({json.dumps(r)[:140]})")
+r=join(ADM,A,ID["gus"],ID["privg"]); check(ID["gus"] in (r[1].get("updated") or {}), "0007: a full Admin still adds a User to that group (the control that has to say yes)")
+r=join(K,KA,ID["gus"],ID["privg"],None); check(ID["gus"] in (r[1].get("updated") or {}), f"0007: the key still removes a member from that group ({json.dumps(r)[:140]})")
 
 # 0008: the nine verbs, on alice, through the key; each refused for the refusal targets.
 refused=lambda r: r[0]=="error" and r[1].get("type")=="forbidden"

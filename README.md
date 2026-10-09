@@ -127,6 +127,10 @@ permission the key lacks is out of reach; an ordinary User, whose permissions a 
 hold to create one, is not. A full Admin's key holds everything, so nothing it did changes. Two call
 sites: `validate_account` (every update) and the registry's destroy path.
 
+The same rule covers group membership. Adding an account to a group, on create or update, is refused
+(*"This group's permissions exceed yours."*) unless the caller holds every permission the group has.
+Leaving a group needs no check.
+
 ## The eighth change: admin verbs on a mailbox, without `impersonate`
 
 The methods an operator needs on a customer's mailbox (its Sieve scripts, which is where a forward
@@ -166,7 +170,8 @@ no `impersonate`). Every verb is allowed on a User and refused on an Admin and w
 `sysAccountUpdate`; mail stays refused (`Email/get`, `Email/query`, `Blob/get` and a download of a mail
 blob); the forward proof switches a mailbox's forward off and the next message stops reaching the
 forward's target; the import credential (`Replace {authenticate, imap…}` with `expiresAt`) opens IMAP;
-and accounts beyond the key's grant are refused while a User is still updated and destroyed. Against the last image before 0007 and 0008 it fails 27 checks
+and accounts beyond the key's grant are refused while a User is still updated and destroyed; so is adding a User to a
+group beyond it, while a group within it is still joined and a member still removed. Against the last image before 0007 and 0008 it fails 29 checks
 (measured), and the build requires it to fail on both bugs' lines there.
 
 ## The ninth change: no Stalwart logo on calendar mail or the RSVP page
@@ -188,7 +193,7 @@ with an attendee and an email alarm) and asserts that neither carries an image p
 both keep their HTML (and the invitation its `text/calendar`), and that the RSVP page carries no logo SVG.
 Against the last image before 0009 its five logo checks fail (measured), and the build requires them to.
 
-Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant1-verbs1-nologo1`.
+Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1`.
 
 ## When this goes away
 

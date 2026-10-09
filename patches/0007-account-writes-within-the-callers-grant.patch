@@ -1,8 +1,8 @@
 diff --git a/crates/jmap/src/registry/mapping/principal.rs b/crates/jmap/src/registry/mapping/principal.rs
-index 30a5ff2..e442f46 100644
+index 30a5ff2..99ddb3c 100644
 --- a/crates/jmap/src/registry/mapping/principal.rs
 +++ b/crates/jmap/src/registry/mapping/principal.rs
-@@ -54,6 +54,13 @@ pub async fn validate_account(
+@@ -54,6 +54,39 @@ pub async fn validate_account(
      }
      // SPDX-SnippetEnd
  
@@ -13,10 +13,36 @@ index 30a5ff2..e442f46 100644
 +        return Ok(Err(err));
 +    }
 +
++    // MainThrive patch 0007: so must every group the account joins. Leaving one needs no check.
++    if let Account::User(new_account) = &*account {
++        let old_group_ids = match old_account {
++            AccountUpdate::Update(Account::User(old_account)) => Some(&old_account.member_group_ids),
++            _ => None,
++        };
++        for group_id in new_account.member_group_ids.iter() {
++            if old_group_ids.is_some_and(|old_group_ids| old_group_ids.contains(group_id)) {
++                continue;
++            }
++            if let Some(group) = server
++                .registry()
++                .object::<Account>(*group_id)
++                .await
++                .caused_by(trc::location!())?
++                && server
++                    .can_set_permissions(access_token, &group)
++                    .await?
++                    .is_err()
++            {
++                return Ok(Err(SetError::forbidden()
++                    .with_description("This group's permissions exceed yours.")));
++            }
++        }
++    }
++
      let is_external_directory = if let Account::User(account) = account {
          server
              .domain_by_id(account.domain_id.document_id())
-@@ -272,6 +279,23 @@ pub async fn validate_account(
+@@ -272,6 +305,23 @@ pub async fn validate_account(
      result
  }
  

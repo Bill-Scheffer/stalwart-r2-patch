@@ -21,7 +21,8 @@
 #    expired entry (a set compared by address alone; a conflicting insert), so with a ban period set
 #    every ban after the first is logged and never enforced (measured). All four ban kinds use it.
 # 7. patches/0007-account-writes-within-the-callers-grant.patch: an account may be updated or destroyed only
-#    by a caller that holds every permission it has (the grant rule, applied to the target as stored).
+#    by a caller that holds every permission it has (the grant rule, applied to the target as stored), and
+#    may join a group only if the caller holds every permission the group has.
 # 8. patches/0008-admin-verbs-without-impersonate.patch: Sieve, out-of-office, identities and issuing an app
 #    password on another account, for a caller with sysAccountUpdate that 0007's rule admits. Upstream passes
 #    them only for the account itself or `impersonate`, which also reads all mail. Nothing that reads mail widens.
@@ -54,7 +55,7 @@ env:
   RUSTS3_REV: 505aded53d2e668bad472bd7834019e8b1f7a4dd
   IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch
   # The tag after the Stalwart release: bump it with any change to what is built.
-  VARIANT: rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant1-verbs1-nologo1
+  VARIANT: rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1
   # A FIXED image that HAS the expired-ban bug (the last build before 0006), which the ban-expiry check must FAIL
   # on the bug's own line: that proves the check can fail. ⛔ NEVER bumped with releases: every build after 0006
   # lacks the bug and PASSES the check, so it could never be the reference. Pinned by tag AND digest, because a tag
@@ -300,6 +301,7 @@ jobs:
         run: |
           bash patch/scripts/previous-must-fail.sh "${MAI970_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-admin-verbs.sh \
             'FAIL 0007: the key cannot destroy an Admin' \
+            'FAIL 0007: the key cannot add a User to a group holding a permission it lacks' \
             'FAIL forward proof: carol got NO copy: the forward stopped'
 
       - name: No logo on a calendar invitation, a reminder or the RSVP page (end to end, the built image)
