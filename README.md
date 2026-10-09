@@ -1,8 +1,10 @@
 # stalwart-r2-patch
 
-[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **six**
+[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **nine**
 changes: it can delete blobs from **Cloudflare R2**, **sharing never crosses tenants**, stored files
-and mail written into a mailbox are **scanned**, and a ban that expired is **enforced again**.
+and mail written into a mailbox are **scanned**, a ban that expired is **enforced again**, a narrow
+key **cannot take over an Admin**, an operator can run **admin verbs on a mailbox without reading
+its mail**, and calendar mail carries **no Stalwart logo**.
 
 ## The problem
 
@@ -112,7 +114,86 @@ NEVER bumped with releases (every later build lacks the bug and passes). It must
 other reason (`tests/previous-must-fail.test.sh`). Before that, a new Stalwart tag made the pull fail silently and
 the step passed having measured nothing.
 
-Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3-banexpiry1`.
+## The seventh change: an account is written only by a caller that could have created it
+
+Stalwart's grant rule (`can_set_permissions`, `crates/common/src/auth/permissions.rs`) checks what an account
+write *grants*. It does not check *whose* account is written, and `sysAccountUpdate` applies to every account.
+
+[`patches/0007-account-writes-within-the-callers-grant.patch`](patches/0007-account-writes-within-the-callers-grant.patch)
+applies the grant rule once more, to the account **as stored**: an `x:Account` update or destroy is
+refused (*"This account's permissions exceed yours."*) unless the caller holds every permission the
+account has now, i.e. it could have created it. An Admin, the key's own owner, or any account with a
+permission the key lacks is out of reach; an ordinary User, whose permissions a provisioning key must
+hold to create one, is not. A full Admin's key holds everything, so nothing it did changes. Two call
+sites: `validate_account` (every update) and the registry's destroy path.
+
+The same rule covers group membership. Adding an account to a group, on create or update, is refused
+(*"This group's permissions exceed yours."*) unless the caller holds every permission the group has.
+Leaving a group needs no check.
+
+## The eighth change: admin verbs on a mailbox, without `impersonate`
+
+The methods an operator needs on a customer's mailbox (its Sieve scripts, which is where a forward
+lives; its out-of-office; its sender identities; issuing it an app password) pass upstream's
+`assert_is_member` only for the account itself, a group it belongs to, or `impersonate`. And
+`impersonate` also opens every message, so the only key that could switch a forward off could also
+read the mail it was forwarding.
+
+[`patches/0008-admin-verbs-without-impersonate.patch`](patches/0008-admin-verbs-without-impersonate.patch)
+lets exactly these pass for a caller that is not an owner, when it holds the method's own permission,
+**`sysAccountUpdate`**, the target inside its tenant (any tenant for an untenanted caller), and passes
+0007's rule on the target (one helper, `Server::can_administer_account`):
+
+| Verb | Methods |
+|---|---|
+| list scripts, see which is active | `SieveScript/query`, `SieveScript/get` |
+| switch a forward off or on; delete a script | `SieveScript/set` (deactivate, activate, destroy) |
+| read a script's content | `GET /jmap/download/…` for a blob linked to a **SieveScript only** |
+| edit a script | the caller uploads to **its own** account, then `SieveScript/validate` and `SieveScript/set update` on the target. Nothing opens the target's own uploads |
+| out-of-office | `VacationResponse/get`, `VacationResponse/set` |
+| sender identities | `Identity/get`, `Identity/set` |
+| issue an app password | `x:AppPassword/set` **create only**, within the caller's grants (`Inherit` stays refused; at sign-in a `Replace` list is intersected with the mailbox's own permissions, so it never exceeds the mailbox) |
+
+No JMAP method or blob path that reads mail widens: `Email*`, `Mailbox*`, `Thread`, `SearchSnippet`, `EmailSubmission*`,
+`Blob/get`, `Blob/copy`, `Blob/lookup`, calendars, contacts and files keep upstream's check, and so do
+`x:AppPassword` get, update and destroy (revoking stays on `x:Account`, under 0007). An issued app password signs in to the mailbox over IMAP and reads all of its mail, past and future, as a
+password reset does; a script set this way can `redirect` future mail. Neither is more than `sysAccountUpdate`
+already gives (it can set the mailbox's password), which is why the predicate requires it.
+Two upstream behaviours are left as they are: SCIM (Enterprise-only) deletes accounts on its own path, and a
+Sieve or out-of-office write is counted against the caller's tenant quota rather than the target's. Without an Enterprise licence a tenanted
+account cannot hold `sysAccountUpdate` at all (Stalwart caps tenanted accounts at the user set), so the
+tenant clause matters only on a licensed deployment.
+
+[`scripts/e2e-admin-verbs.sh`](scripts/e2e-admin-verbs.sh) runs the built image production-shaped: an
+untenanted Admin owns a key with exactly the API's 264 permissions ([`e2e-admin-verbs.perms`](scripts/e2e-admin-verbs.perms),
+no `impersonate`). Every verb is allowed on a User and refused on an Admin and without
+`sysAccountUpdate`; mail stays refused (`Email/get`, `Email/query`, `Blob/get` and a download of a mail
+blob); the forward proof switches a mailbox's forward off and the next message stops reaching the
+forward's target; the import credential (`Replace {authenticate, imap…}` with `expiresAt`) opens IMAP;
+and accounts beyond the key's grant are refused while a User is still updated and destroyed; so is adding a User to a
+group beyond it, while a group within it is still joined and a member still removed. Against the last image before 0007 and 0008 it fails 29 checks
+(measured), and the build requires it to fail on both bugs' lines there.
+
+## The ninth change: no Stalwart logo on calendar mail or the RSVP page
+
+Every calendar invitation and reminder upstream sends carries Stalwart's logo: the compiled-in templates
+(`resources/html-templates/calendar-{invite,alarm}.html`, through `include_str!`) place `<img src="{{logo_cid}}">`,
+and `imip.rs` and `alarm.rs` attach the image as an inline part, falling back to the built-in
+`DEFAULT_LOGO_BASE64` because the per-domain logo is Enterprise-only. The guest RSVP page draws Stalwart's SVG
+logo while it tries `/logo`, also Enterprise-only. There is no setting for any of it in either edition:
+Enterprise can only swap the image, never remove it.
+
+[`patches/0009-no-logo-on-calendar-mail-and-rsvp.patch`](patches/0009-no-logo-on-calendar-mail-and-rsvp.patch)
+replaces the logo row in both templates (and their `.min` builds) with a 16 px spacer, stops attaching the
+image part, and removes the RSVP page's SVG and the 72 px box it sat in (`.html`, `.min`, and the `.min.gz` the
+server actually serves, regenerated so Stalwart's own sync test holds). Stalwart's admin login page is left
+as it is: it is not customer-facing.
+[`scripts/e2e-no-logo.sh`](scripts/e2e-no-logo.sh) sends a real invitation and a real reminder (a CalDAV event
+with an attendee and an email alarm) and asserts that neither carries an image part or a `cid:logo`, that
+both keep their HTML (and the invitation its `text/calendar`), and that the RSVP page carries no logo SVG.
+Against the last image before 0009 its five logo checks fail (measured), and the build requires them to.
+
+Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1`.
 
 ## When this goes away
 

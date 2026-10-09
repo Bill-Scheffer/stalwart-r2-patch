@@ -1,4 +1,4 @@
-# Builds Stalwart from its own release source with SIX changes, each pinned to its exact files:
+# Builds Stalwart from its own release source with NINE changes, each pinned to its exact files:
 # 1. the rust-s3 crate is taken from the commit of rust-s3 PR #467, which stops DeleteObject signing
 #    headers it never sends. Without it, every blob DELETE against Cloudflare R2 fails with
 #    SignatureDoesNotMatch (rust-s3 #466, Stalwart #3185).
@@ -20,6 +20,15 @@
 #    earns a new one, in memory and in the stored list, here and on every node. Upstream keeps the
 #    expired entry (a set compared by address alone; a conflicting insert), so with a ban period set
 #    every ban after the first is logged and never enforced (measured). All four ban kinds use it.
+# 7. patches/0007-account-writes-within-the-callers-grant.patch: an account may be updated or destroyed only
+#    by a caller that holds every permission it has (the grant rule, applied to the target as stored), and
+#    may join a group only if the caller holds every permission the group has.
+# 8. patches/0008-admin-verbs-without-impersonate.patch: Sieve, out-of-office, identities and issuing an app
+#    password on another account, for a caller with sysAccountUpdate that 0007's rule admits. Upstream passes
+#    them only for the account itself or `impersonate`, which also reads all mail. Nothing that reads mail widens.
+# 9. patches/0009-no-logo-on-calendar-mail-and-rsvp.patch: no Stalwart logo on a calendar invitation, a reminder
+#    or the guest RSVP page. The templates are compiled in (both editions; Enterprise can only swap the image), and
+#    upstream attaches its built-in logo to every invitation and reminder (measured).
 # Everything else is upstream: the tag's source, its Dockerfile, its features.
 name: build
 
@@ -46,12 +55,15 @@ env:
   RUSTS3_REV: 505aded53d2e668bad472bd7834019e8b1f7a4dd
   IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch
   # The tag after the Stalwart release: bump it with any change to what is built.
-  VARIANT: rusts3-505aded-tenantacl2-filescan3-banexpiry1
+  VARIANT: rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1
   # A FIXED image that HAS the expired-ban bug (the last build before 0006), which the ban-expiry check must FAIL
   # on the bug's own line: that proves the check can fail. ⛔ NEVER bumped with releases: every build after 0006
   # lacks the bug and PASSES the check, so it could never be the reference. Pinned by tag AND digest, because a tag
   # can be re-pushed (a push to main rebuilds and re-pushes the current tag).
   BAN_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:v0.16.24-rusts3-505aded-tenantacl2-filescan3@sha256:6d15a5ade004aadec046b10541dccce7135122d3c8cd5361df61ec6e3822f9db
+  # The same for 0007, 0008 and 0009: the last build before them, which the admin-verbs and no-logo checks must
+  # FAIL on their bugs' own lines. ⛔ NEVER bumped, for the same reason.
+  MAI970_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:v0.16.25-rusts3-505aded-tenantacl2-filescan3-banexpiry1@sha256:e3e1e06a762ef80c4fae432df6a41a6e48bef2648e1cd2f9a9fe38c0bc171324
 
 jobs:
   build:
@@ -178,6 +190,53 @@ jobs:
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
+          # Stage 0006, so the next step's diff under crates/ is 0007 alone.
+          git add -- crates/
+
+      - name: Apply the account-write grant patch, and prove it changed only its own files
+        working-directory: stalwart
+        run: |
+          set -eu
+          P=../patch/patches/0007-account-writes-within-the-callers-grant.patch
+          git apply --check "$P" && git apply "$P"
+          got=$(git diff --name-only | sort | tr '\n' ' ')
+          [ "$got" = "Cargo.lock Cargo.toml crates/jmap/src/registry/mapping/principal.rs crates/jmap/src/registry/set.rs " ] \
+            || { echo "::error::changed files: $got"; exit 1; }
+          diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
+            || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
+          # Stage 0007, so the next step's diff under crates/ is 0008 alone.
+          git add -- crates/
+
+      - name: Apply the admin-verbs patch, and prove it changed only its own files
+        working-directory: stalwart
+        run: |
+          set -eu
+          P=../patch/patches/0008-admin-verbs-without-impersonate.patch
+          git apply --check "$P" && git apply "$P"
+          got=$(git diff --name-only | sort | tr '\n' ' ')
+          [ "$got" = "Cargo.lock Cargo.toml crates/common/src/auth/permissions.rs crates/jmap/src/api/request.rs crates/jmap/src/blob/download.rs " ] \
+            || { echo "::error::changed files: $got"; exit 1; }
+          diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
+            || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
+          # Stage 0008, so the next step's diff is 0009 alone.
+          git add -- crates/
+
+      - name: Apply the no-logo patch, and prove it changed only its own files
+        working-directory: stalwart
+        run: |
+          set -eu
+          P=../patch/patches/0009-no-logo-on-calendar-mail-and-rsvp.patch
+          git apply --check "$P" && git apply "$P"
+          got=$(git diff --name-only | sort | tr '\n' ' ')
+          T=resources/html-templates
+          [ "$got" = "Cargo.lock Cargo.toml crates/services/src/task_manager/alarm.rs crates/services/src/task_manager/imip.rs $T/calendar-alarm.html $T/calendar-alarm.html.min $T/calendar-invite.html $T/calendar-invite.html.min $T/calendar-rsvp.html $T/calendar-rsvp.html.min $T/calendar-rsvp.html.min.gz " ] \
+            || { echo "::error::changed files: $got"; exit 1; }
+          # Binary too: the RSVP page is served from its .min.gz.
+          diff <(git diff --binary -- crates/ resources/ | grep -v '^index ') <(grep -v '^index ' "$P") \
+            || { echo "::error::the crates/ and resources/ diff is not exactly the patch"; exit 1; }
+          # Stalwart's own test holds the .gz to the .min; hold it here too, before the long build.
+          cmp <(gzip -dc $T/calendar-rsvp.html.min.gz) $T/calendar-rsvp.html.min \
+            || { echo "::error::calendar-rsvp.html.min.gz does not decompress to calendar-rsvp.html.min"; exit 1; }
 
       - name: Swap, as Stalwart's own CI adds for its release build
         run: |
@@ -209,7 +268,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ env.STALWART_TAG }}-${{ env.VARIANT }}
-            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with rust-s3 PR 467 (R2 DeleteObject fix) tenant-scoped sharing (JMAP, IMAP, WebDAV), scanned, capped file writes, and expired bans replaced
+            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with rust-s3 PR 467 (R2 DeleteObject fix) tenant-scoped sharing (JMAP, IMAP, WebDAV), scanned, capped file writes, expired bans replaced, account writes within the caller's grant, admin verbs without impersonate, and no logo on calendar mail
             org.opencontainers.image.licenses=AGPL-3.0-only
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -234,6 +293,26 @@ jobs:
 
       - name: The same check FAILS on the fixed bug-reference image, on the bug itself, so it can tell the two apart
         run: bash patch/scripts/previous-must-fail.sh "${BAN_BUG_REFERENCE_IMAGE}"
+
+      - name: No takeover through a narrow key, and the admin verbs without mail reach (end to end, the built image)
+        run: bash patch/scripts/e2e-admin-verbs.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
+
+      - name: The same check FAILS on the last image before 0007 and 0008, on both bugs, so it can tell the two apart
+        run: |
+          bash patch/scripts/previous-must-fail.sh "${MAI970_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-admin-verbs.sh \
+            'FAIL 0007: the key cannot destroy an Admin' \
+            'FAIL 0007: the key cannot add a User to a group holding a permission it lacks' \
+            'FAIL forward proof: carol got NO copy: the forward stopped'
+
+      - name: No logo on a calendar invitation, a reminder or the RSVP page (end to end, the built image)
+        run: bash patch/scripts/e2e-no-logo.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
+
+      - name: The same check FAILS on the last image before 0009, on the logo itself, so it can tell the two apart
+        run: |
+          bash patch/scripts/previous-must-fail.sh "${MAI970_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-no-logo.sh \
+            'FAIL the invitation references no cid:logo' \
+            'FAIL the reminder references no cid:logo' \
+            'FAIL the RSVP page carries no Stalwart logo SVG'
 
       - name: Push, only after every check passed
         run: |
