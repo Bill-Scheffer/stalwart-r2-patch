@@ -166,7 +166,7 @@ group("privg",["impersonate"]); group("plaing"); user("gus",DOPS)
 GG="This group's permissions exceed yours."
 join=lambda auth,acc,i,g,on=True: r1(auth,["x:Account/set",{"accountId":acc,"update":{i:{f"memberGroupIds/{g}":on}}},"u"])
 r=join(K,KA,ID["gus"],ID["privg"])
-check(ID["gus"] not in (r[1].get("updated") or {}) and ((r[1].get("notUpdated") or {}).get(ID["gus"]) or {}).get("description")==GG, f"0007: the key cannot add a User to a group holding a permission it lacks ({json.dumps(r)[:140]})")
+check(ID["gus"] not in (r[1].get("updated") or {}) and ((r[1].get("notUpdated") or {}).get(ID["gus"]) or {}).get("description")==GG, f"0007: the key cannot add a User to a group holding a permission it lacks")
 r=r1(K,["x:Account/set",{"accountId":KA,"create":{"c":{"@type":"User","name":"hal","domainId":DOPS,"memberGroupIds":{ID["privg"]:True}}}},"c"])
 check(not (r[1].get("created") or {}).get("c") and ((r[1].get("notCreated") or {}).get("c") or {}).get("description")==GG, f"0007: the key cannot create a User inside that group ({json.dumps(r)[:140]})")
 r=join(K,KA,ID["gus"],ID["plaing"]); check(ID["gus"] in (r[1].get("updated") or {}), f"0007: the key still adds a User to a group within its grant ({json.dumps(r)[:140]})")
