@@ -38,6 +38,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+    # Any new directory the build reads goes here too, or merging a change to it never rebuilds main.
     paths: [".github/workflows/build.yml", "patches/**", "scripts/**", "tests/**"]
   # No path filter: this job is the required check on main, and a check filtered out of a pull
   # request never reports, so that pull request could never merge.
@@ -48,10 +49,12 @@ permissions:
   contents: read
   packages: write
 
-# main builds one at a time and never cancels. Each pull request has its own group, and a new push
-# cancels its older run.
+# One group per ref: main builds one at a time and never cancels, and each pull request
+# (refs/pull/N/merge) has its own group, where a new push cancels its older run. Keyed on the ref
+# rather than the event, so a dispatch from a feature branch cannot displace main's pending build:
+# a group holds one pending run, and a newer one cancels it.
 concurrency:
-  group: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.number) || 'build' }}
+  group: build-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -273,7 +276,9 @@ jobs:
             org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with rust-s3 PR 467 (R2 DeleteObject fix) tenant-scoped sharing (JMAP, IMAP, WebDAV), scanned, capped file writes, expired bans replaced, account writes within the caller's grant, admin verbs without impersonate, and no logo on calendar mail
             org.opencontainers.image.licenses=AGPL-3.0-only
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Only main writes the cache: a pull request reads main's, and a Rust build cache written per
+          # pull request would evict main's from the repository's 10 GB.
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,mode=max' || '' }}
 
       # ⛔ Every check runs on the LOCAL image and the push comes last, so a failing build publishes
       # nothing under the tag (MAI-263 DEFERRED E23: run 36992985168 pushed an image, then failed).
