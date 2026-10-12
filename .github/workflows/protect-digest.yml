@@ -1,0 +1,57 @@
+# Tags a digest that is already in this package as pinned-<its first 12 hex>, so that a version something pins by
+# digest (production, or a CI reference image) is never left untagged. Untagged versions are the first thing a
+# registry cleanup removes, and a main build that re-pushes the release tag untags the digest it replaces
+# (MainThrive MAI-1021). This workflow never builds anything and never moves a tag:
+# - the manifest is copied as-is. Without --prefer-index=false, `imagetools create` wraps a single manifest in a
+#   NEW index, so the tag would name a different digest and the pinned one would stay untagged (measured);
+# - an existing pinned-* tag that names another digest is refused, never overwritten;
+# - the tag is read back, and the run fails unless it names exactly the digest given.
+name: protect-digest
+
+on:
+  workflow_dispatch:
+    inputs:
+      digest:
+        description: "The digest to protect: sha256:<64 hex>, already in this package"
+        required: true
+
+permissions:
+  packages: write
+
+jobs:
+  protect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch
+      DIGEST: ${{ inputs.digest }}
+    steps:
+      - name: The digest is well-formed
+        run: |
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::the digest must be sha256:<64 hex>"; exit 1; }
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag it pinned-<12 hex> and read the tag back
+        run: |
+          set -eu
+          tag="pinned-${DIGEST:7:12}"
+          resolve() { docker buildx imagetools inspect "$1" --format '{{.Manifest.Digest}}'; }
+          src=$(resolve "${IMAGE}@${DIGEST}") || { echo "::error::${DIGEST} is not in ${IMAGE}"; exit 1; }
+          [ "$src" = "$DIGEST" ] || { echo "::error::${IMAGE}@${DIGEST} resolved to ${src}"; exit 1; }
+          if have=$(resolve "${IMAGE}:${tag}" 2>&1); then
+            [ "$have" = "$DIGEST" ] || { echo "::error::${tag} already names ${have}; refusing to move it"; exit 1; }
+            echo "${tag} already names ${DIGEST}"
+          else
+            # Only a tag that is certainly absent is created: any other lookup failure could hide a tag to be moved.
+            case "$have" in *": not found"*) ;; *) echo "::error::cannot read ${IMAGE}:${tag}: ${have}"; exit 1 ;; esac
+            docker buildx imagetools create --prefer-index=false -t "${IMAGE}:${tag}" "${IMAGE}@${DIGEST}"
+          fi
+          got=$(resolve "${IMAGE}:${tag}")
+          [ "$got" = "$DIGEST" ] || { echo "::error::${tag} names ${got}, not ${DIGEST}"; exit 1; }
+          echo "${IMAGE}:${tag} -> ${got}"
+          echo "- \`${IMAGE}:${tag}\` → \`${got}\`" >> "$GITHUB_STEP_SUMMARY"
