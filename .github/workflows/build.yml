@@ -30,21 +30,32 @@
 #    or the guest RSVP page. The templates are compiled in (both editions; Enterprise can only swap the image), and
 #    upstream attaches its built-in logo to every invitation and reminder (measured).
 # Everything else is upstream: the tag's source, its Dockerfile, its features.
+# The release tag is pushed only from main; a dispatch from another branch pushes branch-<short sha>
+# instead, and a pull request runs every step but the registry login and the push (MAI-1019).
 name: build
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths: [".github/workflows/build.yml", "patches/**", "scripts/**"]
+    # Any new directory the build reads goes here too, or merging a change to it never rebuilds main.
+    paths: [".github/workflows/build.yml", "patches/**", "scripts/**", "tests/**"]
+  # No path filter: this job is the required check on main, and a check filtered out of a pull
+  # request never reports, so that pull request could never merge.
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
   packages: write
 
+# One group per ref: main builds one at a time and never cancels, and each pull request
+# (refs/pull/N/merge) has its own group, where a new push cancels its older run. Keyed on the ref
+# rather than the event, so a dispatch from a feature branch cannot displace main's pending build:
+# a group holds one pending run, and a newer one cancels it.
 concurrency:
-  group: build
-  cancel-in-progress: false
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   # Upstream Stalwart release, pinned by commit: a tag can move, a commit cannot.
@@ -247,12 +258,6 @@ jobs:
 
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
 
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Build with Stalwart's own Dockerfile (loaded locally, not pushed yet)
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
         with:
@@ -271,7 +276,9 @@ jobs:
             org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with rust-s3 PR 467 (R2 DeleteObject fix) tenant-scoped sharing (JMAP, IMAP, WebDAV), scanned, capped file writes, expired bans replaced, account writes within the caller's grant, admin verbs without impersonate, and no logo on calendar mail
             org.opencontainers.image.licenses=AGPL-3.0-only
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Only main writes the cache: a pull request reads main's, and a Rust build cache written per
+          # pull request would evict main's from the repository's 10 GB.
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,mode=max' || '' }}
 
       # ⛔ Every check runs on the LOCAL image and the push comes last, so a failing build publishes
       # nothing under the tag (MAI-263 DEFERRED E23: run 36992985168 pushed an image, then failed).
@@ -314,15 +321,32 @@ jobs:
             'FAIL the reminder references no cid:logo' \
             'FAIL the RSVP page carries no Stalwart logo SVG'
 
+      # ⛔ The release tag is pushed only from main (a push, or a dispatch on main). A dispatch from any
+      # other branch pushes the same tested image under branch-<short sha> alone, never the release tag,
+      # so a lane can pin it by digest before merge. A pull request (ref refs/pull/N/merge) never logs in
+      # or pushes.
+      - if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Push, only after every check passed
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         run: |
           set -eu
-          docker push "${IMAGE}:${STALWART_TAG}-${VARIANT}"
-          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "${IMAGE}:${STALWART_TAG}-${VARIANT}")
-          echo "pushed ${digest}"
+          tag="${STALWART_TAG}-${VARIANT}"
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            tag="branch-${GITHUB_SHA::7}"
+            docker tag "${IMAGE}:${STALWART_TAG}-${VARIANT}" "${IMAGE}:${tag}"
+          fi
+          docker push "${IMAGE}:${tag}"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "${IMAGE}:${tag}")
+          echo "pushed ${IMAGE}:${tag} ${digest#*@}"
           {
             echo "### ${IMAGE}"
-            echo "- tag: \`${STALWART_TAG}-${VARIANT}\`"
+            echo "- tag: \`${tag}\` (from \`${GITHUB_REF}\` @ \`${GITHUB_SHA}\`)"
             echo "- digest: \`${digest#*@}\`"
             echo "- stalwart: \`${STALWART_TAG}\` @ \`${STALWART_SHA}\`"
             echo "- rust-s3: \`${RUSTS3_REV}\` (PR #467)"
