@@ -195,6 +195,28 @@ Against the last image before 0009 its five logo checks fail (measured), and the
 
 Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1`.
 
+## Builds, tags and testing a change before it merges
+
+| What runs `build` | Checks | Pushes |
+|---|---|---|
+| A pull request to `main` | every check: patches, assertions, tests, the image build, every end-to-end check | **nothing**, and it never logs in to the registry |
+| A push to `main`, or a dispatch on `main` | the same | the **release tag**: `<STALWART_TAG>-<VARIANT>` |
+| A dispatch from any other branch | the same | **`branch-<short sha>`** only, never the release tag |
+
+`build` is the required check on `main`, so a pull request merges only once it is green.
+
+To run a change on the cluster before it merges (a throwaway or a window test), push the branch, then:
+
+```bash
+gh workflow run build.yml -R Bill-Scheffer/stalwart-r2-patch --ref <branch>
+gh run watch -R Bill-Scheffer/stalwart-r2-patch "$(gh run list -R Bill-Scheffer/stalwart-r2-patch -w build -b <branch> -L 1 --json databaseId --jq '.[0].databaseId')"
+```
+
+The run's summary names the tag and the digest. Pin the image **by digest**
+(`ghcr.io/bill-scheffer/stalwart-r2-patch@sha256:…`), never by the `branch-` tag, and replace it with the release
+digest once the change merges and `main` publishes it. A branch image is never released: only `main` moves the
+release tag.
+
 ## When this goes away
 
 Each change goes away on its own: rust-s3 when a Stalwart release ships a `rust-s3` with the fix,

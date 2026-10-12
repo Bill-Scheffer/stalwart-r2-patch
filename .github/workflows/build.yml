@@ -30,8 +30,8 @@
 #    or the guest RSVP page. The templates are compiled in (both editions; Enterprise can only swap the image), and
 #    upstream attaches its built-in logo to every invitation and reminder (measured).
 # Everything else is upstream: the tag's source, its Dockerfile, its features.
-# The image is pushed only from main: a pull request runs every step but the registry login and the
-# push (MAI-1019).
+# The release tag is pushed only from main; a dispatch from another branch pushes branch-<short sha>
+# instead, and a pull request runs every step but the registry login and the push (MAI-1019).
 name: build
 
 on:
@@ -321,10 +321,11 @@ jobs:
             'FAIL the reminder references no cid:logo' \
             'FAIL the RSVP page carries no Stalwart logo SVG'
 
-      # ⛔ Only from main. A pull request's ref is refs/pull/N/merge, so it never logs in or pushes; a
-      # dispatch from another branch does not publish under the release tag either. The bug-reference
-      # images above are public, so pulling them needs no login.
-      - if: github.ref == 'refs/heads/main'
+      # ⛔ The release tag is pushed only from main (a push, or a dispatch on main). A dispatch from any
+      # other branch pushes the same tested image under branch-<short sha> alone, never the release tag,
+      # so a lane can pin it by digest before merge. A pull request (ref refs/pull/N/merge) never logs in
+      # or pushes.
+      - if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ghcr.io
@@ -332,15 +333,20 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Push, only after every check passed
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         run: |
           set -eu
-          docker push "${IMAGE}:${STALWART_TAG}-${VARIANT}"
-          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "${IMAGE}:${STALWART_TAG}-${VARIANT}")
-          echo "pushed ${digest}"
+          tag="${STALWART_TAG}-${VARIANT}"
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            tag="branch-${GITHUB_SHA::7}"
+            docker tag "${IMAGE}:${STALWART_TAG}-${VARIANT}" "${IMAGE}:${tag}"
+          fi
+          docker push "${IMAGE}:${tag}"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "${IMAGE}:${tag}")
+          echo "pushed ${IMAGE}:${tag} ${digest#*@}"
           {
             echo "### ${IMAGE}"
-            echo "- tag: \`${STALWART_TAG}-${VARIANT}\`"
+            echo "- tag: \`${tag}\` (from \`${GITHUB_REF}\` @ \`${GITHUB_SHA}\`)"
             echo "- digest: \`${digest#*@}\`"
             echo "- stalwart: \`${STALWART_TAG}\` @ \`${STALWART_SHA}\`"
             echo "- rust-s3: \`${RUSTS3_REV}\` (PR #467)"
