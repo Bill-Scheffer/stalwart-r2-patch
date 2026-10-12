@@ -38,7 +38,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths: [".github/workflows/build.yml", "patches/**", "scripts/**"]
+    paths: [".github/workflows/build.yml", "patches/**", "scripts/**", "tests/**"]
   # No path filter: this job is the required check on main, and a check filtered out of a pull
   # request never reports, so that pull request could never merge.
   pull_request:
