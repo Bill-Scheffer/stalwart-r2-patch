@@ -3,7 +3,7 @@ index a4f6151..754e1bf 100644
 --- a/crates/common/src/cache/reload.rs
 +++ b/crates/common/src/cache/reload.rs
 @@ -45,8 +45,9 @@ impl Server {
-                         if expires_at > now() {
+                         if expires_at >= now() {
                              let mut ips = self.inner.data.blocked_ips.write();
                              if let Some(ip) = ip.address.try_to_ip() {
 +                                // `replace`: an expired entry for this IP would otherwise stay.
