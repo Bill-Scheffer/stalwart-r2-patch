@@ -31,7 +31,8 @@
 #    upstream attaches its built-in logo to every invitation and reminder (measured).
 # Everything else is upstream: the tag's source, its Dockerfile, its features.
 # The release tag is pushed only from main; a dispatch from another branch pushes branch-<short sha>
-# instead, and a pull request runs every step but the registry login and the push (MAI-1019).
+# instead, and a pull request runs every step but the registry login and the push (MAI-1019). A release tag is
+# pushed once and never re-pushed, so changing what is built means bumping VARIANT (MAI-1021).
 name: build
 
 on:
@@ -70,7 +71,7 @@ env:
   # A FIXED image that HAS the expired-ban bug (the last build before 0006), which the ban-expiry check must FAIL
   # on the bug's own line: that proves the check can fail. ⛔ NEVER bumped with releases: every build after 0006
   # lacks the bug and PASSES the check, so it could never be the reference. Pinned by tag AND digest, because a tag
-  # can be re-pushed (a push to main rebuilds and re-pushes the current tag).
+  # could be re-pushed (until MAI-1021 every main build re-pushed the current tag, which untagged this digest).
   BAN_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:v0.16.24-rusts3-505aded-tenantacl2-filescan3@sha256:6d15a5ade004aadec046b10541dccce7135122d3c8cd5361df61ec6e3822f9db
   # The same for 0007, 0008 and 0009: the last build before them, which the admin-verbs and no-logo checks must
   # FAIL on their bugs' own lines. ⛔ NEVER bumped, for the same reason.
@@ -102,6 +103,46 @@ jobs:
           tagged=$(git ls-remote https://github.com/stalwartlabs/stalwart "refs/tags/${STALWART_TAG}" | cut -f1)
           echo "tag ${STALWART_TAG} -> ${tagged}"
           [ "$tagged" = "$STALWART_SHA" ] || { echo "::error::${STALWART_TAG} no longer points at ${STALWART_SHA}"; exit 1; }
+
+      # ⛔ A release tag names one image, forever (MAI-1021). A main build used to re-push it with a new digest even
+      # when only this workflow changed, which left the digest production pins untagged, and an untagged version is
+      # the first thing a registry cleanup deletes. So a tag that already exists is never re-pushed, and a change to
+      # what goes into the image must bump VARIANT; this fails a pull request that makes one without the bump. What
+      # goes in: patches/**, any other file of this repo that a step up to the image build names (patch/<path>),
+      # the env: values (the upstream commit, rust-s3, the tag itself), and every step up to and
+      # including the image build, comments aside. The CI-only reference images and this step itself are left out.
+      # The package is public, so this reads it without logging in.
+      - name: The release tag is new, or already names this content (it is never re-pushed)
+        id: release
+        run: |
+          set -eu
+          tag="${STALWART_TAG}-${VARIANT}"
+          if ! have=$(docker buildx imagetools inspect "${IMAGE}:${tag}" --format '{{.Manifest.Digest}} {{index .Image.Config.Labels "org.opencontainers.image.revision"}}' 2>&1); then
+            case "$have" in *": not found"*) ;; *) echo "::error::cannot read ${IMAGE}:${tag}: ${have}"; exit 1 ;; esac
+            echo "${tag} is new: a main build publishes it"
+            echo publish=true >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          read -r digest rev <<< "$have"
+          [[ "${rev:-}" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::${IMAGE}:${tag} carries no revision label (got '${have}')"; exit 1; }
+          git -C patch fetch -q --depth=1 origin "$rev"
+          # build.yml from env: through the image build step, minus comments, the reference images and this step.
+          inputs_of() {
+            git -C patch show "$1:.github/workflows/build.yml" | awk '
+              /^env:/ { on = 1 }
+              /^      - / { if (build) exit; skip = /name: The release tag is new/; build = /name: Build with/ }
+              on && !skip && !/^[[:space:]]*(#|$)/ && !/REFERENCE_IMAGE/'
+          }
+          # This repo's files those steps name: patches/** today. A script added before the build is then covered too.
+          refs=$(inputs_of HEAD | { grep -oE '(^|[^[:alnum:]_-])patch/[[:alnum:]_./-]+' || true; } | sed -E 's#^[^p]?patch/##' | sort -u)
+          changed=$(git -C patch diff --name-only "$rev" HEAD -- patches $refs)
+          [ "$(inputs_of "$rev")" = "$(inputs_of HEAD)" ] || changed="${changed} build.yml"
+          if [ -n "$changed" ]; then
+            echo "::error::${tag} already names ${digest}, built from ${rev}, and what goes into the image changed since:" $changed "-- bump VARIANT"
+            exit 1
+          fi
+          echo "${tag} already names ${digest}, built from ${rev}; nothing that goes into the image changed, so it is not re-pushed"
+          echo publish=false >> "$GITHUB_OUTPUT"
 
       - name: Pin rust-s3 to the PR commit, and prove nothing else moved
         working-directory: stalwart
@@ -334,12 +375,18 @@ jobs:
 
       - name: Push, only after every check passed
         if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+        env:
+          PUBLISH: ${{ steps.release.outputs.publish }}
         run: |
           set -eu
           tag="${STALWART_TAG}-${VARIANT}"
           if [ "$GITHUB_REF" != refs/heads/main ]; then
             tag="branch-${GITHUB_SHA::7}"
             docker tag "${IMAGE}:${STALWART_TAG}-${VARIANT}" "${IMAGE}:${tag}"
+          elif [ "$PUBLISH" != true ]; then
+            echo "${tag} already exists and is never re-pushed: built and checked, nothing pushed"
+            echo "### ${IMAGE}: \`${tag}\` already exists and is never re-pushed; this run built and checked, and pushed nothing" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
           docker push "${IMAGE}:${tag}"
           digest=$(docker inspect --format '{{index .RepoDigests 0}}' "${IMAGE}:${tag}")

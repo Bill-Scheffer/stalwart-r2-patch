@@ -214,8 +214,17 @@ gh run watch -R Bill-Scheffer/stalwart-r2-patch "$(gh run list -R Bill-Scheffer/
 
 The run's summary names the tag and the digest. Pin the image **by digest**
 (`ghcr.io/bill-scheffer/stalwart-r2-patch@sha256:…`), never by the `branch-` tag, and replace it with the release
-digest once the change merges and `main` publishes it. A branch image is never released: only `main` moves the
-release tag.
+digest once the change merges and `main` publishes it. A branch image is never released: only `main` publishes a
+release tag, and only once. A tag that already exists is never re-pushed, so a change to what is built must bump
+`VARIANT`. The build fails a pull request that changes `patches/`, a value in `env:` or a step up to and
+including the image build without the bump, and the digest you pin keeps its tag (MainThrive MAI-1021).
+
+A digest pinned without a tag of its own, such as one pinned before that, is protected by tagging it
+`pinned-<first 12 hex>`. The workflow copies the manifest as-is and never moves a tag:
+
+```bash
+gh workflow run protect-digest.yml -R Bill-Scheffer/stalwart-r2-patch -f digest=sha256:<64 hex>
+```
 
 ## When this goes away
 
