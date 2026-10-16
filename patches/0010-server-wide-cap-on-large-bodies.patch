@@ -403,7 +403,7 @@ index 945003a..f2b95dc 100644
      }
  }
 diff --git a/crates/imap/src/core/client.rs b/crates/imap/src/core/client.rs
-index 2de60d8..f6e950e 100644
+index 2de60d8..bebfae0 100644
 --- a/crates/imap/src/core/client.rs
 +++ b/crates/imap/src/core/client.rs
 @@ -4,7 +4,7 @@
@@ -439,7 +439,26 @@ index 2de60d8..f6e950e 100644
                          if !self.write_error(err).await {
                              return SessionResult::Close;
                          }
-@@ -119,7 +126,7 @@ impl<T: SessionStream> Session<T> {
+@@ -83,10 +90,17 @@ impl<T: SessionStream> Session<T> {
+                         }
+                     }
+ 
++                    // A busy refusal ends one request and nothing else: what the client sent after it is read on.
++                    let busy = matches!(
++                        response.key(trc::Key::Code),
++                        Some(trc::Value::String(v)) if v == ResponseCode::Unavailable.as_str()
++                    );
+                     if !self.write_error(response).await {
+                         return SessionResult::Close;
+                     }
+-                    break;
++                    if !busy {
++                        break;
++                    }
+                 }
+             }
+         }
+@@ -119,7 +133,7 @@ impl<T: SessionStream> Session<T> {
                      .await
                      .map(|_| SessionResult::Continue),
                  Command::Append => self
