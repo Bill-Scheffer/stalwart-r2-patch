@@ -66,7 +66,7 @@ index 5de066d..ebe50ff 100644
  serde = { version = "1.0", features = ["derive"]}
  serde_json = "1.0"
 diff --git a/crates/http-proto/src/request.rs b/crates/http-proto/src/request.rs
-index 467dba3..0a06240 100644
+index 467dba3..8f59de1 100644
 --- a/crates/http-proto/src/request.rs
 +++ b/crates/http-proto/src/request.rs
 @@ -4,11 +4,13 @@
@@ -84,14 +84,14 @@ index 467dba3..0a06240 100644
  use crate::HttpRequest;
  
  #[inline]
-@@ -18,15 +20,58 @@ pub fn decode_path_element(item: &str) -> Cow<'_, str> {
+@@ -18,15 +20,64 @@ pub fn decode_path_element(item: &str) -> Cow<'_, str> {
          .unwrap_or_else(|_| item.into())
  }
  
 +pub enum BodyRefusal {
 +    /// Over the caller's size limit.
 +    TooLarge,
-+    /// The server holds as many large bodies as it may: retry later.
++    /// The large bodies the server holds are at their budget: retry later.
 +    Busy,
 +}
 +
@@ -109,7 +109,9 @@ index 467dba3..0a06240 100644
 +    session_id: u64,
 +) -> Result<Vec<u8>, BodyRefusal> {
      let mut bytes = Vec::with_capacity(1024);
-+    let mut large = false;
++    // This body's share of the budget once it is large. It rides in the request's extensions, so it is given
++    // back when the request is dropped, after the handler is done with the body, not when it has been read.
++    let mut slot = None;
 +    // Once refused as busy: how much has been read. The rest is read and none of it kept, so the client can
 +    // read the refusal; closing on an unread body resets the connection, and the client sees a network error.
 +    let mut busy: Option<usize> = None;
@@ -123,27 +125,31 @@ index 467dba3..0a06240 100644
 +                continue;
 +            }
              if bytes.len() + data.len() <= max_size || max_size == 0 {
-+                if !large && bytes.len() + data.len() > LARGE_UPLOAD {
-+                    // The slot rides in the request's extensions, so it is released when the request is
-+                    // dropped, after the handler is done with the body, not when the body has been read.
-+                    let Some(slot) = LARGE_UPLOADS.try_acquire() else {
++                let total = bytes.len() + data.len();
++                if total > LARGE_UPLOAD {
++                    let granted = if let Some(slot) = slot.as_mut() {
++                        slot.grow_to(total)
++                    } else {
++                        slot = LARGE_UPLOADS.try_acquire(total);
++                        slot.is_some()
++                    };
++                    if !granted {
 +                        trc::event!(
 +                            Limit(trc::LimitEvent::TooManyRequests),
 +                            SpanId = session_id,
 +                            Limit = LARGE_UPLOADS.max(),
-+                            Contents = "Too many large uploads in progress on this server",
++                            Contents = "The large uploads in progress on this server are at their budget",
 +                        );
-+                        busy = Some(bytes.len() + data.len());
++                        slot = None;
++                        busy = Some(total);
 +                        bytes = Vec::new();
 +                        continue;
-+                    };
-+                    req.extensions_mut().insert(Arc::new(slot));
-+                    large = true;
++                    }
 +                }
                  bytes.extend_from_slice(data);
              } else {
                  trc::event!(
-@@ -47,11 +92,15 @@ pub async fn fetch_body(
+@@ -47,11 +98,18 @@ pub async fn fetch_body(
                      Limit = max_size,
                  );
  
@@ -156,11 +162,14 @@ index 467dba3..0a06240 100644
 +    if busy.is_some() {
 +        return Err(BodyRefusal::Busy);
 +    }
++    if let Some(slot) = slot {
++        req.extensions_mut().insert(Arc::new(slot));
++    }
 +
      trc::event!(
          Http(trc::HttpEvent::RequestBody),
          SpanId = session_id,
-@@ -69,5 +118,5 @@ pub async fn fetch_body(
+@@ -69,5 +127,5 @@ pub async fn fetch_body(
          Size = bytes.len(),
      );
  
@@ -250,7 +259,7 @@ index 96cf8a0..1fe11b3 100644
  
  impl Flag {
 diff --git a/crates/imap-proto/src/receiver.rs b/crates/imap-proto/src/receiver.rs
-index 945003a..01f38cf 100644
+index 945003a..f2b95dc 100644
 --- a/crates/imap-proto/src/receiver.rs
 +++ b/crates/imap-proto/src/receiver.rs
 @@ -7,6 +7,7 @@
@@ -265,7 +274,7 @@ index 945003a..01f38cf 100644
  pub trait CommandParser: Sized + Default {
      fn parse(bytes: &[u8], is_uid: bool) -> Option<Self>;
      fn tokenize_brackets(&self) -> bool;
-+    /// Whether a large literal of this command is a message, counted against `STALWART_MAX_LARGE_MESSAGES`.
++    /// Whether a large literal of this command is a message, counted against `STALWART_MAX_LARGE_MESSAGE_MIB`.
 +    fn counts_as_message(&self) -> bool {
 +        false
 +    }
@@ -276,7 +285,7 @@ index 945003a..01f38cf 100644
      pub max_request_size: usize,
      pub current_request_size: usize,
      pub start_state: State,
-+    /// The slot of the request's literal when it is a large message (`STALWART_MAX_LARGE_MESSAGES`), for the
++    /// The slot of the request's literals when they are a large message (`STALWART_MAX_LARGE_MESSAGE_MIB`), for the
 +    /// session to take with the request and hold until the request is done (MAI-1000).
 +    pub large: Option<Slot>,
 +    /// The request is refused as busy: its literals are dropped as they arrive, the rest of it is parsed so
@@ -326,7 +335,7 @@ index 945003a..01f38cf 100644
                          self.state = self.start_state;
                          self.current_request_size = 0;
                          return Ok(std::mem::take(&mut self.request));
-@@ -324,8 +359,26 @@ impl<T: CommandParser> Receiver<T> {
+@@ -324,8 +359,35 @@ impl<T: CommandParser> Receiver<T> {
                                          self.max_request_size
                                      )));
                                  }
@@ -337,15 +346,24 @@ index 945003a..01f38cf 100644
 +                                if !oversize
 +                                    && !self.busy
 +                                    && size as usize > LARGE_MESSAGE
-+                                    && self.large.is_none()
 +                                    && self.count_messages
 +                                    && self.request.command.counts_as_message()
 +                                {
-+                                    match LARGE_MESSAGES.try_acquire() {
-+                                        Some(slot) => self.large = Some(slot),
++                                    // A MULTIAPPEND's large literals share one slot, which grows by each.
++                                    let total =
++                                        self.large.as_ref().map_or(0, Slot::bytes) + size as usize;
++                                    let granted = if let Some(slot) = self.large.as_mut() {
++                                        slot.grow_to(total)
++                                    } else {
++                                        self.large = LARGE_MESSAGES.try_acquire(total);
++                                        self.large.is_some()
++                                    };
++                                    if !granted {
++                                        if !non_sync {
++                                            return Err(self.busy_reset());
++                                        }
 +                                        // A non-sync literal is on its way already: read it and drop it.
-+                                        None if non_sync => self.busy = true,
-+                                        None => return Err(self.busy_reset()),
++                                        self.busy = true;
 +                                    }
 +                                }
                                  self.state = State::LiteralSeek { size, non_sync };
@@ -354,7 +372,7 @@ index 945003a..01f38cf 100644
                                      self.buf.resize_buffer(size as usize);
                                  }
                                  self.buf.clear();
-@@ -361,7 +414,9 @@ impl<T: CommandParser> Receiver<T> {
+@@ -361,7 +423,9 @@ impl<T: CommandParser> Receiver<T> {
                  State::LiteralSeek { size, non_sync } => {
                      if ch == b'\n' {
                          if non_sync
@@ -365,7 +383,7 @@ index 945003a..01f38cf 100644
                          {
                              self.state = State::LiteralDiscard { remaining: size };
                          } else if size > 0 {
-@@ -387,6 +442,8 @@ impl<T: CommandParser> Receiver<T> {
+@@ -387,6 +451,8 @@ impl<T: CommandParser> Receiver<T> {
                          self.state = State::LiteralDiscard {
                              remaining: remaining - 1,
                          };
@@ -374,7 +392,7 @@ index 945003a..01f38cf 100644
                      } else {
                          return Err(self.error_reset(format_compact!(
                              "Literal exceeds the maximum request size of {} bytes.",
-@@ -584,6 +641,9 @@ impl<T: CommandParser> Default for Receiver<T> {
+@@ -584,6 +650,9 @@ impl<T: CommandParser> Default for Receiver<T> {
              start_state: State::Start,
              max_request_size: 25 * 1024 * 1024,
              current_request_size: 0,
@@ -460,7 +478,7 @@ index a9c4c8d..0705a23 100644
                  .append_messages(arguments, selected_mailbox, mailbox, is_qresync, op_start)
                  .await?
 diff --git a/crates/smtp/src/core/mod.rs b/crates/smtp/src/core/mod.rs
-index 485b3c3..8e6e984 100644
+index 485b3c3..37620f2 100644
 --- a/crates/smtp/src/core/mod.rs
 +++ b/crates/smtp/src/core/mod.rs
 @@ -23,7 +23,7 @@ use std::{
@@ -476,7 +494,7 @@ index 485b3c3..8e6e984 100644
      pub rcpt_errors: usize,
      pub rcpt_oks: usize,
      pub message: Vec<u8>,
-+    /// Held while `message` is a large one (`utils::in_flight::LARGE_MESSAGES`).
++    /// `message`'s share of `utils::in_flight::LARGE_MESSAGES` while it is a large one.
 +    pub large_message: Option<Slot>,
  
      pub authenticated_as: Option<AccountInfo>,
@@ -498,7 +516,7 @@ index 485b3c3..8e6e984 100644
              auth_errors: 0,
              priority: 0,
 diff --git a/crates/smtp/src/inbound/session.rs b/crates/smtp/src/inbound/session.rs
-index 73b7737..c893972 100644
+index 73b7737..75a2ea4 100644
 --- a/crates/smtp/src/inbound/session.rs
 +++ b/crates/smtp/src/inbound/session.rs
 @@ -21,9 +21,13 @@ use smtp_proto::{
@@ -568,28 +586,33 @@ index 73b7737..c893972 100644
                          self.write(response).await?;
                          state = State::default();
                      } else {
-@@ -483,11 +509,32 @@ impl<T: SessionStream> Session<T> {
+@@ -483,11 +509,37 @@ impl<T: SessionStream> Session<T> {
  }
  
  impl<T: AsyncWrite + AsyncRead + Unpin> Session<T> {
-+    /// Whether a message of `size` bytes so far may go on: one past `LARGE_MESSAGE` needs a slot under
-+    /// `STALWART_MAX_LARGE_MESSAGES`, held until the message is queued or dropped. Past the cap, the rest is
++    /// Whether a message of `size` bytes so far may go on: one past `LARGE_MESSAGE` holds that many bytes of
++    /// `STALWART_MAX_LARGE_MESSAGE_MIB`, until the message is queued or dropped. Past the budget, the rest is
 +    /// read and dropped, and the reply is a 452, so the sender retries later (MAI-1000).
 +    fn claim_large_message(&mut self, size: usize) -> bool {
-+        if size <= LARGE_MESSAGE || self.data.large_message.is_some() {
++        if size <= LARGE_MESSAGE {
 +            return true;
 +        }
-+        if let Some(slot) = LARGE_MESSAGES.try_acquire() {
-+            self.data.large_message = Some(slot);
-+            return true;
++        let granted = if let Some(slot) = self.data.large_message.as_mut() {
++            slot.grow_to(size)
++        } else {
++            self.data.large_message = LARGE_MESSAGES.try_acquire(size);
++            self.data.large_message.is_some()
++        };
++        if !granted {
++            self.data.large_message = None;
++            trc::event!(
++                Limit(trc::LimitEvent::TooManyRequests),
++                SpanId = self.data.session_id,
++                Limit = LARGE_MESSAGES.max(),
++                Contents = "The large messages in progress on this server are at their budget",
++            );
 +        }
-+        trc::event!(
-+            Limit(trc::LimitEvent::TooManyRequests),
-+            SpanId = self.data.session_id,
-+            Limit = LARGE_MESSAGES.max(),
-+            Contents = "Too many large messages in progress on this server",
-+        );
-+        false
++        granted
 +    }
 +
      pub fn reset(&mut self) {
@@ -603,84 +626,115 @@ index 73b7737..c893972 100644
          self.data.future_release = 0;
 diff --git a/crates/utils/src/in_flight.rs b/crates/utils/src/in_flight.rs
 new file mode 100644
-index 0000000..044f4c7
+index 0000000..a122932
 --- /dev/null
 +++ b/crates/utils/src/in_flight.rs
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,107 @@
 +/*
 + * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
 + *
 + * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
 + */
 +
-+//! Server-wide caps on how many large bodies are held in memory at once. Each account is bounded already
-+//! (requests at once, a pending-upload quota), and SMTP per sender IP, but nothing bounds the sum: a burst
++//! Server-wide budgets for the large bodies held in memory at once, in bytes. Each account is bounded already
++//! (requests at once, a pending-upload quota), and SMTP each sender IP, but nothing bounds the sum: a burst
 +//! across accounts or senders takes the process past its memory limit and it is OOM-killed, with every
-+//! session on it. A body past the cap is refused retryably instead. Unset, a cap is no bound (upstream's
-+//! behaviour). Not `common::network::limiter`: `imap-proto` cannot depend on `common`, and that limiter's
-+//! load-then-add can let two callers past the last slot.
++//! session on it. A body that would take its budget past the limit is refused retryably instead. Counted in
++//! bytes, not bodies, so the bound holds whatever the size limits allow. Unset, a budget is no bound
++//! (upstream's behaviour). Not `common::network::limiter`: `imap-proto` cannot depend on `common`, and that
++//! limiter's load-then-add can let two callers past the limit.
 +
 +use std::sync::{
 +    OnceLock,
 +    atomic::{AtomicUsize, Ordering},
 +};
 +
-+/// An HTTP request body past this size counts against `STALWART_MAX_LARGE_UPLOADS`.
++/// An HTTP request body past this size counts against `STALWART_MAX_LARGE_UPLOAD_MIB`.
 +pub const LARGE_UPLOAD: usize = 1024 * 1024;
 +
-+/// A message past this size counts against `STALWART_MAX_LARGE_MESSAGES`. Higher than an upload's, so
++/// A message past this size counts against `STALWART_MAX_LARGE_MESSAGE_MIB`. Higher than an upload's, so
 +/// ordinary mail is never counted: a message costs about 6 times its size in SMTP and 3 times in IMAP, so
 +/// one under it costs at most about 30 MiB.
 +pub const LARGE_MESSAGE: usize = 5 * 1024 * 1024;
 +
 +/// WebDAV PUT, JMAP upload and JMAP request bodies.
-+pub static LARGE_UPLOADS: Cap = Cap::new("STALWART_MAX_LARGE_UPLOADS");
++pub static LARGE_UPLOADS: Budget = Budget::new("STALWART_MAX_LARGE_UPLOAD_MIB");
 +
 +/// Messages arriving by SMTP DATA or BDAT, or by IMAP APPEND.
-+pub static LARGE_MESSAGES: Cap = Cap::new("STALWART_MAX_LARGE_MESSAGES");
++pub static LARGE_MESSAGES: Budget = Budget::new("STALWART_MAX_LARGE_MESSAGE_MIB");
 +
-+pub struct Cap {
++pub struct Budget {
 +    var: &'static str,
-+    count: AtomicUsize,
++    used: AtomicUsize,
 +    max: OnceLock<usize>,
 +}
 +
-+impl Cap {
++impl Budget {
 +    const fn new(var: &'static str) -> Self {
 +        Self {
 +            var,
-+            count: AtomicUsize::new(0),
++            used: AtomicUsize::new(0),
 +            max: OnceLock::new(),
 +        }
 +    }
 +
++    /// The budget in bytes, from its variable in MiB.
 +    pub fn max(&self) -> usize {
 +        *self.max.get_or_init(|| {
 +            std::env::var(self.var)
 +                .ok()
-+                .and_then(|v| v.trim().parse().ok())
-+                .unwrap_or(usize::MAX)
++                .and_then(|v| v.trim().parse::<usize>().ok())
++                .map_or(usize::MAX, |mib| mib.saturating_mul(1024 * 1024))
 +        })
 +    }
 +
-+    /// A slot, or `None` when the server holds as many as it may.
-+    pub fn try_acquire(&'static self) -> Option<Slot> {
++    fn take(&self, bytes: usize) -> bool {
 +        let max = self.max();
-+        self.count
-+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-+                (n < max).then_some(n + 1)
++        self.used
++            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
++                used.checked_add(bytes).filter(|&total| total <= max)
 +            })
-+            .ok()
-+            .map(|_| Slot(self))
++            .is_ok()
++    }
++
++    /// A slot holding `bytes` of the budget, or `None` when they would take it past its limit.
++    pub fn try_acquire(&'static self, bytes: usize) -> Option<Slot> {
++        self.take(bytes).then_some(Slot {
++            budget: self,
++            bytes,
++        })
 +    }
 +}
 +
-+/// One large body's place under its cap, given back when dropped.
-+pub struct Slot(&'static Cap);
++/// A large body's share of its budget, given back when dropped.
++pub struct Slot {
++    budget: &'static Budget,
++    bytes: usize,
++}
++
++impl Slot {
++    pub fn bytes(&self) -> usize {
++        self.bytes
++    }
++
++    /// Grows the share to `total` bytes, as the body grows; `false` when that would take the budget past its
++    /// limit, and the share is left as it was.
++    pub fn grow_to(&mut self, total: usize) -> bool {
++        if total <= self.bytes {
++            return true;
++        }
++        if self.budget.take(total - self.bytes) {
++            self.bytes = total;
++            true
++        } else {
++            false
++        }
++    }
++}
 +
 +impl Drop for Slot {
 +    fn drop(&mut self) {
-+        self.0.count.fetch_sub(1, Ordering::SeqCst);
++        self.budget.used.fetch_sub(self.bytes, Ordering::SeqCst);
 +    }
 +}
 diff --git a/crates/utils/src/lib.rs b/crates/utils/src/lib.rs

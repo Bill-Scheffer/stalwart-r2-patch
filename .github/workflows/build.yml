@@ -29,9 +29,9 @@
 # 9. patches/0009-no-logo-on-calendar-mail-and-rsvp.patch: no Stalwart logo on a calendar invitation, a reminder
 #    or the guest RSVP page. The templates are compiled in (both editions; Enterprise can only swap the image), and
 #    upstream attaches its built-in logo to every invitation and reminder (measured).
-# 10. patches/0010-server-wide-cap-on-large-bodies.patch: at most STALWART_MAX_LARGE_UPLOADS request bodies past 1 MiB,
-#    and at most STALWART_MAX_LARGE_MESSAGES messages past 5 MiB (SMTP DATA and BDAT, IMAP APPEND), are held at once,
-#    server-wide; one past its cap is refused retryably (WebDAV 429 + Retry-After, JMAP 429, SMTP 452, IMAP NO
+# 10. patches/0010-server-wide-cap-on-large-bodies.patch: the request bodies past 1 MiB held at once stay within
+#    STALWART_MAX_LARGE_UPLOAD_MIB, and the messages past 5 MiB (SMTP DATA and BDAT, IMAP APPEND) within
+#    STALWART_MAX_LARGE_MESSAGE_MIB, in bytes, server-wide; one past its budget is refused retryably (WebDAV 429 + Retry-After, JMAP 429, SMTP 452, IMAP NO
 #    [UNAVAILABLE]). Upstream bounds each account, or each sender IP, only, so a burst across them could OOM-kill the
 #    process (measured, MAI-1000).
 # Everything else is upstream: the tag's source, its Dockerfile, its features.
@@ -386,7 +386,7 @@ jobs:
             'FAIL the reminder references no cid:logo' \
             'FAIL the RSVP page carries no Stalwart logo SVG'
 
-      - name: At most STALWART_MAX_LARGE_UPLOADS large bodies and STALWART_MAX_LARGE_MESSAGES large messages at once, server-wide, refused retryably past them (end to end, the built image)
+      - name: Large bodies and large messages held at once stay within their byte budgets, server-wide, refused retryably past them (end to end, the built image)
         run: bash patch/scripts/e2e-upload-cap.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
 
       - name: The same check FAILS on the last image before 0010, on its refusals, so it can tell the two apart

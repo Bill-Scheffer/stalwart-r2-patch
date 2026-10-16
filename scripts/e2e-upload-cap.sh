@@ -1,21 +1,23 @@
 #!/usr/bin/env bash
-# End-to-end: the server holds at most STALWART_MAX_LARGE_UPLOADS large request bodies, and at most
-# STALWART_MAX_LARGE_MESSAGES large messages, at once, across all accounts and senders.
+# End-to-end: the large request bodies the server holds at once stay within STALWART_MAX_LARGE_UPLOAD_MIB, and the
+# large messages within STALWART_MAX_LARGE_MESSAGE_MIB, in bytes, across all accounts and senders.
 # usage: e2e-upload-cap.sh <stalwart image>
 #
 # Each account is bounded upstream (4 requests at once, a pending-upload quota), but nothing bounds the sum: at a 2 GiB
 # limit, ~70 parallel 25 MiB uploads from different accounts OOM-kill the process, and every upload and session on it
 # is lost (measured on the -nologo1 image, MAI-1000). Patch 0010 counts a body once it passes 1 MiB and refuses one
-# past the cap, retryably: WebDAV 429 with Retry-After, JMAP 429. Here the cap is 2: two uploads are held open past
-# 1 MiB, a third (WebDAV and JMAP, other accounts) is refused while they are, a small body is not, and once they finish
+# past the budget, retryably: WebDAV 429 with Retry-After, JMAP 429. Here the budget is 30 MiB: two 24 MiB uploads are
+# held open at 12 MiB each, a third of 8 MiB (WebDAV and JMAP, other accounts) is refused while they are, a small
+# body is not, a 25 MiB body alone still meets its size limit (413) before the budget, and once they finish
 # the slots are back: the same pattern holds a second time, after a too-large body that was refused mid-way too.
 # A refused body is read to its end and dropped, so the client gets the 429, not a reset connection.
 #
 # Messages: a 25 MiB message costs about 160 MiB while SMTP holds it, before authentication, bounded only per sender
-# IP, and about 80 MiB by IMAP APPEND (measured, MAI-1000). Patch 0010 counts one once it passes 5 MiB, so ordinary
-# mail is never counted. Here that cap is 2 too: two SMTP messages are held open past 5 MiB, a third (DATA and BDAT)
-# gets 452 after its body is read and dropped, an IMAP APPEND gets NO [UNAVAILABLE] (synchronizing literal: before
-# it is sent; LITERAL+: after), and a burst of ordinary messages up to 4.5 MiB is all accepted while the cap is full.
+# IP, and about 80 MiB by IMAP APPEND (measured, MAI-1000). Patch 0010 counts one's bytes once it passes 5 MiB, so
+# ordinary mail is never counted. Here that budget is 110 MiB: two 52 MiB SMTP messages are held open at 50 MiB, a
+# third of 16 MiB (DATA and BDAT) gets 452 after its body is read and dropped, an IMAP APPEND gets NO [UNAVAILABLE]
+# (synchronizing literal: before it is sent; LITERAL+: after), a burst of ordinary messages up to 4.5 MiB is all
+# accepted while the budget is full, and once it is free a single 100 MiB message is accepted.
 # Against -nologo1 the refusals FAIL (it has no cap).
 set -euo pipefail
 IMG=${1:?usage: $0 <stalwart image>}
@@ -27,7 +29,7 @@ trap cleanup EXIT
 ADMIN=$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | cut -c1-24)
 docker network create "$NET" >/dev/null
 docker run -d --name "$C" --network "$NET" --network-alias stalwart --hostname mail.one.test \
-  -e STALWART_RECOVERY_ADMIN="admin:$ADMIN" -e STALWART_MAX_LARGE_UPLOADS=2 -e STALWART_MAX_LARGE_MESSAGES=2 \
+  -e STALWART_RECOVERY_ADMIN="admin:$ADMIN" -e STALWART_MAX_LARGE_UPLOAD_MIB=30 -e STALWART_MAX_LARGE_MESSAGE_MIB=110 \
   -v "$W/etc:/etc/stalwart" -v "$W/data:/var/lib/stalwart" "$IMG" >/dev/null
 docker run -d --name "$K" --network "$NET" -e ADMIN="$ADMIN" python:3.12-alpine sleep 900 >/dev/null
 docker exec -i "$K" python3 - <<'PY'
@@ -60,18 +62,18 @@ MiB=1024*1024
 def dav(n,size,name="f.bin"): return req(f"/dav/file/{n}%40one.test/{name}",AU[n],os.urandom(size),"application/octet-stream","PUT")
 def jup(n,size): return req(f"/jmap/upload/{jacct(n)}/",AU[n],os.urandom(size),"application/octet-stream","POST")
 class Held(threading.Thread):
-    # A WebDAV PUT of 3 MiB that sends 1.5 MiB (past the 1 MiB mark), then waits for `go` before the rest.
+    # A WebDAV PUT of 24 MiB that sends 12 MiB of it, then waits for `go` before the rest.
     def __init__(self,n,go): super().__init__(); self.n=n; self.go=go; self.status=None
     def run(self):
         c=http.client.HTTPConnection("stalwart",8080,timeout=120)
         c.putrequest("PUT",f"/dav/file/{self.n}%40one.test/held.bin")
-        c.putheader("Authorization",AU[self.n]); c.putheader("Content-Type","application/octet-stream"); c.putheader("Content-Length",str(3*MiB)); c.endheaders()
-        c.send(os.urandom(3*MiB//2)); self.go.wait(); c.send(os.urandom(3*MiB//2))
+        c.putheader("Authorization",AU[self.n]); c.putheader("Content-Type","application/octet-stream"); c.putheader("Content-Length",str(24*MiB)); c.endheaders()
+        c.send(os.urandom(12*MiB)); self.go.wait(); c.send(os.urandom(12*MiB))
         self.status=c.getresponse().status
 def round_(tag,a,b,x,y,z):
     go=threading.Event(); hs=[Held(a,go),Held(b,go)]; [h.start() for h in hs]
-    time.sleep(3)   # both bodies are past 1 MiB on the server: both slots are held
-    # 8 MiB: the refusal comes at 1 MiB, and the client must still READ it after sending the other 7. A server that
+    time.sleep(3)   # both bodies are at 12 MiB on the server: 24 of the 30 MiB are held
+    # 8 MiB: the refusal comes at 6 MiB, and the client must still READ it after sending the rest. A server that
     # answers and closes on the unread rest resets the connection, and the client sees a network error instead.
     LARGE=8*MiB
     st,hd,_=dav(x,LARGE)
@@ -149,31 +151,31 @@ def append(n,size,non_sync=False):
         if got.startswith(b"+"): c.sendall(m+b"\r\n"); got=tagged(b"b")
     c.close(); return got.decode(errors="replace")[:120]
 class HeldMessage(threading.Thread):
-    # An SMTP message of 12 MiB that sends 6 MiB (past the 5 MiB mark), then waits for `go` before the rest.
+    # An SMTP message of 52 MiB that sends 50 MiB of it, then waits for `go` before the rest.
     def __init__(self,n,go): super().__init__(); self.n=n; self.go=go; self.code=None
     def run(self):
         s=Smtp(); st=s.begin(self.n)
         if st!="ok": self.code=st; return
-        m=eml(12*MiB); s.c.sendall(m[:6*MiB]); self.go.wait(); s.c.sendall(m[6*MiB:]); self.code=s.cmd(b".\r\n"); s.close()
+        m=eml(52*MiB); s.c.sendall(m[:50*MiB]); self.go.wait(); s.c.sendall(m[50*MiB:]); self.code=s.cmd(b".\r\n"); s.close()
 go=threading.Event(); held=[HeldMessage(NAMES[0],go),HeldMessage(NAMES[1],go)]; [h.start() for h in held]
-time.sleep(5)   # both messages are past 5 MiB on the server: both slots are held
-st=smtp(NAMES[2],8*MiB)
+time.sleep(8)   # both messages are at 50 MiB on the server: 100 of the 110 MiB are held
+st=smtp(NAMES[2],16*MiB)
 check(st=="452", "with 2 large messages in flight, a third by SMTP DATA is refused with 452 (the sender retries)", st)
-st=bdat(NAMES[3],8*MiB)
+st=bdat(NAMES[3],16*MiB)
 check(st=="452", "and one by SMTP BDAT", st)
-got=append(NAMES[4],8*MiB)
+got=append(NAMES[4],16*MiB)
 check(got.startswith("b NO [UNAVAILABLE]"), "and an IMAP APPEND, before its literal is sent", got)
-got=append(NAMES[5],8*MiB,non_sync=True)
+got=append(NAMES[5],16*MiB,non_sync=True)
 check(got.startswith("b NO [UNAVAILABLE]"), "and an IMAP APPEND with a LITERAL+ literal, read and dropped", got)
 # A refusal ends the transaction: the same session's next MAIL is a fresh one, not "503 Multiple MAIL commands".
 s=Smtp(); st=s.begin(NAMES[2])
-if st=="ok": s.c.sendall(eml(8*MiB)); st=s.cmd(b".\r\n")
+if st=="ok": s.c.sendall(eml(16*MiB)); st=s.cmd(b".\r\n")
 nxt=s.cmd(b"MAIL FROM:<s@example.net>\r\n") if st=="452" else "-"; s.close()
 check(st=="452" and nxt=="250", "after a 452, the same session starts a new message", f"{st} then {nxt}")
 # Pipelined BDAT chunks after a refused one are refused too (RFC 3030), so no message is delivered from the rest.
 s=Smtp(); st=s.begin(NAMES[3],data=False); codes=[]
 if st=="ok":
-    a,b,c=os.urandom(3*MiB),os.urandom(3*MiB),os.urandom(MiB)
+    a,b,c=os.urandom(3*MiB),os.urandom(9*MiB),os.urandom(MiB)
     s.c.sendall(f"BDAT {len(a)}\r\n".encode()+a+f"BDAT {len(b)}\r\n".encode()+b+f"BDAT {len(c)} LAST\r\n".encode()+c)
     codes=[s.reply() for _ in range(3)]
 s.close()
@@ -182,7 +184,7 @@ check(len(codes)==3 and codes[1]=="452" and codes[2]!="250", "a pipelined BDAT a
 c=ssl._create_unverified_context().wrap_socket(socket.create_connection(("stalwart",993),timeout=120)); f=c.makefile("rb"); f.readline()
 c.sendall(f"a LOGIN {NAMES[5]}@one.test {PW}\r\n".encode())
 while not (l:=f.readline()).startswith(b"a "): pass
-one,big=eml(MiB),eml(8*MiB); tail=b"Subject: x\r\n\r\nzz9 NOOP\r\n"
+one,big=eml(MiB),eml(16*MiB); tail=b"Subject: x\r\n\r\nzz9 NOOP\r\n"
 c.sendall(f"b APPEND INBOX {{{len(one)}+}}\r\n".encode()+one+f" {{{len(big)}+}}\r\n".encode()+big+f" {{{len(tail)}+}}\r\n".encode()+tail+b"\r\nc NOOP\r\n")
 seen=[]
 while not (l:=f.readline()).startswith(b"c ") and l: seen.append(l.strip())
@@ -200,9 +202,9 @@ got=append(NAMES[6],1*MiB)
 check(got.startswith("b OK"), "and an ordinary IMAP APPEND too", got)
 go.set(); [h.join() for h in held]
 check([h.code for h in held]==["250","250"], "the two held messages are accepted", [h.code for h in held])
-st=smtp(NAMES[2],8*MiB)
+st=smtp(NAMES[2],16*MiB)
 check(st=="250", "once they are, the refused SMTP message is accepted on retry", st)
-got=append(NAMES[4],8*MiB)
+got=append(NAMES[4],16*MiB)
 check(got.startswith("b OK"), "and the refused IMAP APPEND", got)
 # A client that has not logged in holds no slot: two stalled pre-login literals, and a large APPEND still goes in.
 stalled=[]
@@ -211,8 +213,11 @@ for _ in range(2):
     c.sendall(f"p APPEND INBOX {{{8*MiB}}}\r\n".encode())
     if f.readline().startswith(b"+"): c.sendall(os.urandom(3*MiB))
     stalled.append(c)
-got=append(NAMES[7],8*MiB)
+got=append(NAMES[7],16*MiB)
 check(got.startswith("b OK"), "a client that has not logged in cannot hold a large-message slot", got)
 [c.close() for c in stalled]
+# The budget is bytes, so one message as large as SMTP allows (100 MiB) goes in alone.
+st=smtp(NAMES[8],97*MiB)
+check(st=="250", "with the budget free, a single 100 MiB message is accepted", st)
 sys.exit(1 if fails else 0)
 PY
