@@ -66,7 +66,7 @@ index 5de066d..ebe50ff 100644
  serde = { version = "1.0", features = ["derive"]}
  serde_json = "1.0"
 diff --git a/crates/http-proto/src/request.rs b/crates/http-proto/src/request.rs
-index 467dba3..8f59de1 100644
+index 467dba3..ed1606e 100644
 --- a/crates/http-proto/src/request.rs
 +++ b/crates/http-proto/src/request.rs
 @@ -4,11 +4,13 @@
@@ -79,7 +79,7 @@ index 467dba3..8f59de1 100644
  use compact_str::ToCompactString;
  use http_body_util::BodyExt;
  
-+use utils::in_flight::{LARGE_UPLOAD, LARGE_UPLOADS};
++use utils::in_flight::{LARGE_UPLOAD, LARGE_UPLOADS, Slot};
 +
  use crate::HttpRequest;
  
@@ -111,7 +111,7 @@ index 467dba3..8f59de1 100644
      let mut bytes = Vec::with_capacity(1024);
 +    // This body's share of the budget once it is large. It rides in the request's extensions, so it is given
 +    // back when the request is dropped, after the handler is done with the body, not when it has been read.
-+    let mut slot = None;
++    let mut slot: Option<Slot> = None;
 +    // Once refused as busy: how much has been read. The rest is read and none of it kept, so the client can
 +    // read the refusal; closing on an unread body resets the connection, and the client sees a network error.
 +    let mut busy: Option<usize> = None;
