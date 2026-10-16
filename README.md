@@ -219,8 +219,8 @@ so a count would bound nothing:
   mail is never counted: a 1 MiB message costs a few MiB.
 
 Unset, a budget is no bound (upstream's behaviour); a budget below the largest body allowed refuses that body always.
-[`scripts/e2e-upload-cap.sh`](scripts/e2e-upload-cap.sh) sets 30 MiB and 110 MiB. It holds two 24 MiB uploads open at
-12 MiB and checks that a third of 8 MiB, by WebDAV `PUT` and by JMAP upload from other accounts, is refused while a
+[`scripts/e2e-upload-cap.sh`](scripts/e2e-upload-cap.sh) sets 30 MiB and 110 MiB. It holds two 14 MiB uploads open at
+13 MiB and checks that a third of 8 MiB, by WebDAV `PUT` and by JMAP upload from other accounts, is refused while a
 small file is stored, that both store on retry once the held uploads finish, that a 25 MiB body alone still meets its
 size limit (`413`), and that the budget comes back after it. Then it holds two 52 MiB SMTP messages open at 50 MiB and
 checks that a third of 16 MiB by `DATA` and by `BDAT` gets `452`, that IMAP `APPEND` with either kind of literal gets

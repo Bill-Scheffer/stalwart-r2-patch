@@ -6,8 +6,8 @@
 # Each account is bounded upstream (4 requests at once, a pending-upload quota), but nothing bounds the sum: at a 2 GiB
 # limit, ~70 parallel 25 MiB uploads from different accounts OOM-kill the process, and every upload and session on it
 # is lost (measured on the -nologo1 image, MAI-1000). Patch 0010 counts a body once it passes 1 MiB and refuses one
-# past the budget, retryably: WebDAV 429 with Retry-After, JMAP 429. Here the budget is 30 MiB: two 24 MiB uploads are
-# held open at 12 MiB each, a third of 8 MiB (WebDAV and JMAP, other accounts) is refused while they are, a small
+# past the budget, retryably: WebDAV 429 with Retry-After, JMAP 429. Here the budget is 30 MiB: two 14 MiB uploads are
+# held open at 13 MiB each (both fit when they finish), a third of 8 MiB (WebDAV and JMAP, other accounts) is refused while they are, a small
 # body is not, a 25 MiB body alone still meets its size limit (413) before the budget, and once they finish
 # the slots are back: the same pattern holds a second time, after a too-large body that was refused mid-way too.
 # A refused body is read to its end and dropped, so the client gets the 429, not a reset connection.
@@ -62,18 +62,18 @@ MiB=1024*1024
 def dav(n,size,name="f.bin"): return req(f"/dav/file/{n}%40one.test/{name}",AU[n],os.urandom(size),"application/octet-stream","PUT")
 def jup(n,size): return req(f"/jmap/upload/{jacct(n)}/",AU[n],os.urandom(size),"application/octet-stream","POST")
 class Held(threading.Thread):
-    # A WebDAV PUT of 24 MiB that sends 12 MiB of it, then waits for `go` before the rest.
+    # A WebDAV PUT of 14 MiB that sends 13 MiB of it, then waits for `go` before the rest.
     def __init__(self,n,go): super().__init__(); self.n=n; self.go=go; self.status=None
     def run(self):
         c=http.client.HTTPConnection("stalwart",8080,timeout=120)
         c.putrequest("PUT",f"/dav/file/{self.n}%40one.test/held.bin")
-        c.putheader("Authorization",AU[self.n]); c.putheader("Content-Type","application/octet-stream"); c.putheader("Content-Length",str(24*MiB)); c.endheaders()
-        c.send(os.urandom(12*MiB)); self.go.wait(); c.send(os.urandom(12*MiB))
+        c.putheader("Authorization",AU[self.n]); c.putheader("Content-Type","application/octet-stream"); c.putheader("Content-Length",str(14*MiB)); c.endheaders()
+        c.send(os.urandom(13*MiB)); self.go.wait(); c.send(os.urandom(MiB))
         self.status=c.getresponse().status
 def round_(tag,a,b,x,y,z):
     go=threading.Event(); hs=[Held(a,go),Held(b,go)]; [h.start() for h in hs]
-    time.sleep(3)   # both bodies are at 12 MiB on the server: 24 of the 30 MiB are held
-    # 8 MiB: the refusal comes at 6 MiB, and the client must still READ it after sending the rest. A server that
+    time.sleep(3)   # both bodies are at 13 MiB on the server: 26 of the 30 MiB are held
+    # 8 MiB: the refusal comes at 4 MiB, and the client must still READ it after sending the rest. A server that
     # answers and closes on the unread rest resets the connection, and the client sees a network error instead.
     LARGE=8*MiB
     st,hd,_=dav(x,LARGE)
@@ -152,13 +152,13 @@ def append(n,size,non_sync=False):
     c.close(); return got.decode(errors="replace")[:120]
 class HeldMessage(threading.Thread):
     # An SMTP message of 52 MiB that sends 50 MiB of it, then waits for `go` before the rest.
-    def __init__(self,n,go): super().__init__(); self.n=n; self.go=go; self.code=None
+    def __init__(self,n,go): super().__init__(); self.n=n; self.go=go; self.code=None; self.sent=threading.Event()
     def run(self):
         s=Smtp(); st=s.begin(self.n)
-        if st!="ok": self.code=st; return
-        m=eml(52*MiB); s.c.sendall(m[:50*MiB]); self.go.wait(); s.c.sendall(m[50*MiB:]); self.code=s.cmd(b".\r\n"); s.close()
+        if st!="ok": self.code=st; self.sent.set(); return
+        m=eml(52*MiB); s.c.sendall(m[:50*MiB]); self.sent.set(); self.go.wait(); s.c.sendall(m[50*MiB:]); self.code=s.cmd(b".\r\n"); s.close()
 go=threading.Event(); held=[HeldMessage(NAMES[0],go),HeldMessage(NAMES[1],go)]; [h.start() for h in held]
-time.sleep(8)   # both messages are at 50 MiB on the server: 100 of the 110 MiB are held
+[h.sent.wait() for h in held]; time.sleep(3)   # both messages are at 50 MiB on the server: 100 of the 110 MiB held
 st=smtp(NAMES[2],16*MiB)
 check(st=="452", "with 2 large messages in flight, a third by SMTP DATA is refused with 452 (the sender retries)", st)
 st=bdat(NAMES[3],16*MiB)

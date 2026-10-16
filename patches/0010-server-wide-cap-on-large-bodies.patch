@@ -626,10 +626,10 @@ index 73b7737..75a2ea4 100644
          self.data.future_release = 0;
 diff --git a/crates/utils/src/in_flight.rs b/crates/utils/src/in_flight.rs
 new file mode 100644
-index 0000000..a122932
+index 0000000..590a33c
 --- /dev/null
 +++ b/crates/utils/src/in_flight.rs
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,108 @@
 +/*
 + * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
 + *
@@ -699,7 +699,8 @@ index 0000000..a122932
 +
 +    /// A slot holding `bytes` of the budget, or `None` when they would take it past its limit.
 +    pub fn try_acquire(&'static self, bytes: usize) -> Option<Slot> {
-+        self.take(bytes).then_some(Slot {
++        // `then`, not `then_some`: a slot built eagerly and dropped on a refusal would give back bytes it never took.
++        self.take(bytes).then(|| Slot {
 +            budget: self,
 +            bytes,
 +        })
