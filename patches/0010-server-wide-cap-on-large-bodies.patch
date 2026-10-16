@@ -234,8 +234,23 @@ index 7a031f2..1e3b79b 100644
                              };
                          }
                      }
+diff --git a/crates/imap-proto/src/parser/mod.rs b/crates/imap-proto/src/parser/mod.rs
+index 96cf8a0..1fe11b3 100644
+--- a/crates/imap-proto/src/parser/mod.rs
++++ b/crates/imap-proto/src/parser/mod.rs
+@@ -90,6 +90,10 @@ impl CommandParser for Command {
+     fn tokenize_brackets(&self) -> bool {
+         matches!(self, Command::Fetch(_))
+     }
++
++    fn counts_as_message(&self) -> bool {
++        matches!(self, Command::Append)
++    }
+ }
+ 
+ impl Flag {
 diff --git a/crates/imap-proto/src/receiver.rs b/crates/imap-proto/src/receiver.rs
-index 945003a..30f8246 100644
+index 945003a..52b9064 100644
 --- a/crates/imap-proto/src/receiver.rs
 +++ b/crates/imap-proto/src/receiver.rs
 @@ -7,6 +7,7 @@
@@ -246,11 +261,22 @@ index 945003a..30f8246 100644
  
  #[derive(Debug, Clone)]
  pub enum Error {
-@@ -70,6 +71,11 @@ pub struct Receiver<T: CommandParser> {
+@@ -25,6 +26,10 @@ pub struct Request<T: CommandParser> {
+ pub trait CommandParser: Sized + Default {
+     fn parse(bytes: &[u8], is_uid: bool) -> Option<Self>;
+     fn tokenize_brackets(&self) -> bool;
++    /// Whether a large literal of this command is a message, counted against `STALWART_MAX_LARGE_MESSAGES`.
++    fn counts_as_message(&self) -> bool {
++        false
++    }
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -70,6 +75,11 @@ pub struct Receiver<T: CommandParser> {
      pub max_request_size: usize,
      pub current_request_size: usize,
      pub start_state: State,
-+    /// The slot of the request's literal when it is a large one (`STALWART_MAX_LARGE_MESSAGES`), for the
++    /// The slot of the request's literal when it is a large message (`STALWART_MAX_LARGE_MESSAGES`), for the
 +    /// session to take with the request and hold until the request is done (MAI-1000).
 +    pub large: Option<Slot>,
 +    /// The literal being read is refused as busy: it is dropped as it arrives.
@@ -258,7 +284,7 @@ index 945003a..30f8246 100644
  }
  
  const ARG_MAX_LEN: usize = 8000;
-@@ -112,9 +118,27 @@ impl<T: CommandParser> Receiver<T> {
+@@ -112,9 +122,27 @@ impl<T: CommandParser> Receiver<T> {
          self.buf = ArgumentBuffer::default();
          self.state = self.start_state;
          self.current_request_size = 0;
@@ -286,13 +312,14 @@ index 945003a..30f8246 100644
      fn push_argument(&mut self, in_quote: bool) -> Result<(), Error> {
          if !self.buf.is_empty() {
              self.current_request_size += self.buf.len();
-@@ -324,8 +348,19 @@ impl<T: CommandParser> Receiver<T> {
+@@ -324,8 +352,20 @@ impl<T: CommandParser> Receiver<T> {
                                          self.max_request_size
                                      )));
                                  }
 +                                if !oversize
 +                                    && size as usize > LARGE_MESSAGE
 +                                    && self.large.is_none()
++                                    && self.request.command.counts_as_message()
 +                                {
 +                                    match LARGE_MESSAGES.try_acquire() {
 +                                        Some(slot) => self.large = Some(slot),
@@ -307,7 +334,7 @@ index 945003a..30f8246 100644
                                      self.buf.resize_buffer(size as usize);
                                  }
                                  self.buf.clear();
-@@ -361,7 +396,9 @@ impl<T: CommandParser> Receiver<T> {
+@@ -361,7 +401,9 @@ impl<T: CommandParser> Receiver<T> {
                  State::LiteralSeek { size, non_sync } => {
                      if ch == b'\n' {
                          if non_sync
@@ -318,7 +345,7 @@ index 945003a..30f8246 100644
                          {
                              self.state = State::LiteralDiscard { remaining: size };
                          } else if size > 0 {
-@@ -387,6 +424,8 @@ impl<T: CommandParser> Receiver<T> {
+@@ -387,6 +429,8 @@ impl<T: CommandParser> Receiver<T> {
                          self.state = State::LiteralDiscard {
                              remaining: remaining - 1,
                          };
@@ -327,7 +354,7 @@ index 945003a..30f8246 100644
                      } else {
                          return Err(self.error_reset(format_compact!(
                              "Literal exceeds the maximum request size of {} bytes.",
-@@ -584,6 +623,8 @@ impl<T: CommandParser> Default for Receiver<T> {
+@@ -584,6 +628,8 @@ impl<T: CommandParser> Default for Receiver<T> {
              start_state: State::Start,
              max_request_size: 25 * 1024 * 1024,
              current_request_size: 0,
@@ -337,7 +364,7 @@ index 945003a..30f8246 100644
      }
  }
 diff --git a/crates/imap/src/core/client.rs b/crates/imap/src/core/client.rs
-index 2de60d8..d4b5c30 100644
+index 2de60d8..6924678 100644
 --- a/crates/imap/src/core/client.rs
 +++ b/crates/imap/src/core/client.rs
 @@ -4,7 +4,7 @@
@@ -358,13 +385,12 @@ index 2de60d8..d4b5c30 100644
  
          loop {
              match self.receiver.parse(&mut bytes) {
-@@ -38,9 +40,14 @@ impl<T: SessionStream> Session<T> {
+@@ -38,9 +40,13 @@ impl<T: SessionStream> Session<T> {
                      Ok(request) => {
                          has_expunge |=
                              matches!(request.command, Command::Expunge(_) | Command::Close);
-+                        let large = self.receiver.large.take();
 +                        if matches!(request.command, Command::Append) {
-+                            append_slots.push_back(large);
++                            append_slots.push_back(self.receiver.large.take());
 +                        }
                          requests.push(request);
                      }
@@ -373,7 +399,7 @@ index 2de60d8..d4b5c30 100644
                          if !self.write_error(err).await {
                              return SessionResult::Close;
                          }
-@@ -119,7 +126,7 @@ impl<T: SessionStream> Session<T> {
+@@ -119,7 +125,7 @@ impl<T: SessionStream> Session<T> {
                      .await
                      .map(|_| SessionResult::Continue),
                  Command::Append => self
@@ -411,51 +437,6 @@ index a9c4c8d..0705a23 100644
              let response = data
                  .append_messages(arguments, selected_mailbox, mailbox, is_qresync, op_start)
                  .await?
-diff --git a/crates/managesieve/src/core/client.rs b/crates/managesieve/src/core/client.rs
-index cd13085..38e71e6 100644
---- a/crates/managesieve/src/core/client.rs
-+++ b/crates/managesieve/src/core/client.rs
-@@ -22,23 +22,27 @@ impl<T: SessionStream> Session<T> {
- 
-         loop {
-             match self.receiver.parse(&mut bytes) {
--                Ok(request) => match self.validate_request(request).await {
--                    Ok(request) => {
--                        requests.push(request);
--                    }
--                    Err(err) => {
--                        let mut disconnect = err.must_disconnect();
--
--                        if let Err(err) = self.write_error(err).await {
--                            trc::error!(err.span_id(self.session_id));
--                            disconnect = true;
-+                Ok(request) => {
-+                    // A script is never a message: no slot is held for a large literal (MAI-1000).
-+                    self.receiver.large = None;
-+                    match self.validate_request(request).await {
-+                        Ok(request) => {
-+                            requests.push(request);
-                         }
-+                        Err(err) => {
-+                            let mut disconnect = err.must_disconnect();
-+
-+                            if let Err(err) = self.write_error(err).await {
-+                                trc::error!(err.span_id(self.session_id));
-+                                disconnect = true;
-+                            }
- 
--                        if disconnect {
--                            return SessionResult::Close;
-+                            if disconnect {
-+                                return SessionResult::Close;
-+                            }
-                         }
-                     }
--                },
-+                }
-                 Err(receiver::Error::NeedsMoreData) => {
-                     break;
-                 }
 diff --git a/crates/smtp/src/core/mod.rs b/crates/smtp/src/core/mod.rs
 index 485b3c3..8e6e984 100644
 --- a/crates/smtp/src/core/mod.rs
@@ -495,7 +476,7 @@ index 485b3c3..8e6e984 100644
              auth_errors: 0,
              priority: 0,
 diff --git a/crates/smtp/src/inbound/session.rs b/crates/smtp/src/inbound/session.rs
-index 73b7737..4c2005f 100644
+index 73b7737..04d4170 100644
 --- a/crates/smtp/src/inbound/session.rs
 +++ b/crates/smtp/src/inbound/session.rs
 @@ -21,9 +21,13 @@ use smtp_proto::{
@@ -512,24 +493,33 @@ index 73b7737..4c2005f 100644
  use super::auth::SaslToken;
  
  impl<T: SessionStream> Session<T> {
-@@ -74,6 +78,16 @@ impl<T: SessionStream> Session<T> {
-                                         DummyDataReceiver::new_bdat(chunk_size),
-                                         response,
-                                     )
-+                                } else if chunk_size.saturating_add(self.data.message.len())
-+                                    < self.params.max_message_size
-+                                    && !self.claim_large_message(
-+                                        chunk_size.saturating_add(self.data.message.len()),
-+                                    )
-+                                {
-+                                    State::SkipData(
-+                                        DummyDataReceiver::new_bdat(chunk_size),
-+                                        LARGE_MESSAGE_BUSY,
-+                                    )
+@@ -77,12 +81,21 @@ impl<T: SessionStream> Session<T> {
                                  } else if chunk_size.saturating_add(self.data.message.len())
                                      < self.params.max_message_size
                                  {
-@@ -363,6 +377,13 @@ impl<T: SessionStream> Session<T> {
+-                                    if self.data.message.is_empty() {
+-                                        self.data.message = Vec::with_capacity(chunk_size);
++                                    if !self.claim_large_message(
++                                        chunk_size.saturating_add(self.data.message.len()),
++                                    ) {
++                                        State::SkipData(
++                                            DummyDataReceiver::new_bdat(chunk_size),
++                                            LARGE_MESSAGE_BUSY,
++                                        )
+                                     } else {
+-                                        self.data.message.reserve(chunk_size);
++                                        if self.data.message.is_empty() {
++                                            self.data.message = Vec::with_capacity(chunk_size);
++                                        } else {
++                                            self.data.message.reserve(chunk_size);
++                                        }
++                                        State::Bdat(BdatReceiver::new(chunk_size, is_last))
+                                     }
+-                                    State::Bdat(BdatReceiver::new(chunk_size, is_last))
+                                 } else {
+                                     trc::event!(
+                                         Smtp(SmtpEvent::MessageTooLarge),
+@@ -363,6 +376,13 @@ impl<T: SessionStream> Session<T> {
                  },
                  State::Data(receiver) => {
                      if self.data.message.len() + bytes.len() < self.params.max_message_size {
@@ -543,7 +533,7 @@ index 73b7737..4c2005f 100644
                          if receiver.ingest(&mut iter, &mut self.data.message) {
                              let message = self.queue_message().await;
                              let num_responses = if self.instance.protocol == ServerProtocol::Smtp {
-@@ -454,6 +475,7 @@ impl<T: SessionStream> Session<T> {
+@@ -454,6 +474,7 @@ impl<T: SessionStream> Session<T> {
                  State::SkipData(receiver, response) => {
                      if receiver.ingest(&mut iter) {
                          self.data.message = Vec::with_capacity(0);
@@ -551,7 +541,7 @@ index 73b7737..4c2005f 100644
                          self.write(response).await?;
                          state = State::default();
                      } else {
-@@ -483,11 +505,32 @@ impl<T: SessionStream> Session<T> {
+@@ -483,11 +504,32 @@ impl<T: SessionStream> Session<T> {
  }
  
  impl<T: AsyncWrite + AsyncRead + Unpin> Session<T> {
@@ -586,10 +576,10 @@ index 73b7737..4c2005f 100644
          self.data.future_release = 0;
 diff --git a/crates/utils/src/in_flight.rs b/crates/utils/src/in_flight.rs
 new file mode 100644
-index 0000000..be31d79
+index 0000000..044f4c7
 --- /dev/null
 +++ b/crates/utils/src/in_flight.rs
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,76 @@
 +/*
 + * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
 + *
@@ -600,14 +590,12 @@ index 0000000..be31d79
 +//! (requests at once, a pending-upload quota), and SMTP per sender IP, but nothing bounds the sum: a burst
 +//! across accounts or senders takes the process past its memory limit and it is OOM-killed, with every
 +//! session on it. A body past the cap is refused retryably instead. Unset, a cap is no bound (upstream's
-+//! behaviour).
++//! behaviour). Not `common::network::limiter`: `imap-proto` cannot depend on `common`, and that limiter's
++//! load-then-add can let two callers past the last slot.
 +
-+use std::{
-+    fmt,
-+    sync::{
-+        OnceLock,
-+        atomic::{AtomicUsize, Ordering},
-+    },
++use std::sync::{
++    OnceLock,
++    atomic::{AtomicUsize, Ordering},
 +};
 +
 +/// An HTTP request body past this size counts against `STALWART_MAX_LARGE_UPLOADS`.
@@ -619,18 +607,18 @@ index 0000000..be31d79
 +pub const LARGE_MESSAGE: usize = 5 * 1024 * 1024;
 +
 +/// WebDAV PUT, JMAP upload and JMAP request bodies.
-+pub static LARGE_UPLOADS: InFlight = InFlight::new("STALWART_MAX_LARGE_UPLOADS");
++pub static LARGE_UPLOADS: Cap = Cap::new("STALWART_MAX_LARGE_UPLOADS");
 +
 +/// Messages arriving by SMTP DATA or BDAT, or by IMAP APPEND.
-+pub static LARGE_MESSAGES: InFlight = InFlight::new("STALWART_MAX_LARGE_MESSAGES");
++pub static LARGE_MESSAGES: Cap = Cap::new("STALWART_MAX_LARGE_MESSAGES");
 +
-+pub struct InFlight {
++pub struct Cap {
 +    var: &'static str,
 +    count: AtomicUsize,
 +    max: OnceLock<usize>,
 +}
 +
-+impl InFlight {
++impl Cap {
 +    const fn new(var: &'static str) -> Self {
 +        Self {
 +            var,
@@ -650,9 +638,10 @@ index 0000000..be31d79
 +
 +    /// A slot, or `None` when the server holds as many as it may.
 +    pub fn try_acquire(&'static self) -> Option<Slot> {
++        let max = self.max();
 +        self.count
 +            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-+                (n < self.max()).then_some(n + 1)
++                (n < max).then_some(n + 1)
 +            })
 +            .ok()
 +            .map(|_| Slot(self))
@@ -660,28 +649,13 @@ index 0000000..be31d79
 +}
 +
 +/// One large body's place under its cap, given back when dropped.
-+pub struct Slot(&'static InFlight);
++pub struct Slot(&'static Cap);
 +
 +impl Drop for Slot {
 +    fn drop(&mut self) {
 +        self.0.count.fetch_sub(1, Ordering::SeqCst);
 +    }
 +}
-+
-+impl fmt::Debug for Slot {
-+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-+        f.write_str(self.0.var)
-+    }
-+}
-+
-+// So a request that carries one can still be compared: two requests are equal whatever slots they hold.
-+impl PartialEq for Slot {
-+    fn eq(&self, _: &Self) -> bool {
-+        true
-+    }
-+}
-+
-+impl Eq for Slot {}
 diff --git a/crates/utils/src/lib.rs b/crates/utils/src/lib.rs
 index 4629c3c..5cf6662 100644
 --- a/crates/utils/src/lib.rs
