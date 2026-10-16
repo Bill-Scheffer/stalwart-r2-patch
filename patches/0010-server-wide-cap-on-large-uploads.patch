@@ -54,7 +54,7 @@ index 2aaa3cb..08bf8d4 100644
          } else {
              Vec::new()
 diff --git a/crates/http-proto/src/request.rs b/crates/http-proto/src/request.rs
-index 467dba3..8e62649 100644
+index 467dba3..287f46f 100644
 --- a/crates/http-proto/src/request.rs
 +++ b/crates/http-proto/src/request.rs
 @@ -4,7 +4,13 @@
@@ -72,7 +72,7 @@ index 467dba3..8e62649 100644
  
  use compact_str::ToCompactString;
  use http_body_util::BodyExt;
-@@ -18,15 +24,78 @@ pub fn decode_path_element(item: &str) -> Cow<'_, str> {
+@@ -18,15 +24,90 @@ pub fn decode_path_element(item: &str) -> Cow<'_, str> {
          .unwrap_or_else(|_| item.into())
  }
  
@@ -127,8 +127,18 @@ index 467dba3..8e62649 100644
 +) -> Result<Vec<u8>, BodyRefusal> {
      let mut bytes = Vec::with_capacity(1024);
 +    let mut large = false;
++    // Once refused as busy: how much has been read. The rest is read and none of it kept, so the client can
++    // read the refusal; closing on an unread body resets the connection, and the client sees a network error.
++    let mut busy: Option<usize> = None;
      while let Some(Ok(frame)) = req.frame().await {
          if let Some(data) = frame.data_ref() {
++            if let Some(read) = &mut busy {
++                *read += data.len();
++                if *read > max_size && max_size != 0 {
++                    break;
++                }
++                continue;
++            }
              if bytes.len() + data.len() <= max_size || max_size == 0 {
 +                if !large && bytes.len() + data.len() > LARGE_BODY {
 +                    if LARGE_IN_FLIGHT
@@ -143,7 +153,9 @@ index 467dba3..8e62649 100644
 +                            Limit = max_large_bodies(),
 +                            Contents = "Too many large uploads in progress on this server",
 +                        );
-+                        return Err(BodyRefusal::Busy);
++                        busy = Some(bytes.len() + data.len());
++                        bytes = Vec::new();
++                        continue;
 +                    }
 +                    req.extensions_mut().insert(Arc::new(LargeBody));
 +                    large = true;
@@ -151,7 +163,7 @@ index 467dba3..8e62649 100644
                  bytes.extend_from_slice(data);
              } else {
                  trc::event!(
-@@ -47,7 +116,7 @@ pub async fn fetch_body(
+@@ -47,11 +128,15 @@ pub async fn fetch_body(
                      Limit = max_size,
                  );
  
@@ -160,7 +172,15 @@ index 467dba3..8e62649 100644
              }
          }
      }
-@@ -69,5 +138,5 @@ pub async fn fetch_body(
+ 
++    if busy.is_some() {
++        return Err(BodyRefusal::Busy);
++    }
++
+     trc::event!(
+         Http(trc::HttpEvent::RequestBody),
+         SpanId = session_id,
+@@ -69,5 +154,5 @@ pub async fn fetch_body(
          Size = bytes.len(),
      );
  

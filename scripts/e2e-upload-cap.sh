@@ -8,6 +8,7 @@
 # past the cap, retryably: WebDAV 429 with Retry-After, JMAP 429. Here the cap is 2: two uploads are held open past
 # 1 MiB, a third (WebDAV and JMAP, other accounts) is refused while they are, a small body is not, and once they finish
 # the slots are back: the same pattern holds a second time, after a too-large body that was refused mid-way too.
+# A refused body is read to its end and dropped, so the client gets the 429, not a reset connection.
 # Against -nologo1 the refusals FAIL (it has no cap).
 set -euo pipefail
 IMG=${1:?usage: $0 <stalwart image>}
@@ -63,8 +64,9 @@ class Held(threading.Thread):
 def round_(tag,a,b,x,y,z):
     go=threading.Event(); hs=[Held(a,go),Held(b,go)]; [h.start() for h in hs]
     time.sleep(3)   # both bodies are past 1 MiB on the server: both slots are held
-    # Just past 1 MiB, so the refusal comes when nearly all of it is sent and the client reads the answer.
-    LARGE=MiB+16*1024
+    # 8 MiB: the refusal comes at 1 MiB, and the client must still READ it after sending the other 7. A server that
+    # answers and closes on the unread rest resets the connection, and the client sees a network error instead.
+    LARGE=8*MiB
     st,hd,_=dav(x,LARGE)
     check(st==429, f"{tag}: with 2 large uploads in flight, a third WebDAV PUT from another account is refused retryably", st)
     check(st==429 and hd.get("Retry-After")=="5", f"{tag}: the WebDAV refusal says when to retry", hd.get("Retry-After"))

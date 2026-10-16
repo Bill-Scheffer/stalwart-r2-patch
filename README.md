@@ -202,7 +202,9 @@ process, and every upload and session on it is lost (measured at a smaller limit
 container, and all 16 failed). [`patches/0010-server-wide-cap-on-large-uploads.patch`](patches/0010-server-wide-cap-on-large-uploads.patch)
 counts a request body once it passes 1 MiB, and holds the count until the request is done with it. When
 `STALWART_MAX_LARGE_UPLOADS` is set, a body that would pass that count is refused retryably: WebDAV `429` with
-`Retry-After: 5`, JMAP `429`. Smaller bodies are never counted. Unset, there is no cap (upstream's behaviour).
+`Retry-After: 5`, JMAP `429`. The refused body is read to its end and none of it kept, so the client reads the
+`429`: answering and closing on the unread rest reset the connection, and every refused upload in a 64-upload burst
+saw a network error instead (measured on the first build). Smaller bodies are never counted. Unset, there is no cap (upstream's behaviour).
 [`scripts/e2e-upload-cap.sh`](scripts/e2e-upload-cap.sh) sets the cap to 2, holds two uploads open past 1 MiB, and
 checks that a third WebDAV `PUT` and JMAP upload from other accounts are refused while a small file is stored. It then
 checks that both stored on retry once the held uploads finished, and that the slots came back after a body refused as
