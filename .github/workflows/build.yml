@@ -29,9 +29,11 @@
 # 9. patches/0009-no-logo-on-calendar-mail-and-rsvp.patch: no Stalwart logo on a calendar invitation, a reminder
 #    or the guest RSVP page. The templates are compiled in (both editions; Enterprise can only swap the image), and
 #    upstream attaches its built-in logo to every invitation and reminder (measured).
-# 10. patches/0010-server-wide-cap-on-large-uploads.patch: at most STALWART_MAX_LARGE_UPLOADS request bodies past 1 MiB
-#    are held at once, server-wide; one past the cap is refused retryably (WebDAV 429 + Retry-After, JMAP 429). Upstream
-#    bounds each account only, so a burst across accounts could OOM-kill the process (measured, MAI-1000).
+# 10. patches/0010-server-wide-cap-on-large-bodies.patch: at most STALWART_MAX_LARGE_UPLOADS request bodies past 1 MiB,
+#    and at most STALWART_MAX_LARGE_MESSAGES messages past 5 MiB (SMTP DATA and BDAT, IMAP APPEND), are held at once,
+#    server-wide; one past its cap is refused retryably (WebDAV 429 + Retry-After, JMAP 429, SMTP 452, IMAP NO
+#    [UNAVAILABLE]). Upstream bounds each account, or each sender IP, only, so a burst across them could OOM-kill the
+#    process (measured, MAI-1000).
 # Everything else is upstream: the tag's source, its Dockerfile, its features.
 # The release tag is pushed only from main; a dispatch from another branch pushes branch-<short sha>
 # instead, and a pull request runs every step but the registry login and the push (MAI-1019). A release tag is
@@ -70,7 +72,7 @@ env:
   RUSTS3_REV: 505aded53d2e668bad472bd7834019e8b1f7a4dd
   IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch
   # The tag after the Stalwart release: bump it with any change to what is built.
-  VARIANT: rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-uploadcap1
+  VARIANT: rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1
   # A FIXED image that HAS the expired-ban bug (the last build before 0006), which the ban-expiry check must FAIL
   # on the bug's own line: that proves the check can fail. ⛔ NEVER bumped with releases: every build after 0006
   # lacks the bug and PASSES the check, so it could never be the reference. Pinned by tag AND digest, because a tag
@@ -298,14 +300,16 @@ jobs:
           # Stage 0009, so the next step's diff is 0010 alone.
           git add -- crates/ resources/
 
-      - name: Apply the upload-cap patch, and prove it changed only its own files
+      - name: Apply the large-body cap patch, and prove it changed only its own files
         working-directory: stalwart
         run: |
           set -eu
-          P=../patch/patches/0010-server-wide-cap-on-large-uploads.patch
+          P=../patch/patches/0010-server-wide-cap-on-large-bodies.patch
           git apply --check "$P" && git apply "$P"
+          # Its one new file is untracked until marked, and the diff below must see it.
+          git add -N -- crates/utils/src/in_flight.rs
           got=$(git diff --name-only | sort | tr '\n' ' ')
-          [ "$got" = "Cargo.lock Cargo.toml crates/dav/src/request.rs crates/http-proto/src/request.rs crates/http/src/request.rs " ] \
+          [ "$got" = "Cargo.lock Cargo.toml crates/dav/src/request.rs crates/http-proto/Cargo.toml crates/http-proto/src/request.rs crates/http/src/request.rs crates/imap-proto/src/receiver.rs crates/imap/src/core/client.rs crates/imap/src/op/append.rs crates/managesieve/src/core/client.rs crates/smtp/src/core/mod.rs crates/smtp/src/inbound/session.rs crates/utils/src/in_flight.rs crates/utils/src/lib.rs " ] \
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
@@ -334,7 +338,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ env.STALWART_TAG }}-${{ env.VARIANT }}
-            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with rust-s3 PR 467 (R2 DeleteObject fix) tenant-scoped sharing (JMAP, IMAP, WebDAV), scanned, capped file writes, expired bans replaced, account writes within the caller's grant, admin verbs without impersonate, no logo on calendar mail, and a server-wide cap on large uploads
+            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with rust-s3 PR 467 (R2 DeleteObject fix) tenant-scoped sharing (JMAP, IMAP, WebDAV), scanned, capped file writes, expired bans replaced, account writes within the caller's grant, admin verbs without impersonate, no logo on calendar mail, and a server-wide cap on large uploads and messages
             org.opencontainers.image.licenses=AGPL-3.0-only
           cache-from: type=gha
           # Only main writes the cache: a pull request reads main's, and a Rust build cache written per
@@ -382,14 +386,18 @@ jobs:
             'FAIL the reminder references no cid:logo' \
             'FAIL the RSVP page carries no Stalwart logo SVG'
 
-      - name: At most STALWART_MAX_LARGE_UPLOADS large bodies at once, server-wide, refused retryably past it (end to end, the built image)
+      - name: At most STALWART_MAX_LARGE_UPLOADS large bodies and STALWART_MAX_LARGE_MESSAGES large messages at once, server-wide, refused retryably past them (end to end, the built image)
         run: bash patch/scripts/e2e-upload-cap.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
 
       - name: The same check FAILS on the last image before 0010, on its refusals, so it can tell the two apart
         run: |
           bash patch/scripts/previous-must-fail.sh "${MAI1000_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-upload-cap.sh \
             'FAIL first: with 2 large uploads in flight, a third WebDAV PUT from another account is refused retryably' \
-            'FAIL first: and a third JMAP upload from another account too'
+            'FAIL first: and a third JMAP upload from another account too' \
+            'FAIL with 2 large messages in flight, a third by SMTP DATA is refused with 452 (the sender retries)' \
+            'FAIL and one by SMTP BDAT' \
+            'FAIL and an IMAP APPEND, before its literal is sent' \
+            'FAIL and an IMAP APPEND with a LITERAL+ literal, read and dropped'
 
       # ⛔ The release tag is pushed only from main (a push, or a dispatch on main). A dispatch from any
       # other branch pushes the same tested image under branch-<short sha> alone, never the release tag,

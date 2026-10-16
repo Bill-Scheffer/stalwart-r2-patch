@@ -1,0 +1,696 @@
+diff --git a/crates/dav/src/request.rs b/crates/dav/src/request.rs
+index 2aaa3cb..08bf8d4 100644
+--- a/crates/dav/src/request.rs
++++ b/crates/dav/src/request.rs
+@@ -47,7 +47,10 @@ use dav_proto::{
+         },
+     },
+ };
+-use http_proto::{HttpRequest, HttpResponse, HttpSessionData, request::fetch_body};
++use http_proto::{
++    HttpRequest, HttpResponse, HttpSessionData,
++    request::{BodyRefusal, fetch_body_or_busy},
++};
+ use hyper::{StatusCode, header};
+ use registry::schema::enums::Permission;
+ use std::time::Instant;
+@@ -603,7 +606,7 @@ impl DavRequestHandler for Server {
+                 .and_then(|v| v.parse::<u64>().ok())
+                 .is_some_and(|len| len > 0)
+         {
+-            if let Some(body) = fetch_body(
++            match fetch_body_or_busy(
+                 &mut request,
+                 if !access_token.has_permission(Permission::UnlimitedUploads) {
+                     self.core.groupware.max_request_size
+@@ -614,15 +617,20 @@ impl DavRequestHandler for Server {
+             )
+             .await
+             {
+-                body
+-            } else {
+-                trc::event!(
+-                    Limit(trc::LimitEvent::SizeRequest),
+-                    SpanId = session.session_id,
+-                    Contents = "Request body too large",
+-                );
+-
+-                return HttpResponse::new(StatusCode::PAYLOAD_TOO_LARGE);
++                Ok(body) => body,
++                Err(BodyRefusal::Busy) => {
++                    return HttpResponse::new(StatusCode::TOO_MANY_REQUESTS)
++                        .with_header(header::RETRY_AFTER, "5");
++                }
++                Err(BodyRefusal::TooLarge) => {
++                    trc::event!(
++                        Limit(trc::LimitEvent::SizeRequest),
++                        SpanId = session.session_id,
++                        Contents = "Request body too large",
++                    );
++
++                    return HttpResponse::new(StatusCode::PAYLOAD_TOO_LARGE);
++                }
+             }
+         } else {
+             Vec::new()
+diff --git a/crates/http-proto/Cargo.toml b/crates/http-proto/Cargo.toml
+index 5de066d..ebe50ff 100644
+--- a/crates/http-proto/Cargo.toml
++++ b/crates/http-proto/Cargo.toml
+@@ -6,6 +6,7 @@ edition = "2024"
+ [dependencies]
+ common = { path = "../common" }
+ trc = { path = "../trc" }
++utils = { path = "../utils" }
+ registry = { path = "../registry" }
+ serde = { version = "1.0", features = ["derive"]}
+ serde_json = "1.0"
+diff --git a/crates/http-proto/src/request.rs b/crates/http-proto/src/request.rs
+index 467dba3..0a06240 100644
+--- a/crates/http-proto/src/request.rs
++++ b/crates/http-proto/src/request.rs
+@@ -4,11 +4,13 @@
+  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+  */
+ 
+-use std::borrow::Cow;
++use std::{borrow::Cow, sync::Arc};
+ 
+ use compact_str::ToCompactString;
+ use http_body_util::BodyExt;
+ 
++use utils::in_flight::{LARGE_UPLOAD, LARGE_UPLOADS};
++
+ use crate::HttpRequest;
+ 
+ #[inline]
+@@ -18,15 +20,58 @@ pub fn decode_path_element(item: &str) -> Cow<'_, str> {
+         .unwrap_or_else(|_| item.into())
+ }
+ 
++pub enum BodyRefusal {
++    /// Over the caller's size limit.
++    TooLarge,
++    /// The server holds as many large bodies as it may: retry later.
++    Busy,
++}
++
+ pub async fn fetch_body(
+     req: &mut HttpRequest,
+     max_size: usize,
+     session_id: u64,
+ ) -> Option<Vec<u8>> {
++    fetch_body_or_busy(req, max_size, session_id).await.ok()
++}
++
++pub async fn fetch_body_or_busy(
++    req: &mut HttpRequest,
++    max_size: usize,
++    session_id: u64,
++) -> Result<Vec<u8>, BodyRefusal> {
+     let mut bytes = Vec::with_capacity(1024);
++    let mut large = false;
++    // Once refused as busy: how much has been read. The rest is read and none of it kept, so the client can
++    // read the refusal; closing on an unread body resets the connection, and the client sees a network error.
++    let mut busy: Option<usize> = None;
+     while let Some(Ok(frame)) = req.frame().await {
+         if let Some(data) = frame.data_ref() {
++            if let Some(read) = &mut busy {
++                *read += data.len();
++                if *read > max_size && max_size != 0 {
++                    break;
++                }
++                continue;
++            }
+             if bytes.len() + data.len() <= max_size || max_size == 0 {
++                if !large && bytes.len() + data.len() > LARGE_UPLOAD {
++                    // The slot rides in the request's extensions, so it is released when the request is
++                    // dropped, after the handler is done with the body, not when the body has been read.
++                    let Some(slot) = LARGE_UPLOADS.try_acquire() else {
++                        trc::event!(
++                            Limit(trc::LimitEvent::TooManyRequests),
++                            SpanId = session_id,
++                            Limit = LARGE_UPLOADS.max(),
++                            Contents = "Too many large uploads in progress on this server",
++                        );
++                        busy = Some(bytes.len() + data.len());
++                        bytes = Vec::new();
++                        continue;
++                    };
++                    req.extensions_mut().insert(Arc::new(slot));
++                    large = true;
++                }
+                 bytes.extend_from_slice(data);
+             } else {
+                 trc::event!(
+@@ -47,11 +92,15 @@ pub async fn fetch_body(
+                     Limit = max_size,
+                 );
+ 
+-                return None;
++                return Err(BodyRefusal::TooLarge);
+             }
+         }
+     }
+ 
++    if busy.is_some() {
++        return Err(BodyRefusal::Busy);
++    }
++
+     trc::event!(
+         Http(trc::HttpEvent::RequestBody),
+         SpanId = session_id,
+@@ -69,5 +118,5 @@ pub async fn fetch_body(
+         Size = bytes.len(),
+     );
+ 
+-    bytes.into()
++    Ok(bytes)
+ }
+diff --git a/crates/http/src/request.rs b/crates/http/src/request.rs
+index 7a031f2..1e3b79b 100644
+--- a/crates/http/src/request.rs
++++ b/crates/http/src/request.rs
+@@ -26,7 +26,8 @@ use dav::{DavMethod, request::DavRequestHandler};
+ use groupware::DavResourceName;
+ use http_proto::{
+     DownloadResponse, HttpContext, HttpRequest, HttpResponse, HttpResponseBody, HttpSessionData,
+-    JsonProblemResponse, ToHttpResponse, form_urlencoded, request::fetch_body,
++    JsonProblemResponse, ToHttpResponse, form_urlencoded,
++    request::{BodyRefusal, fetch_body, fetch_body_or_busy},
+ };
+ use hyper::{
+     Method, StatusCode, body,
+@@ -122,7 +123,7 @@ impl ParseHttp for Server {
+                             }
+                         }
+ 
+-                        let bytes = fetch_body(
++                        let bytes = fetch_body_or_busy(
+                             &mut req,
+                             if !access_token.has_permission(Permission::UnlimitedUploads) {
+                                 self.core.jmap.upload_max_size
+@@ -132,7 +133,10 @@ impl ParseHttp for Server {
+                             session.session_id,
+                         )
+                         .await
+-                        .ok_or_else(|| trc::LimitEvent::SizeRequest.into_err())?;
++                        .map_err(|refusal| match refusal {
++                            BodyRefusal::TooLarge => trc::LimitEvent::SizeRequest.into_err(),
++                            BodyRefusal::Busy => trc::LimitEvent::TooManyRequests.into_err(),
++                        })?;
+ 
+                         return Ok(self
+                             .handle_jmap_request(
+@@ -182,7 +186,7 @@ impl ParseHttp for Server {
+                             self.authenticate_headers(&req, &session).await?;
+ 
+                         if let Some(account_id) = path.next().and_then(|p| Id::from_str(p).ok()) {
+-                            return match fetch_body(
++                            return match fetch_body_or_busy(
+                                 &mut req,
+                                 if !access_token.has_permission(Permission::UnlimitedUploads) {
+                                     self.core.jmap.upload_max_size
+@@ -193,7 +197,7 @@ impl ParseHttp for Server {
+                             )
+                             .await
+                             {
+-                                Some(bytes) => Ok(self
++                                Ok(bytes) => Ok(self
+                                     .blob_upload(
+                                         account_id,
+                                         req.headers()
+@@ -205,7 +209,12 @@ impl ParseHttp for Server {
+                                     )
+                                     .await?
+                                     .into_http_response()),
+-                                None => Err(trc::LimitEvent::SizeUpload.into_err()),
++                                Err(BodyRefusal::TooLarge) => {
++                                    Err(trc::LimitEvent::SizeUpload.into_err())
++                                }
++                                Err(BodyRefusal::Busy) => {
++                                    Err(trc::LimitEvent::TooManyRequests.into_err())
++                                }
+                             };
+                         }
+                     }
+diff --git a/crates/imap-proto/src/receiver.rs b/crates/imap-proto/src/receiver.rs
+index 945003a..30f8246 100644
+--- a/crates/imap-proto/src/receiver.rs
++++ b/crates/imap-proto/src/receiver.rs
+@@ -7,6 +7,7 @@
+ use super::{ResponseCode, ResponseType};
+ use compact_str::{CompactString, format_compact};
+ use std::fmt::Display;
++use utils::in_flight::{LARGE_MESSAGE, LARGE_MESSAGES, Slot};
+ 
+ #[derive(Debug, Clone)]
+ pub enum Error {
+@@ -70,6 +71,11 @@ pub struct Receiver<T: CommandParser> {
+     pub max_request_size: usize,
+     pub current_request_size: usize,
+     pub start_state: State,
++    /// The slot of the request's literal when it is a large one (`STALWART_MAX_LARGE_MESSAGES`), for the
++    /// session to take with the request and hold until the request is done (MAI-1000).
++    pub large: Option<Slot>,
++    /// The literal being read is refused as busy: it is dropped as it arrives.
++    busy: bool,
+ }
+ 
+ const ARG_MAX_LEN: usize = 8000;
+@@ -112,9 +118,27 @@ impl<T: CommandParser> Receiver<T> {
+         self.buf = ArgumentBuffer::default();
+         self.state = self.start_state;
+         self.current_request_size = 0;
++        self.large = None;
++        self.busy = false;
+         err
+     }
+ 
++    /// The server holds as many large messages as it may: a temporary refusal, so the client can retry.
++    fn busy_reset(&mut self) -> Error {
++        let tag = std::mem::take(&mut self.request.tag);
++        self.error_reset("");
++        Error::Error {
++            response: trc::ImapEvent::Error
++                .ctx(
++                    trc::Key::Details,
++                    "Too many large messages in progress, try again later.",
++                )
++                .ctx_opt(trc::Key::Id, (!tag.is_empty()).then(|| CompactString::from(tag)))
++                .ctx(trc::Key::Type, ResponseType::No)
++                .code(ResponseCode::Unavailable),
++        }
++    }
++
+     fn push_argument(&mut self, in_quote: bool) -> Result<(), Error> {
+         if !self.buf.is_empty() {
+             self.current_request_size += self.buf.len();
+@@ -324,8 +348,19 @@ impl<T: CommandParser> Receiver<T> {
+                                         self.max_request_size
+                                     )));
+                                 }
++                                if !oversize
++                                    && size as usize > LARGE_MESSAGE
++                                    && self.large.is_none()
++                                {
++                                    match LARGE_MESSAGES.try_acquire() {
++                                        Some(slot) => self.large = Some(slot),
++                                        // A non-sync literal is on its way already: read it and drop it.
++                                        None if non_sync => self.busy = true,
++                                        None => return Err(self.busy_reset()),
++                                    }
++                                }
+                                 self.state = State::LiteralSeek { size, non_sync };
+-                                if !oversize {
++                                if !oversize && !self.busy {
+                                     self.buf.resize_buffer(size as usize);
+                                 }
+                                 self.buf.clear();
+@@ -361,7 +396,9 @@ impl<T: CommandParser> Receiver<T> {
+                 State::LiteralSeek { size, non_sync } => {
+                     if ch == b'\n' {
+                         if non_sync
+-                            && self.current_request_size + size as usize > self.max_request_size
++                            && (self.busy
++                                || self.current_request_size + size as usize
++                                    > self.max_request_size)
+                         {
+                             self.state = State::LiteralDiscard { remaining: size };
+                         } else if size > 0 {
+@@ -387,6 +424,8 @@ impl<T: CommandParser> Receiver<T> {
+                         self.state = State::LiteralDiscard {
+                             remaining: remaining - 1,
+                         };
++                    } else if self.busy {
++                        return Err(self.busy_reset());
+                     } else {
+                         return Err(self.error_reset(format_compact!(
+                             "Literal exceeds the maximum request size of {} bytes.",
+@@ -584,6 +623,8 @@ impl<T: CommandParser> Default for Receiver<T> {
+             start_state: State::Start,
+             max_request_size: 25 * 1024 * 1024,
+             current_request_size: 0,
++            large: None,
++            busy: false,
+         }
+     }
+ }
+diff --git a/crates/imap/src/core/client.rs b/crates/imap/src/core/client.rs
+index 2de60d8..d4b5c30 100644
+--- a/crates/imap/src/core/client.rs
++++ b/crates/imap/src/core/client.rs
+@@ -4,7 +4,7 @@
+  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+  */
+ 
+-use std::{iter::Peekable, sync::Arc, vec::IntoIter};
++use std::{collections::VecDeque, iter::Peekable, sync::Arc, vec::IntoIter};
+ 
+ use common::{
+     KV_RATE_LIMIT_IMAP,
+@@ -31,6 +31,8 @@ impl<T: SessionStream> Session<T> {
+         let mut requests = Vec::with_capacity(2);
+         let mut needs_literal = None;
+         let mut has_expunge = false;
++        // Each APPEND's large-message slot, in order, held until that APPEND is done (MAI-1000).
++        let mut append_slots = VecDeque::new();
+ 
+         loop {
+             match self.receiver.parse(&mut bytes) {
+@@ -38,9 +40,14 @@ impl<T: SessionStream> Session<T> {
+                     Ok(request) => {
+                         has_expunge |=
+                             matches!(request.command, Command::Expunge(_) | Command::Close);
++                        let large = self.receiver.large.take();
++                        if matches!(request.command, Command::Append) {
++                            append_slots.push_back(large);
++                        }
+                         requests.push(request);
+                     }
+                     Err(err) => {
++                        self.receiver.large = None;
+                         if !self.write_error(err).await {
+                             return SessionResult::Close;
+                         }
+@@ -119,7 +126,7 @@ impl<T: SessionStream> Session<T> {
+                     .await
+                     .map(|_| SessionResult::Continue),
+                 Command::Append => self
+-                    .handle_append(request)
++                    .handle_append(request, append_slots.pop_front().flatten())
+                     .await
+                     .map(|_| SessionResult::Continue),
+                 Command::Close => self
+diff --git a/crates/imap/src/op/append.rs b/crates/imap/src/op/append.rs
+index a9c4c8d..0705a23 100644
+--- a/crates/imap/src/op/append.rs
++++ b/crates/imap/src/op/append.rs
+@@ -24,9 +24,14 @@ use types::{
+     keyword::Keyword,
+     type_state::{DataType, StateChange},
+ };
++use utils::in_flight::Slot;
+ 
+ impl<T: SessionStream> Session<T> {
+-    pub async fn handle_append(&mut self, request: Request<Command>) -> trc::Result<()> {
++    pub async fn handle_append(
++        &mut self,
++        request: Request<Command>,
++        large: Option<Slot>,
++    ) -> trc::Result<()> {
+         // Validate access
+         self.assert_has_permission(Permission::ImapAppend)?;
+ 
+@@ -68,6 +73,8 @@ impl<T: SessionStream> Session<T> {
+         let is_qresync = self.is_qresync;
+ 
+         spawn_op!(data, {
++            // Held until the message is stored.
++            let _large = large;
+             let response = data
+                 .append_messages(arguments, selected_mailbox, mailbox, is_qresync, op_start)
+                 .await?
+diff --git a/crates/managesieve/src/core/client.rs b/crates/managesieve/src/core/client.rs
+index cd13085..38e71e6 100644
+--- a/crates/managesieve/src/core/client.rs
++++ b/crates/managesieve/src/core/client.rs
+@@ -22,23 +22,27 @@ impl<T: SessionStream> Session<T> {
+ 
+         loop {
+             match self.receiver.parse(&mut bytes) {
+-                Ok(request) => match self.validate_request(request).await {
+-                    Ok(request) => {
+-                        requests.push(request);
+-                    }
+-                    Err(err) => {
+-                        let mut disconnect = err.must_disconnect();
+-
+-                        if let Err(err) = self.write_error(err).await {
+-                            trc::error!(err.span_id(self.session_id));
+-                            disconnect = true;
++                Ok(request) => {
++                    // A script is never a message: no slot is held for a large literal (MAI-1000).
++                    self.receiver.large = None;
++                    match self.validate_request(request).await {
++                        Ok(request) => {
++                            requests.push(request);
+                         }
++                        Err(err) => {
++                            let mut disconnect = err.must_disconnect();
++
++                            if let Err(err) = self.write_error(err).await {
++                                trc::error!(err.span_id(self.session_id));
++                                disconnect = true;
++                            }
+ 
+-                        if disconnect {
+-                            return SessionResult::Close;
++                            if disconnect {
++                                return SessionResult::Close;
++                            }
+                         }
+                     }
+-                },
++                }
+                 Err(receiver::Error::NeedsMoreData) => {
+                     break;
+                 }
+diff --git a/crates/smtp/src/core/mod.rs b/crates/smtp/src/core/mod.rs
+index 485b3c3..8e6e984 100644
+--- a/crates/smtp/src/core/mod.rs
++++ b/crates/smtp/src/core/mod.rs
+@@ -23,7 +23,7 @@ use std::{
+     time::{Duration, Instant},
+ };
+ use tokio::io::{AsyncRead, AsyncWrite};
+-use utils::DomainPart;
++use utils::{DomainPart, in_flight::Slot};
+ 
+ pub mod params;
+ pub mod throttle;
+@@ -76,6 +76,8 @@ pub struct SessionData {
+     pub rcpt_errors: usize,
+     pub rcpt_oks: usize,
+     pub message: Vec<u8>,
++    /// Held while `message` is a large one (`utils::in_flight::LARGE_MESSAGES`).
++    pub large_message: Option<Slot>,
+ 
+     pub authenticated_as: Option<AccountInfo>,
+     pub auth_errors: usize,
+@@ -159,6 +161,7 @@ impl SessionData {
+             rcpt_errors: 0,
+             rcpt_oks: 0,
+             message: Vec::with_capacity(0),
++            large_message: None,
+             auth_errors: 0,
+             messages_sent: 0,
+             bytes_left: 0,
+@@ -279,6 +282,7 @@ impl SessionData {
+             rcpt_errors: 0,
+             rcpt_oks: 0,
+             message,
++            large_message: None,
+             authenticated_as: Some(authenticated_as),
+             auth_errors: 0,
+             priority: 0,
+diff --git a/crates/smtp/src/inbound/session.rs b/crates/smtp/src/inbound/session.rs
+index 73b7737..4c2005f 100644
+--- a/crates/smtp/src/inbound/session.rs
++++ b/crates/smtp/src/inbound/session.rs
+@@ -21,9 +21,13 @@ use smtp_proto::{
+ };
+ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+ use trc::{NetworkEvent, SecurityEvent, SmtpEvent};
++use utils::in_flight::{LARGE_MESSAGE, LARGE_MESSAGES};
+ 
+ use crate::core::{Session, State};
+ 
++const LARGE_MESSAGE_BUSY: &[u8] =
++    b"452 4.3.1 Too many large messages in progress, try again later.\r\n";
++
+ use super::auth::SaslToken;
+ 
+ impl<T: SessionStream> Session<T> {
+@@ -74,6 +78,16 @@ impl<T: SessionStream> Session<T> {
+                                         DummyDataReceiver::new_bdat(chunk_size),
+                                         response,
+                                     )
++                                } else if chunk_size.saturating_add(self.data.message.len())
++                                    < self.params.max_message_size
++                                    && !self.claim_large_message(
++                                        chunk_size.saturating_add(self.data.message.len()),
++                                    )
++                                {
++                                    State::SkipData(
++                                        DummyDataReceiver::new_bdat(chunk_size),
++                                        LARGE_MESSAGE_BUSY,
++                                    )
+                                 } else if chunk_size.saturating_add(self.data.message.len())
+                                     < self.params.max_message_size
+                                 {
+@@ -363,6 +377,13 @@ impl<T: SessionStream> Session<T> {
+                 },
+                 State::Data(receiver) => {
+                     if self.data.message.len() + bytes.len() < self.params.max_message_size {
++                        if !self.claim_large_message(self.data.message.len() + bytes.len()) {
++                            state = State::SkipData(
++                                DummyDataReceiver::new_data(receiver),
++                                LARGE_MESSAGE_BUSY,
++                            );
++                            continue 'outer;
++                        }
+                         if receiver.ingest(&mut iter, &mut self.data.message) {
+                             let message = self.queue_message().await;
+                             let num_responses = if self.instance.protocol == ServerProtocol::Smtp {
+@@ -454,6 +475,7 @@ impl<T: SessionStream> Session<T> {
+                 State::SkipData(receiver, response) => {
+                     if receiver.ingest(&mut iter) {
+                         self.data.message = Vec::with_capacity(0);
++                        self.data.large_message = None;
+                         self.write(response).await?;
+                         state = State::default();
+                     } else {
+@@ -483,11 +505,32 @@ impl<T: SessionStream> Session<T> {
+ }
+ 
+ impl<T: AsyncWrite + AsyncRead + Unpin> Session<T> {
++    /// Whether a message of `size` bytes so far may go on: one past `LARGE_MESSAGE` needs a slot under
++    /// `STALWART_MAX_LARGE_MESSAGES`, held until the message is queued or dropped. Past the cap, the rest is
++    /// read and dropped, and the reply is a 452, so the sender retries later (MAI-1000).
++    fn claim_large_message(&mut self, size: usize) -> bool {
++        if size <= LARGE_MESSAGE || self.data.large_message.is_some() {
++            return true;
++        }
++        if let Some(slot) = LARGE_MESSAGES.try_acquire() {
++            self.data.large_message = Some(slot);
++            return true;
++        }
++        trc::event!(
++            Limit(trc::LimitEvent::TooManyRequests),
++            SpanId = self.data.session_id,
++            Limit = LARGE_MESSAGES.max(),
++            Contents = "Too many large messages in progress on this server",
++        );
++        false
++    }
++
+     pub fn reset(&mut self) {
+         self.data.mail_from = None;
+         self.data.spf_mail_from = None;
+         self.data.rcpt_to.clear();
+         self.data.message = Vec::with_capacity(0);
++        self.data.large_message = None;
+         self.data.priority = 0;
+         self.data.delivery_by = 0;
+         self.data.future_release = 0;
+diff --git a/crates/utils/src/in_flight.rs b/crates/utils/src/in_flight.rs
+new file mode 100644
+index 0000000..be31d79
+--- /dev/null
++++ b/crates/utils/src/in_flight.rs
+@@ -0,0 +1,92 @@
++/*
++ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
++ *
++ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
++ */
++
++//! Server-wide caps on how many large bodies are held in memory at once. Each account is bounded already
++//! (requests at once, a pending-upload quota), and SMTP per sender IP, but nothing bounds the sum: a burst
++//! across accounts or senders takes the process past its memory limit and it is OOM-killed, with every
++//! session on it. A body past the cap is refused retryably instead. Unset, a cap is no bound (upstream's
++//! behaviour).
++
++use std::{
++    fmt,
++    sync::{
++        OnceLock,
++        atomic::{AtomicUsize, Ordering},
++    },
++};
++
++/// An HTTP request body past this size counts against `STALWART_MAX_LARGE_UPLOADS`.
++pub const LARGE_UPLOAD: usize = 1024 * 1024;
++
++/// A message past this size counts against `STALWART_MAX_LARGE_MESSAGES`. Higher than an upload's, so
++/// ordinary mail is never counted: a message costs about 6 times its size in SMTP and 3 times in IMAP, so
++/// one under it costs at most about 30 MiB.
++pub const LARGE_MESSAGE: usize = 5 * 1024 * 1024;
++
++/// WebDAV PUT, JMAP upload and JMAP request bodies.
++pub static LARGE_UPLOADS: InFlight = InFlight::new("STALWART_MAX_LARGE_UPLOADS");
++
++/// Messages arriving by SMTP DATA or BDAT, or by IMAP APPEND.
++pub static LARGE_MESSAGES: InFlight = InFlight::new("STALWART_MAX_LARGE_MESSAGES");
++
++pub struct InFlight {
++    var: &'static str,
++    count: AtomicUsize,
++    max: OnceLock<usize>,
++}
++
++impl InFlight {
++    const fn new(var: &'static str) -> Self {
++        Self {
++            var,
++            count: AtomicUsize::new(0),
++            max: OnceLock::new(),
++        }
++    }
++
++    pub fn max(&self) -> usize {
++        *self.max.get_or_init(|| {
++            std::env::var(self.var)
++                .ok()
++                .and_then(|v| v.trim().parse().ok())
++                .unwrap_or(usize::MAX)
++        })
++    }
++
++    /// A slot, or `None` when the server holds as many as it may.
++    pub fn try_acquire(&'static self) -> Option<Slot> {
++        self.count
++            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
++                (n < self.max()).then_some(n + 1)
++            })
++            .ok()
++            .map(|_| Slot(self))
++    }
++}
++
++/// One large body's place under its cap, given back when dropped.
++pub struct Slot(&'static InFlight);
++
++impl Drop for Slot {
++    fn drop(&mut self) {
++        self.0.count.fetch_sub(1, Ordering::SeqCst);
++    }
++}
++
++impl fmt::Debug for Slot {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(self.0.var)
++    }
++}
++
++// So a request that carries one can still be compared: two requests are equal whatever slots they hold.
++impl PartialEq for Slot {
++    fn eq(&self, _: &Self) -> bool {
++        true
++    }
++}
++
++impl Eq for Slot {}
+diff --git a/crates/utils/src/lib.rs b/crates/utils/src/lib.rs
+index 4629c3c..5cf6662 100644
+--- a/crates/utils/src/lib.rs
++++ b/crates/utils/src/lib.rs
+@@ -14,6 +14,7 @@ pub mod codec;
+ pub mod cron;
+ pub mod glob;
+ pub mod http;
++pub mod in_flight;
+ pub mod map;
+ pub mod snowflake;
+ pub mod template;

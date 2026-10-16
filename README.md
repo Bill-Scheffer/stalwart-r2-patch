@@ -4,7 +4,7 @@
 changes: it can delete blobs from **Cloudflare R2**, **sharing never crosses tenants**, stored files
 and mail written into a mailbox are **scanned**, a ban that expired is **enforced again**, a narrow
 key **cannot take over an Admin**, an operator can run **admin verbs on a mailbox without reading
-its mail**, calendar mail carries **no Stalwart logo**, and a burst of large uploads is **refused, not an OOM**.
+its mail**, calendar mail carries **no Stalwart logo**, and a burst of large uploads or messages is **refused, not an OOM**.
 
 ## The problem
 
@@ -193,24 +193,36 @@ with an attendee and an email alarm) and asserts that neither carries an image p
 both keep their HTML (and the invitation its `text/calendar`), and that the RSVP page carries no logo SVG.
 Against the last image before 0009 its five logo checks fail (measured), and the build requires them to.
 
-## The tenth change: a server-wide cap on large uploads
+## The tenth change: a server-wide cap on large uploads and messages
 
-Upstream bounds uploads per account (4 requests at once, a pending-upload quota), never in sum. A request body is held
-in memory whole, and a 25 MiB WebDAV `PUT` or JMAP upload costs about 26 MiB while it is in flight (measured: N = 1 to
-40 parallel uploads, each from its own account, MAI-1000). At a 2 GiB limit about 70 of them at once OOM-kill the
-process, and every upload and session on it is lost (measured at a smaller limit: 16 parallel uploads killed a 512 MiB
-container, and all 16 failed). [`patches/0010-server-wide-cap-on-large-uploads.patch`](patches/0010-server-wide-cap-on-large-uploads.patch)
-counts a request body once it passes 1 MiB, and holds the count until the request is done with it. When
-`STALWART_MAX_LARGE_UPLOADS` is set, a body that would pass that count is refused retryably: WebDAV `429` with
-`Retry-After: 5`, JMAP `429`. The refused body is read to its end and none of it kept, so the client reads the
-`429`: answering and closing on the unread rest reset the connection, and every refused upload in a 64-upload burst
-saw a network error instead (measured on the first build). Smaller bodies are never counted. Unset, there is no cap (upstream's behaviour).
-[`scripts/e2e-upload-cap.sh`](scripts/e2e-upload-cap.sh) sets the cap to 2, holds two uploads open past 1 MiB, and
-checks that a third WebDAV `PUT` and JMAP upload from other accounts are refused while a small file is stored. It then
-checks that both stored on retry once the held uploads finished, and that the slots came back after a body refused as
-too large. Against `-nologo1` the refusals FAIL (measured), and the build requires that.
+Upstream bounds uploads per account (4 requests at once, a pending-upload quota) and inbound SMTP per sender IP (5
+new connections a second), never in sum, and holds each body in memory whole. Measured on the `-nologo1` image at
+2 GiB, each from its own account (MAI-1000): a 25 MiB WebDAV `PUT` or JMAP upload costs about 26 MiB while it is in
+flight, an IMAP `APPEND` of a 25 MiB message about 80 MiB, and a 25 MiB message by SMTP about 160 MiB, before any
+authentication. About 70 uploads at once, or a dozen large messages from a few senders, OOM-kill the process, and every
+session on it is lost (measured at a smaller limit: 16 parallel uploads killed a 512 MiB container, and all 16 failed).
+[`patches/0010-server-wide-cap-on-large-bodies.patch`](patches/0010-server-wide-cap-on-large-bodies.patch) keeps
+two server-wide counts, each held until the request or message is done with its body:
 
-Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-uploadcap1`.
+- **`STALWART_MAX_LARGE_UPLOADS`**: HTTP request bodies past 1 MiB. Past the cap: WebDAV `429` with `Retry-After: 5`,
+  JMAP `429`. The refused body is read to its end and none of it kept, so the client reads the `429`: answering and
+  closing on the unread rest reset the connection, and every refused upload in a 64-upload burst saw a network error
+  instead (measured on the first build).
+- **`STALWART_MAX_LARGE_MESSAGES`**: messages past 5 MiB, by SMTP `DATA` or `BDAT` or by IMAP `APPEND`. Past the cap:
+  SMTP reads the rest of the message, drops it and answers `452 4.3.1`, so the sending server retries later; IMAP
+  answers `NO [UNAVAILABLE]`, before a synchronizing literal is sent, or after a `LITERAL+` one is read and dropped. The
+  threshold is higher than an upload's so ordinary mail is never counted: a 1 MiB message costs a few MiB.
+
+Unset, a cap is no bound (upstream's behaviour). [`scripts/e2e-upload-cap.sh`](scripts/e2e-upload-cap.sh) sets both
+caps to 2. It holds two uploads open past 1 MiB and checks that a third WebDAV `PUT` and JMAP upload from other
+accounts are refused while a small file is stored, that both store on retry once the held uploads finish, and that
+the slots come back after a body refused as too large. Then it holds two SMTP messages open past 5 MiB and checks that
+a third by `DATA` and by `BDAT` gets `452`, that IMAP `APPEND` with either kind of literal gets `NO [UNAVAILABLE]`,
+that a burst of 8 ordinary messages up to 4.5 MiB and a small `APPEND` are all accepted while the cap is full, and that
+the refused message and `APPEND` are accepted on retry. Against `-nologo1` the refusals FAIL (measured), and the build
+requires that.
+
+Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1`.
 
 ## Builds, tags and testing a change before it merges
 
