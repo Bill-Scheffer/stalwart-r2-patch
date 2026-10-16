@@ -165,6 +165,30 @@ got=append(NAMES[4],8*MiB)
 check(got.startswith("b NO [UNAVAILABLE]"), "and an IMAP APPEND, before its literal is sent", got)
 got=append(NAMES[5],8*MiB,non_sync=True)
 check(got.startswith("b NO [UNAVAILABLE]"), "and an IMAP APPEND with a LITERAL+ literal, read and dropped", got)
+# A refusal ends the transaction: the same session's next MAIL is a fresh one, not "503 Multiple MAIL commands".
+s=Smtp(); st=s.begin(NAMES[2])
+if st=="ok": s.c.sendall(eml(8*MiB)); st=s.cmd(b".\r\n")
+nxt=s.cmd(b"MAIL FROM:<s@example.net>\r\n") if st=="452" else "-"; s.close()
+check(st=="452" and nxt=="250", "after a 452, the same session starts a new message", f"{st} then {nxt}")
+# Pipelined BDAT chunks after a refused one are refused too (RFC 3030), so no message is delivered from the rest.
+s=Smtp(); st=s.begin(NAMES[3],data=False); codes=[]
+if st=="ok":
+    a,b,c=os.urandom(3*MiB),os.urandom(3*MiB),os.urandom(MiB)
+    s.c.sendall(f"BDAT {len(a)}\r\n".encode()+a+f"BDAT {len(b)}\r\n".encode()+b+f"BDAT {len(c)} LAST\r\n".encode()+c)
+    codes=[s.reply() for _ in range(3)]
+s.close()
+check(len(codes)==3 and codes[1]=="452" and codes[2]!="250", "a pipelined BDAT after a refused chunk is refused too", codes)
+# A MULTIAPPEND refused as busy mid-way: the rest of its line is read as data, never run as a command.
+c=ssl._create_unverified_context().wrap_socket(socket.create_connection(("stalwart",993),timeout=120)); f=c.makefile("rb"); f.readline()
+c.sendall(f"a LOGIN {NAMES[5]}@one.test {PW}\r\n".encode())
+while not (l:=f.readline()).startswith(b"a "): pass
+one,big=eml(MiB),eml(8*MiB); tail=b"Subject: x\r\n\r\nzz9 NOOP\r\n"
+c.sendall(f"b APPEND INBOX {{{len(one)}+}}\r\n".encode()+one+f" {{{len(big)}+}}\r\n".encode()+big+f" {{{len(tail)}+}}\r\n".encode()+tail+b"\r\nc NOOP\r\n")
+seen=[]
+while not (l:=f.readline()).startswith(b"c ") and l: seen.append(l.strip())
+c.close()
+tagged=[x.decode(errors="replace")[:60] for x in seen if not x.startswith(b"*")]
+check(len(tagged)==1 and tagged[0].startswith("b NO [UNAVAILABLE]"), "a MULTIAPPEND refused mid-way runs none of the rest of its line", tagged)
 # The burst the cap must never touch: ordinary messages up to 4.5 MiB, two senders at once.
 small={}
 def burst(i):
@@ -180,5 +204,15 @@ st=smtp(NAMES[2],8*MiB)
 check(st=="250", "once they are, the refused SMTP message is accepted on retry", st)
 got=append(NAMES[4],8*MiB)
 check(got.startswith("b OK"), "and the refused IMAP APPEND", got)
+# A client that has not logged in holds no slot: two stalled pre-login literals, and a large APPEND still goes in.
+stalled=[]
+for _ in range(2):
+    c=ssl._create_unverified_context().wrap_socket(socket.create_connection(("stalwart",993),timeout=120)); f=c.makefile("rb"); f.readline()
+    c.sendall(f"p APPEND INBOX {{{8*MiB}}}\r\n".encode())
+    if f.readline().startswith(b"+"): c.sendall(os.urandom(3*MiB))
+    stalled.append(c)
+got=append(NAMES[7],8*MiB)
+check(got.startswith("b OK"), "a client that has not logged in cannot hold a large-message slot", got)
+[c.close() for c in stalled]
 sys.exit(1 if fails else 0)
 PY

@@ -210,8 +210,11 @@ two server-wide counts, each held until the request or message is done with its 
   instead (measured on the first build).
 - **`STALWART_MAX_LARGE_MESSAGES`**: messages past 5 MiB, by SMTP `DATA` or `BDAT` or by IMAP `APPEND`. Past the cap:
   SMTP reads the rest of the message, drops it and answers `452 4.3.1`, so the sending server retries later; IMAP
-  answers `NO [UNAVAILABLE]`, before a synchronizing literal is sent, or after a `LITERAL+` one is read and dropped. The
-  threshold is higher than an upload's so ordinary mail is never counted: a 1 MiB message costs a few MiB.
+  answers `NO [UNAVAILABLE]`, before a synchronizing literal is sent, or after a `LITERAL+` one is read and dropped
+  (and the rest of that command line with it, so none of a refused `MULTIAPPEND` runs as a command). A refused SMTP
+  message ends its transaction, so a `BDAT` pipelined after it is refused too. Only an `APPEND` by a logged-in client
+  counts, so a client that has not logged in cannot hold a slot. The threshold is higher than an upload's so ordinary
+  mail is never counted: a 1 MiB message costs a few MiB.
 
 Unset, a cap is no bound (upstream's behaviour). [`scripts/e2e-upload-cap.sh`](scripts/e2e-upload-cap.sh) sets both
 caps to 2. It holds two uploads open past 1 MiB and checks that a third WebDAV `PUT` and JMAP upload from other
@@ -219,8 +222,10 @@ accounts are refused while a small file is stored, that both store on retry once
 the slots come back after a body refused as too large. Then it holds two SMTP messages open past 5 MiB and checks that
 a third by `DATA` and by `BDAT` gets `452`, that IMAP `APPEND` with either kind of literal gets `NO [UNAVAILABLE]`,
 that a burst of 8 ordinary messages up to 4.5 MiB and a small `APPEND` are all accepted while the cap is full, and that
-the refused message and `APPEND` are accepted on retry. Against `-nologo1` the refusals FAIL (measured), and the build
-requires that.
+the refused message and `APPEND` are accepted on retry. It also checks that a session's next `MAIL` after a `452` is a
+new message, that a pipelined `BDAT` after a refused chunk is refused, that a `MULTIAPPEND` refused mid-way runs
+none of the rest of its line, and that two stalled pre-login literals take no slot. Against `-nologo1` the refusals
+FAIL (measured), and the build requires that.
 
 Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1`.
 
