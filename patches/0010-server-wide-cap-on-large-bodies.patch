@@ -496,8 +496,22 @@ index a9c4c8d..0705a23 100644
              let response = data
                  .append_messages(arguments, selected_mailbox, mailbox, is_qresync, op_start)
                  .await?
+diff --git a/crates/main/src/main.rs b/crates/main/src/main.rs
+index db0a4c0..354eba5 100644
+--- a/crates/main/src/main.rs
++++ b/crates/main/src/main.rs
+@@ -40,6 +40,9 @@ async fn main() -> std::io::Result<()> {
+     // Build the shared outbound TLS configurations
+     utils::http::init_shared_tls_configs();
+ 
++    // The server-wide budgets for large bodies (MAI-1000)
++    utils::in_flight::init();
++
+     // Load config and apply macros
+     let mut init = Box::pin(BootManager::init()).await;
+ 
 diff --git a/crates/smtp/src/core/mod.rs b/crates/smtp/src/core/mod.rs
-index 485b3c3..37620f2 100644
+index 485b3c3..73b96af 100644
 --- a/crates/smtp/src/core/mod.rs
 +++ b/crates/smtp/src/core/mod.rs
 @@ -23,7 +23,7 @@ use std::{
@@ -509,7 +523,17 @@ index 485b3c3..37620f2 100644
  
  pub mod params;
  pub mod throttle;
-@@ -76,6 +76,8 @@ pub struct SessionData {
+@@ -41,7 +41,8 @@ impl SmtpSessionManager {
+ 
+ pub enum State {
+     Request(RequestReceiver),
+-    Bdat(BdatReceiver),
++    /// The chunk, and the length `message` reaches when it is all in.
++    Bdat(BdatReceiver, usize),
+     Data(DataReceiver),
+     Sasl(LineReceiver<SaslToken>),
+     SkipData(DummyDataReceiver, &'static [u8]),
+@@ -76,6 +77,8 @@ pub struct SessionData {
      pub rcpt_errors: usize,
      pub rcpt_oks: usize,
      pub message: Vec<u8>,
@@ -518,7 +542,7 @@ index 485b3c3..37620f2 100644
  
      pub authenticated_as: Option<AccountInfo>,
      pub auth_errors: usize,
-@@ -159,6 +161,7 @@ impl SessionData {
+@@ -159,6 +162,7 @@ impl SessionData {
              rcpt_errors: 0,
              rcpt_oks: 0,
              message: Vec::with_capacity(0),
@@ -526,7 +550,7 @@ index 485b3c3..37620f2 100644
              auth_errors: 0,
              messages_sent: 0,
              bytes_left: 0,
-@@ -279,6 +282,7 @@ impl SessionData {
+@@ -279,6 +283,7 @@ impl SessionData {
              rcpt_errors: 0,
              rcpt_oks: 0,
              message,
@@ -535,7 +559,7 @@ index 485b3c3..37620f2 100644
              auth_errors: 0,
              priority: 0,
 diff --git a/crates/smtp/src/inbound/session.rs b/crates/smtp/src/inbound/session.rs
-index 73b7737..75a2ea4 100644
+index 73b7737..f2b4f49 100644
 --- a/crates/smtp/src/inbound/session.rs
 +++ b/crates/smtp/src/inbound/session.rs
 @@ -21,9 +21,13 @@ use smtp_proto::{
@@ -552,33 +576,19 @@ index 73b7737..75a2ea4 100644
  use super::auth::SaslToken;
  
  impl<T: SessionStream> Session<T> {
-@@ -77,12 +81,21 @@ impl<T: SessionStream> Session<T> {
-                                 } else if chunk_size.saturating_add(self.data.message.len())
-                                     < self.params.max_message_size
-                                 {
--                                    if self.data.message.is_empty() {
--                                        self.data.message = Vec::with_capacity(chunk_size);
-+                                    if !self.claim_large_message(
-+                                        chunk_size.saturating_add(self.data.message.len()),
-+                                    ) {
-+                                        State::SkipData(
-+                                            DummyDataReceiver::new_bdat(chunk_size),
-+                                            LARGE_MESSAGE_BUSY,
-+                                        )
+@@ -82,7 +86,10 @@ impl<T: SessionStream> Session<T> {
                                      } else {
--                                        self.data.message.reserve(chunk_size);
-+                                        if self.data.message.is_empty() {
-+                                            self.data.message = Vec::with_capacity(chunk_size);
-+                                        } else {
-+                                            self.data.message.reserve(chunk_size);
-+                                        }
-+                                        State::Bdat(BdatReceiver::new(chunk_size, is_last))
+                                         self.data.message.reserve(chunk_size);
                                      }
 -                                    State::Bdat(BdatReceiver::new(chunk_size, is_last))
++                                    State::Bdat(
++                                        BdatReceiver::new(chunk_size, is_last),
++                                        self.data.message.len() + chunk_size,
++                                    )
                                  } else {
                                      trc::event!(
                                          Smtp(SmtpEvent::MessageTooLarge),
-@@ -363,6 +376,13 @@ impl<T: SessionStream> Session<T> {
+@@ -363,6 +370,13 @@ impl<T: SessionStream> Session<T> {
                  },
                  State::Data(receiver) => {
                      if self.data.message.len() + bytes.len() < self.params.max_message_size {
@@ -592,7 +602,24 @@ index 73b7737..75a2ea4 100644
                          if receiver.ingest(&mut iter, &mut self.data.message) {
                              let message = self.queue_message().await;
                              let num_responses = if self.instance.protocol == ServerProtocol::Smtp {
-@@ -454,6 +474,12 @@ impl<T: SessionStream> Session<T> {
+@@ -397,7 +411,15 @@ impl<T: SessionStream> Session<T> {
+                         );
+                     }
+                 }
+-                State::Bdat(receiver) => {
++                State::Bdat(receiver, chunk_end) => {
++                    // Counted as the chunk arrives, not as declared: a BDAT that names a size and sends nothing
++                    // holds none of the budget.
++                    let left = *chunk_end - self.data.message.len();
++                    if !self.claim_large_message(self.data.message.len() + left.min(bytes.len())) {
++                        state =
++                            State::SkipData(DummyDataReceiver::new_bdat(left), LARGE_MESSAGE_BUSY);
++                        continue 'outer;
++                    }
+                     if receiver.ingest(&mut iter, &mut self.data.message) {
+                         if receiver.is_last {
+                             let message = self.queue_message().await;
+@@ -454,6 +476,12 @@ impl<T: SessionStream> Session<T> {
                  State::SkipData(receiver, response) => {
                      if receiver.ingest(&mut iter) {
                          self.data.message = Vec::with_capacity(0);
@@ -605,7 +632,7 @@ index 73b7737..75a2ea4 100644
                          self.write(response).await?;
                          state = State::default();
                      } else {
-@@ -483,11 +509,37 @@ impl<T: SessionStream> Session<T> {
+@@ -483,11 +511,39 @@ impl<T: SessionStream> Session<T> {
  }
  
  impl<T: AsyncWrite + AsyncRead + Unpin> Session<T> {
@@ -623,7 +650,9 @@ index 73b7737..75a2ea4 100644
 +            self.data.large_message.is_some()
 +        };
 +        if !granted {
++            // What it holds goes now, with its share: the rest is read and dropped, however slowly it comes.
 +            self.data.large_message = None;
++            self.data.message = Vec::with_capacity(0);
 +            trc::event!(
 +                Limit(trc::LimitEvent::TooManyRequests),
 +                SpanId = self.data.session_id,
@@ -645,10 +674,10 @@ index 73b7737..75a2ea4 100644
          self.data.future_release = 0;
 diff --git a/crates/utils/src/in_flight.rs b/crates/utils/src/in_flight.rs
 new file mode 100644
-index 0000000..590a33c
+index 0000000..cb2a2e4
 --- /dev/null
 +++ b/crates/utils/src/in_flight.rs
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,124 @@
 +/*
 + * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
 + *
@@ -682,6 +711,12 @@ index 0000000..590a33c
 +/// Messages arriving by SMTP DATA or BDAT, or by IMAP APPEND.
 +pub static LARGE_MESSAGES: Budget = Budget::new("STALWART_MAX_LARGE_MESSAGE_MIB");
 +
++/// Reads both budgets at startup, so one that is unset or unreadable is logged then, not at the first large body.
++pub fn init() {
++    LARGE_UPLOADS.max();
++    LARGE_MESSAGES.max();
++}
++
 +pub struct Budget {
 +    var: &'static str,
 +    used: AtomicUsize,
@@ -697,13 +732,23 @@ index 0000000..590a33c
 +        }
 +    }
 +
-+    /// The budget in bytes, from its variable in MiB.
++    /// The budget in bytes, from its variable in MiB. Unset or unreadable, it is no bound, and says so once.
 +    pub fn max(&self) -> usize {
-+        *self.max.get_or_init(|| {
-+            std::env::var(self.var)
-+                .ok()
-+                .and_then(|v| v.trim().parse::<usize>().ok())
-+                .map_or(usize::MAX, |mib| mib.saturating_mul(1024 * 1024))
++        *self.max.get_or_init(|| match std::env::var(self.var) {
++            Ok(v) => match v.trim().parse::<usize>() {
++                Ok(mib) => mib.saturating_mul(1024 * 1024),
++                Err(_) => {
++                    eprintln!(
++                        "ERROR {}={v:?} is not a whole number of MiB: large bodies are NOT bounded",
++                        self.var
++                    );
++                    usize::MAX
++                }
++            },
++            Err(_) => {
++                eprintln!("WARN {} is not set: large bodies are not bounded", self.var);
++                usize::MAX
++            }
 +        })
 +    }
 +

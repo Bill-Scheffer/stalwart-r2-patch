@@ -309,7 +309,7 @@ jobs:
           # Its one new file is untracked until marked, and the diff below must see it.
           git add -N -- crates/utils/src/in_flight.rs
           got=$(git diff --name-only | sort | tr '\n' ' ')
-          [ "$got" = "Cargo.lock Cargo.toml crates/dav/src/request.rs crates/http-proto/Cargo.toml crates/http-proto/src/request.rs crates/http/src/request.rs crates/imap-proto/src/parser/mod.rs crates/imap-proto/src/receiver.rs crates/imap/src/core/client.rs crates/imap/src/op/append.rs crates/smtp/src/core/mod.rs crates/smtp/src/inbound/session.rs crates/utils/src/in_flight.rs crates/utils/src/lib.rs " ] \
+          [ "$got" = "Cargo.lock Cargo.toml crates/dav/src/request.rs crates/http-proto/Cargo.toml crates/http-proto/src/request.rs crates/http/src/request.rs crates/imap-proto/src/parser/mod.rs crates/imap-proto/src/receiver.rs crates/imap/src/core/client.rs crates/imap/src/op/append.rs crates/main/src/main.rs crates/smtp/src/core/mod.rs crates/smtp/src/inbound/session.rs crates/utils/src/in_flight.rs crates/utils/src/lib.rs " ] \
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }

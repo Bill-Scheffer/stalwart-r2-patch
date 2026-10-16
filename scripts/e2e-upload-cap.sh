@@ -219,5 +219,12 @@ check(got.startswith("b OK"), "a client that has not logged in cannot hold a lar
 # The budget is bytes, so one message as large as SMTP allows (100 MiB) goes in alone.
 st=smtp(NAMES[8],97*MiB)
 check(st=="250", "with the budget free, a single 100 MiB message is accepted", st)
+# A BDAT is counted as its bytes arrive, not as declared: one that names 94 MiB and sends nothing holds none of it.
+idle=Smtp(); st=idle.begin(NAMES[9],data=False)
+if st=="ok": idle.c.sendall(b"BDAT 99000000\r\n")
+time.sleep(2)
+st2=smtp(NAMES[10],97*MiB)
+check(st=="ok" and st2=="250", "a BDAT that declares 94 MiB and sends nothing does not hold the budget", f"{st} / {st2}")
+idle.c.close()
 sys.exit(1 if fails else 0)
 PY

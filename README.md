@@ -211,14 +211,20 @@ so a count would bound nothing:
   client reads the `429`: answering and closing on the unread rest reset the connection, and every refused upload in a
   64-upload burst saw a network error instead (measured on the first build).
 - **`STALWART_MAX_LARGE_MESSAGE_MIB`**: messages past 5 MiB, by SMTP `DATA` or `BDAT` or by IMAP `APPEND`. Past the
-  budget, SMTP reads the rest of the message, drops it and answers `452 4.3.1`, so the sending server retries later;
-  the refusal ends the transaction, so a `BDAT` pipelined after it is refused too. IMAP answers `NO [UNAVAILABLE]`,
+  budget, SMTP drops what it holds of the message at once, reads and drops the rest, and answers `452 4.3.1`, so the
+  sending server retries later; the refusal ends the transaction, so a `BDAT` pipelined after it is refused too. A
+  `BDAT` chunk is counted as its bytes arrive, not as declared, so one that names a size and sends nothing holds none
+  of the budget. IMAP answers `NO [UNAVAILABLE]`,
   before a synchronizing literal is sent, or after a `LITERAL+` one is read and dropped (and the rest of that command
   line with it, so none of a refused `MULTIAPPEND` runs as a command). Only an `APPEND` by a logged-in client counts,
   so a client that has not logged in cannot hold any of the budget. The threshold is higher than an upload's so ordinary
   mail is never counted: a 1 MiB message costs a few MiB.
 
-Unset, a budget is no bound (upstream's behaviour); a budget below the largest body allowed refuses that body always.
+Unset, a budget is no bound (upstream's behaviour), and the server says so on stderr at startup, as it does for a
+value that is not a whole number of MiB; a budget below the largest body allowed refuses that body always. ⚠️ Not
+bounded: the inbound spam filter costs ~30–40 times a `text/plain` body (an attachment ~6), so huge plain-text mail
+on port 25 can still take more than the budget implies (MAI-1000's follow-up). A synchronizing IMAP literal reserves
+its declared size when it is announced (a logged-in client only).
 [`scripts/e2e-upload-cap.sh`](scripts/e2e-upload-cap.sh) sets 30 MiB and 110 MiB. It holds two 14 MiB uploads open at
 13 MiB and checks that a third of 8 MiB, by WebDAV `PUT` and by JMAP upload from other accounts, is refused while a
 small file is stored, that both store on retry once the held uploads finish, that a 25 MiB body alone still meets its
@@ -228,7 +234,7 @@ checks that a third of 16 MiB by `DATA` and by `BDAT` gets `452`, that IMAP `APP
 refused chunk is refused, that a `MULTIAPPEND` refused mid-way runs none of the rest of its line, and that a burst of 8
 ordinary messages up to 4.5 MiB and a small `APPEND` are all accepted while the budget is full. Once it is free, the
 refused message and `APPEND` are accepted on retry, two stalled pre-login literals take nothing, and a single 100 MiB
-message is accepted. Against `-nologo1` the refusals FAIL (measured), and the build requires that.
+message is accepted, also while a `BDAT` that declares 94 MiB and sends nothing is open. Against `-nologo1` the refusals FAIL (measured), and the build requires that.
 
 Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1`.
 
