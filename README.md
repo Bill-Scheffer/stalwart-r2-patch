@@ -1,10 +1,10 @@
 # stalwart-r2-patch
 
-[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **nine**
+[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **ten**
 changes: it can delete blobs from **Cloudflare R2**, **sharing never crosses tenants**, stored files
 and mail written into a mailbox are **scanned**, a ban that expired is **enforced again**, a narrow
 key **cannot take over an Admin**, an operator can run **admin verbs on a mailbox without reading
-its mail**, and calendar mail carries **no Stalwart logo**.
+its mail**, calendar mail carries **no Stalwart logo**, and a burst of large uploads is **refused, not an OOM**.
 
 ## The problem
 
@@ -193,7 +193,22 @@ with an attendee and an email alarm) and asserts that neither carries an image p
 both keep their HTML (and the invitation its `text/calendar`), and that the RSVP page carries no logo SVG.
 Against the last image before 0009 its five logo checks fail (measured), and the build requires them to.
 
-Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1`.
+## The tenth change: a server-wide cap on large uploads
+
+Upstream bounds uploads per account (4 requests at once, a pending-upload quota), never in sum. A request body is held
+in memory whole, and a 25 MiB WebDAV `PUT` or JMAP upload costs about 26 MiB while it is in flight (measured: N = 1 to
+40 parallel uploads, each from its own account, MAI-1000). At a 2 GiB limit about 70 of them at once OOM-kill the
+process, and every upload and session on it is lost (measured at a smaller limit: 16 parallel uploads killed a 512 MiB
+container, and all 16 failed). [`patches/0010-server-wide-cap-on-large-uploads.patch`](patches/0010-server-wide-cap-on-large-uploads.patch)
+counts a request body once it passes 1 MiB, and holds the count until the request is done with it. When
+`STALWART_MAX_LARGE_UPLOADS` is set, a body that would pass that count is refused retryably: WebDAV `429` with
+`Retry-After: 5`, JMAP `429`. Smaller bodies are never counted. Unset, there is no cap (upstream's behaviour).
+[`scripts/e2e-upload-cap.sh`](scripts/e2e-upload-cap.sh) sets the cap to 2, holds two uploads open past 1 MiB, and
+checks that a third WebDAV `PUT` and JMAP upload from other accounts are refused while a small file is stored. It then
+checks that both stored on retry once the held uploads finished, and that the slots came back after a body refused as
+too large. Against `-nologo1` the refusals FAIL (measured), and the build requires that.
+
+Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-uploadcap1`.
 
 ## Builds, tags and testing a change before it merges
 
