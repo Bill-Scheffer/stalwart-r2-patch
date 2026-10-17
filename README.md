@@ -1,10 +1,10 @@
 # stalwart-r2-patch
 
-[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **nine**
+[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **ten**
 changes: it can delete blobs from **Cloudflare R2**, **sharing never crosses tenants**, stored files
 and mail written into a mailbox are **scanned**, a ban that expired is **enforced again**, a narrow
 key **cannot take over an Admin**, an operator can run **admin verbs on a mailbox without reading
-its mail**, and calendar mail carries **no Stalwart logo**.
+its mail**, calendar mail carries **no Stalwart logo**, and a burst of large uploads or messages is **refused, not an OOM**.
 
 ## The problem
 
@@ -193,7 +193,50 @@ with an attendee and an email alarm) and asserts that neither carries an image p
 both keep their HTML (and the invitation its `text/calendar`), and that the RSVP page carries no logo SVG.
 Against the last image before 0009 its five logo checks fail (measured), and the build requires them to.
 
-Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1`.
+## The tenth change: a server-wide budget for large uploads and messages
+
+Upstream bounds uploads per account (4 requests at once, a pending-upload quota) and inbound SMTP per sender IP (5
+new connections a second), never in sum, and holds each body in memory whole. Measured on the `-nologo1` image at
+2 GiB, each from its own account (MAI-1000): a 25 MiB WebDAV `PUT` or JMAP upload costs about 26 MiB while it is in
+flight, an IMAP `APPEND` of a 25 MiB message about 80 MiB, and a 25 MiB message by SMTP about 160 MiB, before any
+authentication. About 70 uploads at once, or a dozen large messages from a few senders, OOM-kill the process, and every
+session on it is lost (measured at a smaller limit: 16 parallel uploads killed a 512 MiB container, and all 16 failed).
+[`patches/0010-server-wide-cap-on-large-bodies.patch`](patches/0010-server-wide-cap-on-large-bodies.patch) keeps
+two server-wide budgets, in bytes, each body holding its share until the request or message is done with it. Bytes,
+not bodies, because the size limits differ (an SMTP message may be 100 MiB, a JMAP upload 50 MB, a WebDAV file 25 MiB),
+so a count would bound nothing:
+
+- **`STALWART_MAX_LARGE_UPLOAD_MIB`**: HTTP request bodies past 1 MiB. A body that would take the budget past its
+  limit: WebDAV `429` with `Retry-After: 5`, JMAP `429`. The refused body is read to its end and none of it kept, so the
+  client reads the `429`: answering and closing on the unread rest reset the connection, and every refused upload in a
+  64-upload burst saw a network error instead (measured on the first build).
+- **`STALWART_MAX_LARGE_MESSAGE_MIB`**: messages past 5 MiB, by SMTP `DATA` or `BDAT` or by IMAP `APPEND`. Past the
+  budget, SMTP drops what it holds of the message at once, reads and drops the rest, and answers `452 4.3.1`, so the
+  sending server retries later; the refusal ends the transaction, so a `BDAT` pipelined after it is refused too. A
+  `BDAT` chunk is counted as its bytes arrive, not as declared, so one that names a size and sends nothing holds none
+  of the budget. IMAP answers `NO [UNAVAILABLE]`,
+  before a synchronizing literal is sent, or after a `LITERAL+` one is read and dropped (and the rest of that command
+  line with it, so none of a refused `MULTIAPPEND` runs as a command). Only an `APPEND` by a logged-in client counts,
+  so a client that has not logged in cannot hold any of the budget. The threshold is higher than an upload's so ordinary
+  mail is never counted: a 1 MiB message costs a few MiB.
+
+Unset, a budget is no bound (upstream's behaviour), and the server says so on stderr at startup, as it does for a
+value that is not a whole number of MiB; a budget below the largest body allowed refuses that body always. ⚠️ Not
+bounded: the inbound spam filter costs ~30–40 times a `text/plain` body (an attachment ~6), so huge plain-text mail
+on port 25 can still take more than the budget implies (MAI-1000's follow-up). A synchronizing IMAP literal reserves
+its declared size when it is announced (a logged-in client only).
+[`scripts/e2e-upload-cap.sh`](scripts/e2e-upload-cap.sh) sets 30 MiB and 110 MiB. It holds two 14 MiB uploads open at
+13 MiB and checks that a third of 8 MiB, by WebDAV `PUT` and by JMAP upload from other accounts, is refused while a
+small file is stored, that both store on retry once the held uploads finish, that a 25 MiB body alone still meets its
+size limit (`413`), and that the budget comes back after it. Then it holds two 52 MiB SMTP messages open at 50 MiB and
+checks that a third of 16 MiB by `DATA` and by `BDAT` gets `452`, that IMAP `APPEND` with either kind of literal gets
+`NO [UNAVAILABLE]`, that a session's next `MAIL` after a `452` is a new message, that a pipelined `BDAT` after a
+refused chunk is refused, that a `MULTIAPPEND` refused mid-way runs none of the rest of its line, and that a burst of 8
+ordinary messages up to 4.5 MiB and a small `APPEND` are all accepted while the budget is full. Once it is free, the
+refused message and `APPEND` are accepted on retry, two stalled pre-login literals take nothing, and a single 100 MiB
+message is accepted, also while a `BDAT` that declares 94 MiB and sends nothing is open. Against `-nologo1` the refusals FAIL (measured), and the build requires that.
+
+Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1`.
 
 ## Builds, tags and testing a change before it merges
 
