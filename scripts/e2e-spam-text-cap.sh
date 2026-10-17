@@ -5,19 +5,20 @@
 #
 # Every word and every space of a text part becomes a 224-byte token, held until the message is scored, so the filter
 # cost ~40 times the text: a 10 MiB text/plain message by SMTP took ~430 MiB, against ~30 MiB by IMAP APPEND, which
-# does not filter (measured on -bodycap1, MAI-1077). Patch 0011 analyses the first 512 KiB of each text or HTML part
-# and 1 MiB per message. Here:
+# does not filter (measured on -bodycap1, MAI-1077). Patch 0011 analyses the first 512 KiB of each part's text, plain
+# or extracted from HTML, and 1 MiB per message, and reads up to 4 MiB of HTML markup. Here:
 # - an 8 MiB text/plain message on port 25 costs under 150 MiB of anonymous memory while it is received, filtered and
 #   delivered (sampled from the container's own cgroup);
 # - a URL past the first 512 KiB of a part, and one at the start of a third part past the first 1 MiB of the message,
 #   are not analysed, while the same URL early in a large part, or in a second part, still is;
-# - a control set, ordinary mail and spam whose signal sits early in a large body, scores exactly as -bodycap1 scored
-#   it: the same verdict, score and tags (EXPECTED below, measured on -bodycap1 with this script).
+# - a control set, ordinary mail (a large plain-and-HTML newsletter among it) and spam whose signal sits early in a
+#   large body, scores exactly as -bodycap1 scored it: the same verdict, score and tags (measured with this script).
 # The scores come from Stalwart's spam rules, which a server downloads at startup (production takes upstream's latest
 # release): here a pinned release, checked by hash and served on an internal network, with a DNS stub that answers
 # NXDOMAIN to all but the sender's own names, so no score depends on the runner's network or resolver. Pyzor, a network
 # lookup, is off.
-# Against -bodycap1 the memory check and the two past-the-bound checks FAIL, and the control set passes.
+# Against -bodycap1 the memory check and the two past-the-bound checks FAIL, and the control set passes. Against a
+# build that cut HTML on its markup, the newsletter scored PARTS_DIFFER (+1.0) and the control set FAILED.
 set -euo pipefail
 IMG=${1:?usage: $0 <stalwart image>}
 NET=e2e-text-$$; C=e2e-text-stalwart-$$; K=e2e-text-client-$$; N=e2e-text-dns-$$; R=e2e-text-rules-$$
@@ -56,6 +57,7 @@ class T(socketserver.BaseRequestHandler):
         f = self.request.makefile("rb")
         while (h := f.read(2)) and len(h) == 2:
             r = answer(f.read(struct.unpack(">H", h)[0])); self.request.sendall(struct.pack(">H", len(r)) + r)
+# TCP too: the resolver retries over TCP when a UDP answer fails (tcpOnError).
 socketserver.ThreadingTCPServer.allow_reuse_address = True
 threading.Thread(target=socketserver.ThreadingTCPServer(("", 53), T).serve_forever, daemon=True).start()
 u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind(("", 53))
@@ -77,7 +79,7 @@ for d in "/sys/fs/cgroup/system.slice/docker-$ID.scope" "/sys/fs/cgroup/docker/$
 docker run -d --name "$K" --network "$NET" -e ADMIN="$ADMIN" -e RULES_AT="$(ip_of "$R"):8000" -v "$CG:/cg:ro" python:3.12-alpine sleep 900 >/dev/null
 ip_of "$K" > "$W/dns/client-ip"
 docker exec -i "$K" python3 - <<'PY'
-import base64,email.utils,json,os,socket,threading,time,urllib.request
+import base64,email.utils,json,os,random,socket,threading,time,urllib.request
 B="http://stalwart:8080"; fails=[]
 for _ in range(90):
     try: urllib.request.urlopen(B+"/healthz/ready",timeout=2); break
@@ -161,8 +163,8 @@ base=anon(); peak=[base]; done=threading.Event()
 def sample():
     while not done.is_set(): peak[0]=max(peak[0],anon()); time.sleep(0.02)
 t=threading.Thread(target=sample); t.start()
-line=b"abcdefghij "*7+b"\r\n"
-st=smtp(msg("eight mib of text","text/plain; charset=utf-8",line*(8*MiB//len(line))))
+ascii_line=b"abcdefghij "*7+b"\r\n"
+st=smtp(msg("eight mib of text","text/plain; charset=utf-8",ascii_line*(8*MiB//len(ascii_line))))
 delivered("eight mib of text"); time.sleep(1); done.set(); t.join()
 cost=(peak[0]-base)//MiB
 check(st=="250","an 8 MiB text/plain message on port 25 is accepted",st)
@@ -180,48 +182,67 @@ cases={
       "and one at the start of the second part still is"),
 }
 for subject,(ctype,body,_,_) in cases.items(): smtp(msg(subject,ctype,body))
-for subject,(_,_,want,line_) in cases.items():
-    got=tags(delivered(subject)); check(("SUSPICIOUS_URL" in got)==want,line_,sorted(got))
+for subject,(_,_,want,label) in cases.items():
+    got=tags(delivered(subject)); check(("SUSPICIOUS_URL" in got)==want,label,sorted(got))
 
-# 3. The control set: what -bodycap1 wrote, exactly.
+# 3. The control set: what -bodycap1 wrote, exactly (score and tags), measured with this script.
+def newsletter():
+    words=(b"garden spring roses planting soil compost seeds water sunlight weeds harvest tomato herbs basil mint "
+           b"travel flights hotel beach passport museum train coast island hiking trail map journey ferry harbour "
+           b"kitchen recipe flour butter oven bread pastry sugar lemon ginger soup noodle spice pepper garlic "
+           b"finance savings budget pension mortgage interest account rates invest shares bonds income taxes credit").split()
+    plain=html=b""
+    for i in range(40):
+        w=words[i*3%len(words):][:15] or words[:15]; r=random.Random(i)
+        text=b" ".join(b" ".join(r.choice(w) for _ in range(12))+b"." for _ in range(80))
+        url=b"https://shop.news%d.example/section" % i
+        plain+=text+b"\r\nMore: "+url+b"\r\n\r\n"
+        html+=(b"<table role=\"presentation\" width=\"100%\"><tr><td style=\"padding:8px 16px;color:#333333;font-family:Arial,"
+               b"Helvetica,sans-serif;font-size:15px;line-height:1.5\">"+text.replace(b". ",b".</td></tr>\r\n<tr><td style=\"padding:8px "
+               b"16px;color:#333333;font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:1.5\">")
+               +b"</td></tr><tr><td>More: <a href=\""+url+b"\">"+url+b"</a></td></tr></table>\r\n")
+    return plain,b"<html><body>"+html+b"</body></html>"
+HAM=('ham, score=3.20',
+     'ARC_NA (0.00), DKIM2_NA (0.00), DKIM_NA (0.00), FROM_EQ_ENV_FROM (0.00), FROM_HAS_DN (0.00), MID_RHS_MATCH_ENV_FROM (0.00), RCPT_COUNT_ONE (0.00), SPF_NA (0.00), TO_DN_NONE (0.00), TO_MATCH_ENVRCPT_ALL (0.00), RCVD_COUNT_ZERO (0.10), RCVD_NO_TLS_LAST (0.10), AUTH_NA (1.00), DMARC_NA (1.00), MID_RHS_MATCH_FROM (1.00)')
 CONTROLS={
-  "lunch on friday": ("text/plain; charset=utf-8",b"Hi,\r\n\r\nAre we still on for lunch on Friday? I can book a table for noon.\r\n\r\nSam\r\n"),
-  "minutes from tuesday": ("multipart/alternative; boundary=b",alternative(PROSE*3,html_of(PROSE*3))),
-  "the full report": ("text/plain; charset=utf-8",prose(2*MiB)),
-  "the full report as html": ("multipart/alternative; boundary=b",alternative(prose(700*KiB),html_of(prose(700*KiB)))),
-  "you won": ("text/plain; charset=utf-8",URL),
-  "you won big": ("text/plain; charset=utf-8",URL+prose(2*MiB)),
+  "lunch on friday": ("text/plain; charset=utf-8",b"Hi,\r\n\r\nAre we still on for lunch on Friday? I can book a table for noon.\r\n\r\nSam\r\n",
+    HAM),
+  "minutes from tuesday": ("multipart/alternative; boundary=b",alternative(PROSE*3,html_of(PROSE*3)),
+    ('ham, score=3.20',
+      'ARC_NA (0.00), DKIM2_NA (0.00), DKIM_NA (0.00), FROM_EQ_ENV_FROM (0.00), FROM_HAS_DN (0.00), HTML_SHORT_1 (0.00), MID_RHS_MATCH_ENV_FROM (0.00), RCPT_COUNT_ONE (0.00), SPF_NA (0.00), TO_DN_NONE (0.00), TO_MATCH_ENVRCPT_ALL (0.00), RCVD_COUNT_ZERO (0.10), RCVD_NO_TLS_LAST (0.10), AUTH_NA (1.00), DMARC_NA (1.00), MID_RHS_MATCH_FROM (1.00)')),
+  "the full report": ("text/plain; charset=utf-8",prose(2*MiB),
+    HAM),
+  "the full report as html": ("multipart/alternative; boundary=b",alternative(prose(700*KiB),html_of(prose(700*KiB))),
+    HAM),
+  "you won": ("text/plain; charset=utf-8",URL,
+    ('spam, score=8.20',
+      'ARC_NA (0.00), DKIM2_NA (0.00), DKIM_NA (0.00), FROM_EQ_ENV_FROM (0.00), FROM_HAS_DN (0.00), MID_RHS_MATCH_ENV_FROM (0.00), RCPT_COUNT_ONE (0.00), SPF_NA (0.00), TO_DN_NONE (0.00), TO_MATCH_ENVRCPT_ALL (0.00), RCVD_COUNT_ZERO (0.10), RCVD_NO_TLS_LAST (0.10), AUTH_NA (1.00), DMARC_NA (1.00), MID_RHS_MATCH_FROM (1.00), SUSPICIOUS_URL (5.00)')),
+  "you won big": ("text/plain; charset=utf-8",URL+prose(2*MiB),
+    ('spam, score=8.20',
+      'ARC_NA (0.00), DKIM2_NA (0.00), DKIM_NA (0.00), FROM_EQ_ENV_FROM (0.00), FROM_HAS_DN (0.00), MID_RHS_MATCH_ENV_FROM (0.00), RCPT_COUNT_ONE (0.00), SPF_NA (0.00), TO_DN_NONE (0.00), TO_MATCH_ENVRCPT_ALL (0.00), RCVD_COUNT_ZERO (0.10), RCVD_NO_TLS_LAST (0.10), AUTH_NA (1.00), DMARC_NA (1.00), MID_RHS_MATCH_FROM (1.00), SUSPICIOUS_URL (5.00)')),
   "your invoice": ("text/plain; charset=utf-8",b"Your invoice: http://cdn.example.org/wp-content/uploads/invoice.php or http://inv0ice.onion/pay\r\n"
-      +prose(2*MiB)),
+      +prose(2*MiB),
+    ('ham, score=3.30',
+      'ARC_NA (0.00), DKIM2_NA (0.00), DKIM_NA (0.00), FROM_EQ_ENV_FROM (0.00), FROM_HAS_DN (0.00), HAS_ONION_URI (0.00), MID_RHS_MATCH_ENV_FROM (0.00), RCPT_COUNT_ONE (0.00), SPF_NA (0.00), TO_DN_NONE (0.00), TO_MATCH_ENVRCPT_ALL (0.00), WP_COMPROMISED (0.00), HAS_ANON_DOMAIN (0.10), RCVD_COUNT_ZERO (0.10), RCVD_NO_TLS_LAST (0.10), AUTH_NA (1.00), DMARC_NA (1.00), MID_RHS_MATCH_FROM (1.00)')),
   # Unclosed HTML that was not cut still scores as unbalanced: only a part the filter cut has its closing tags restored.
-  "a note in unclosed html": ("text/html; charset=utf-8",b"<html><body><p>See you at noon on Friday, the usual place.</p>\r\n"),
+  "a note in unclosed html": ("text/html; charset=utf-8",b"<html><body><p>See you at noon on Friday, the usual place.</p>\r\n",
+    ('ham, score=3.90',
+      'ARC_NA (0.00), DKIM2_NA (0.00), DKIM_NA (0.00), FROM_EQ_ENV_FROM (0.00), FROM_HAS_DN (0.00), HTML_SHORT_1 (0.00), MID_RHS_MATCH_ENV_FROM (0.00), RCPT_COUNT_ONE (0.00), SPF_NA (0.00), TO_DN_NONE (0.00), TO_MATCH_ENVRCPT_ALL (0.00), RCVD_COUNT_ZERO (0.10), RCVD_NO_TLS_LAST (0.10), MIME_HTML_ONLY (0.20), HTML_UNBALANCED_TAG (0.50), AUTH_NA (1.00), DMARC_NA (1.00), MID_RHS_MATCH_FROM (1.00)')),
   "verify your account": ("text/html; charset=utf-8",b"<html><body><p>Your account is suspended. <a href=\"http://192.0.2.10/login\">https://www.paypal.com/signin</a></p>\r\n"
-      +html_of(prose(2*MiB))[len(b"<html><body>"):]),
+      +html_of(prose(2*MiB))[len(b"<html><body>"):],
+    ('spam, score=13.90',
+      'ARC_NA (0.00), DKIM2_NA (0.00), DKIM_NA (0.00), FROM_EQ_ENV_FROM (0.00), FROM_HAS_DN (0.00), MID_RHS_MATCH_ENV_FROM (0.00), RCPT_COUNT_ONE (0.00), SPF_NA (0.00), TO_DN_NONE (0.00), TO_MATCH_ENVRCPT_ALL (0.00), RCVD_COUNT_ZERO (0.10), RCVD_NO_TLS_LAST (0.10), MIME_HTML_ONLY (0.20), HTTP_TO_HTTPS (0.50), AUTH_NA (1.00), DMARC_NA (1.00), HTTP_TO_IP (1.00), MID_RHS_MATCH_FROM (1.00), PHISHING (4.00), SUSPICIOUS_URL (5.00)')),
+  # A large newsletter, plain and HTML: the topic and the linked sites change through it, and the HTML is markup-heavy.
+  # Cut on the HTML's markup instead of its text, the two alternatives would differ (PARTS_DIFFER, URI_COUNT_ODD).
+  "the weekly newsletter": ("multipart/alternative; boundary=b",alternative(*newsletter()),
+    HAM),
 }
-EXPECTED={
-  'lunch on friday': ('ham, score=3.20',
-    'ARC_NA (0.00), DKIM2_NA (0.00), DKIM_NA (0.00), FROM_EQ_ENV_FROM (0.00), FROM_HAS_DN (0.00), MID_RHS_MATCH_ENV_FROM (0.00), RCPT_COUNT_ONE (0.00), SPF_NA (0.00), TO_DN_NONE (0.00), TO_MATCH_ENVRCPT_ALL (0.00), RCVD_COUNT_ZERO (0.10), RCVD_NO_TLS_LAST (0.10), AUTH_NA (1.00), DMARC_NA (1.00), MID_RHS_MATCH_FROM (1.00)'),
-  'minutes from tuesday': ('ham, score=3.20',
-    'ARC_NA (0.00), DKIM2_NA (0.00), DKIM_NA (0.00), FROM_EQ_ENV_FROM (0.00), FROM_HAS_DN (0.00), HTML_SHORT_1 (0.00), MID_RHS_MATCH_ENV_FROM (0.00), RCPT_COUNT_ONE (0.00), SPF_NA (0.00), TO_DN_NONE (0.00), TO_MATCH_ENVRCPT_ALL (0.00), RCVD_COUNT_ZERO (0.10), RCVD_NO_TLS_LAST (0.10), AUTH_NA (1.00), DMARC_NA (1.00), MID_RHS_MATCH_FROM (1.00)'),
-  'the full report': ('ham, score=3.20',
-    'ARC_NA (0.00), DKIM2_NA (0.00), DKIM_NA (0.00), FROM_EQ_ENV_FROM (0.00), FROM_HAS_DN (0.00), MID_RHS_MATCH_ENV_FROM (0.00), RCPT_COUNT_ONE (0.00), SPF_NA (0.00), TO_DN_NONE (0.00), TO_MATCH_ENVRCPT_ALL (0.00), RCVD_COUNT_ZERO (0.10), RCVD_NO_TLS_LAST (0.10), AUTH_NA (1.00), DMARC_NA (1.00), MID_RHS_MATCH_FROM (1.00)'),
-  'the full report as html': ('ham, score=3.20',
-    'ARC_NA (0.00), DKIM2_NA (0.00), DKIM_NA (0.00), FROM_EQ_ENV_FROM (0.00), FROM_HAS_DN (0.00), MID_RHS_MATCH_ENV_FROM (0.00), RCPT_COUNT_ONE (0.00), SPF_NA (0.00), TO_DN_NONE (0.00), TO_MATCH_ENVRCPT_ALL (0.00), RCVD_COUNT_ZERO (0.10), RCVD_NO_TLS_LAST (0.10), AUTH_NA (1.00), DMARC_NA (1.00), MID_RHS_MATCH_FROM (1.00)'),
-  'you won': ('spam, score=8.20',
-    'ARC_NA (0.00), DKIM2_NA (0.00), DKIM_NA (0.00), FROM_EQ_ENV_FROM (0.00), FROM_HAS_DN (0.00), MID_RHS_MATCH_ENV_FROM (0.00), RCPT_COUNT_ONE (0.00), SPF_NA (0.00), TO_DN_NONE (0.00), TO_MATCH_ENVRCPT_ALL (0.00), RCVD_COUNT_ZERO (0.10), RCVD_NO_TLS_LAST (0.10), AUTH_NA (1.00), DMARC_NA (1.00), MID_RHS_MATCH_FROM (1.00), SUSPICIOUS_URL (5.00)'),
-  'you won big': ('spam, score=8.20',
-    'ARC_NA (0.00), DKIM2_NA (0.00), DKIM_NA (0.00), FROM_EQ_ENV_FROM (0.00), FROM_HAS_DN (0.00), MID_RHS_MATCH_ENV_FROM (0.00), RCPT_COUNT_ONE (0.00), SPF_NA (0.00), TO_DN_NONE (0.00), TO_MATCH_ENVRCPT_ALL (0.00), RCVD_COUNT_ZERO (0.10), RCVD_NO_TLS_LAST (0.10), AUTH_NA (1.00), DMARC_NA (1.00), MID_RHS_MATCH_FROM (1.00), SUSPICIOUS_URL (5.00)'),
-  'your invoice': ('ham, score=3.30',
-    'ARC_NA (0.00), DKIM2_NA (0.00), DKIM_NA (0.00), FROM_EQ_ENV_FROM (0.00), FROM_HAS_DN (0.00), HAS_ONION_URI (0.00), MID_RHS_MATCH_ENV_FROM (0.00), RCPT_COUNT_ONE (0.00), SPF_NA (0.00), TO_DN_NONE (0.00), TO_MATCH_ENVRCPT_ALL (0.00), WP_COMPROMISED (0.00), HAS_ANON_DOMAIN (0.10), RCVD_COUNT_ZERO (0.10), RCVD_NO_TLS_LAST (0.10), AUTH_NA (1.00), DMARC_NA (1.00), MID_RHS_MATCH_FROM (1.00)'),
-  'a note in unclosed html': ('ham, score=3.90',
-    'ARC_NA (0.00), DKIM2_NA (0.00), DKIM_NA (0.00), FROM_EQ_ENV_FROM (0.00), FROM_HAS_DN (0.00), HTML_SHORT_1 (0.00), MID_RHS_MATCH_ENV_FROM (0.00), RCPT_COUNT_ONE (0.00), SPF_NA (0.00), TO_DN_NONE (0.00), TO_MATCH_ENVRCPT_ALL (0.00), RCVD_COUNT_ZERO (0.10), RCVD_NO_TLS_LAST (0.10), MIME_HTML_ONLY (0.20), HTML_UNBALANCED_TAG (0.50), AUTH_NA (1.00), DMARC_NA (1.00), MID_RHS_MATCH_FROM (1.00)'),
-  'verify your account': ('spam, score=13.90',
-    'ARC_NA (0.00), DKIM2_NA (0.00), DKIM_NA (0.00), FROM_EQ_ENV_FROM (0.00), FROM_HAS_DN (0.00), MID_RHS_MATCH_ENV_FROM (0.00), RCPT_COUNT_ONE (0.00), SPF_NA (0.00), TO_DN_NONE (0.00), TO_MATCH_ENVRCPT_ALL (0.00), RCVD_COUNT_ZERO (0.10), RCVD_NO_TLS_LAST (0.10), MIME_HTML_ONLY (0.20), HTTP_TO_HTTPS (0.50), AUTH_NA (1.00), DMARC_NA (1.00), HTTP_TO_IP (1.00), MID_RHS_MATCH_FROM (1.00), PHISHING (4.00), SUSPICIOUS_URL (5.00)'),
-}
-for subject,(ctype,body) in CONTROLS.items(): smtp(msg(subject,ctype,body))
-for subject in CONTROLS:
-    e=delivered(subject); got=(e.get("header:X-Spam-Score:asText"),e.get("header:X-Spam-Result:asText"))
-    check(got==EXPECTED.get(subject),f"control {subject!r} scores as it did before the patch",json.dumps(got))
+results=[]
+for subject,(ctype,body,_) in CONTROLS.items(): smtp(msg(subject,ctype,body))
+for subject,(_,_,want) in CONTROLS.items():
+    e=delivered(subject); got=(e.get("header:X-Spam-Score:asText"),e.get("header:X-Spam-Result:asText")); results.append(got==want)
+    check(got==want,f"control {subject!r} scores as it did before the patch",json.dumps(got))
+check(all(results),"the control set scores as it did before the patch",f"{results.count(True)} of {len(results)}")
 print(f"{len(fails)} failed" if fails else "all passed")
 raise SystemExit(1 if fails else 0)
 PY

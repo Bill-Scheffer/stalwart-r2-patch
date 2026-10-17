@@ -246,13 +246,15 @@ IMAP `APPEND`, which does not filter; a message under the tenth change's 5 MiB t
 few plain-text messages on port 25, before any authentication, could take the pod past what the budgets imply
 (MAI-1077).
 [`patches/0011-spam-filter-analyses-a-bounded-start-of-each-text.patch`](patches/0011-spam-filter-analyses-a-bounded-start-of-each-text.patch)
-analyses the first 512 KiB of each text or HTML part and 1 MiB per message, cut on a character boundary, as other
-filters do (SpamAssassin skips bodies past 500 KB). Everything the filter derives from the text reads the same slice:
-the tokens, URLs, emails and IPs, the rules, and the classifier, in training too. So a message costs at most ~40 MiB to
-filter, whatever it holds. The cost is per part as well as per message, so a large plain part never leaves the HTML
-alternative after it empty (which would score as parts that differ), and a cut HTML part has the `<head>` and
-`<body>` it left open closed, so the cut itself never scores as unbalanced HTML. Mail whose text is under 512 KiB, which is nearly
-all of it, is analysed exactly as before. Pyzor hashes the message as before.
+analyses the first 512 KiB of each part's text, and 1 MiB per message, as other filters do (SpamAssassin skips bodies
+past 500 KB). Everything the filter derives from the text reads the same slice: the tokens, URLs, emails and IPs, the
+rules and the classifier, in training too. An HTML part is cut on the text extracted from it, not on its markup, so
+the plain and HTML alternatives of a message are cut at the same point: cut on markup, a large newsletter's HTML lost
+text its plain twin kept, and scored `PARTS_DIFFER` (+1.0) from the cut alone (measured on the first build). Markup
+costs ~5 times itself to parse (~1 for an inline image), so up to 4 MiB of it is read per message; an HTML part cut
+there has the `<head>` and `<body>` it left open closed, so the cut never scores as unbalanced HTML. So a message
+costs at most ~65 MiB to analyse, whatever it holds. Mail with under 512 KiB of text per part, which is nearly all of
+it, is analysed exactly as before. Pyzor hashes the message as before.
 
 ⚠️ **The trade: padding evades it.** Nothing past the cut is seen, a URL included: URL extraction reads the same
 tokens, not the raw body, and the e2e checks that a URL past the cut is missed. So a spammer who puts 512 KiB of filler
@@ -263,7 +265,8 @@ reason. Revisit if padded spam turns up in practice, or if a whole-body signal i
 costs under 150 MiB while it is received, filtered and delivered (`-bodycap1`: ~460 MiB), that a URL past the first
 512 KiB of a part, or at the start of a third part past the first 1 MiB, is not analysed while one early in a 2 MiB
 part or in a second part is, and that a control set scores exactly as on `-bodycap1`: ordinary mail small and large,
-plain and HTML, and spam whose signal sits early in a 2 MiB body (a suspicious URL, a phishing link, URL rules). The
+plain and HTML, a large newsletter whose topics and links change through it, unclosed HTML, and spam whose signal sits
+early in a 2 MiB body (a suspicious URL, a phishing link, URL rules). The
 scores come from upstream's pinned rules release (v3.0.2, by hash), served on an internal network with a DNS stub, so
 no score depends on the runner's network. Against `-bodycap1` the memory check and both bound checks FAIL and the
 control set passes (measured), and the build requires both.
