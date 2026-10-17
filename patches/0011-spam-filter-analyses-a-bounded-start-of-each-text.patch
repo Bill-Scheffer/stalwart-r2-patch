@@ -1,0 +1,159 @@
+diff --git a/crates/spam-filter/src/analysis/init.rs b/crates/spam-filter/src/analysis/init.rs
+index 0bdfe8d..76120c7 100644
+--- a/crates/spam-filter/src/analysis/init.rs
++++ b/crates/spam-filter/src/analysis/init.rs
+@@ -5,6 +5,7 @@
+  */
+ 
+ use common::Server;
++use std::borrow::Cow;
+ 
+ use mail_auth::DmarcResult;
+ use mail_parser::{HeaderName, PartType, parsers::fields::thread::thread_name};
+@@ -13,7 +14,7 @@ use nlp::tokenizers::types::{TokenType, TypesTokenizer};
+ use crate::{
+     Email, Hostname, IpParts, Recipient, SpamFilterContext, SpamFilterInput, SpamFilterOutput,
+     SpamFilterResult, TextPart,
+-    modules::html::{HEAD, HtmlToken, html_to_tokens},
++    modules::html::{BODY, HEAD, HtmlToken, html_to_tokens},
+ };
+ 
+ use super::url::UrlParts;
+@@ -24,6 +25,90 @@ pub trait SpamFilterInit {
+ 
+ const POSTMASTER_ADDRESSES: [&str; 3] = ["postmaster", "mailer-daemon", "root"];
+ 
++// Every word and every space of a text part becomes a 224-byte token, held until the message is scored, so the
++// filter costs about 40 times the text it analyses: 400 MiB for a 10 MiB text/plain message, which no size limit
++// sees. Like other filters (SpamAssassin skips bodies past 500 KB), analyse only the start of each part's text, plain
++// or extracted from HTML, so both alternatives of a message are cut at about the same point, and only so much per
++// message. HTML markup costs 5 to 24 times itself to parse (measured), so it is read up to its own limit. A message
++// then costs at most ~90 MiB to analyse, whatever it holds.
++const MAX_ANALYSED_PART: usize = 512 * 1024;
++const MAX_ANALYSED_MESSAGE: usize = 1024 * 1024;
++const MAX_READ_HTML: usize = 2 * 1024 * 1024;
++
++/// The start of `text`, at most `max` bytes, cut on a character boundary and taken from what the message has left.
++fn analysed<'x>(text: &'x str, max: usize, left: &mut usize) -> &'x str {
++    let end = text.floor_char_boundary(max.min(*left));
++    *left -= end;
++    &text[..end]
++}
++
++/// The HTML that is read, up to what the message has left of `MAX_READ_HTML`, and whether any was left out. A data:
++/// URI's payload in a `src` or `href` is not markup and is left out (its header, which the analysis reads, is kept): a
++/// large inline image would otherwise use up the budget before any of the text. Anywhere else, in text or another
++/// attribute, it is read as written, so it cannot hide words.
++fn readable_html<'x>(html: &'x str, left: &mut usize) -> (Cow<'x, str>, bool) {
++    if !html.contains("data:") {
++        let read = analysed(html, usize::MAX, left);
++        return (read.into(), read.len() < html.len());
++    }
++    let mut read = String::new();
++    let mut rest = html;
++    while let Some(at) = rest.find("data:").filter(|&at| read.len() + at < *left) {
++        let before = html.as_bytes()[..html.len() - rest.len() + at].trim_ascii_end();
++        let before = before
++            .strip_suffix(b"\"")
++            .or_else(|| before.strip_suffix(b"'"))
++            .unwrap_or(before)
++            .trim_ascii_end();
++        let in_src_or_href = before.strip_suffix(b"=").is_some_and(|name| {
++            let name = name.trim_ascii_end();
++            [b"src".as_slice(), b"href"].iter().any(|attr| {
++                name.len() > attr.len()
++                    && name[name.len() - attr.len()..].eq_ignore_ascii_case(attr)
++                    && name[name.len() - attr.len() - 1].is_ascii_whitespace()
++            })
++        });
++        let head = &rest.as_bytes()[at..rest.len().min(at + 100)];
++        let header = head
++            .windows(8)
++            .position(|w| w == b";base64,")
++            .filter(|&i| in_src_or_href && !head[..i].iter().any(|b| b"\"' <>".contains(b)));
++        let keep = at + header.map_or(5, |i| i + 8);
++        read.push_str(&rest[..keep]);
++        rest = &rest[keep..];
++        if header.is_some() {
++            rest = rest
++                .trim_start_matches(|c: char| c.is_ascii_alphanumeric() || "+/=\r\n".contains(c));
++        }
++    }
++    let pushed = rest.floor_char_boundary(left.saturating_sub(read.len()));
++    read.push_str(&rest[..pushed]);
++    let end = read.floor_char_boundary(*left);
++    let cut = pushed < rest.len() || end < read.len();
++    read.truncate(end);
++    *left -= end;
++    (read.into(), cut)
++}
++
++/// A cut HTML part has lost its closing tags, which would score as unbalanced HTML: close the head and body it left
++/// open, counted as the HTML analysis counts them.
++fn close_cut_html(tokens: &mut Vec<HtmlToken>) {
++    for tag in [BODY, HEAD] {
++        let open = tokens.iter().fold(0i32, |open, token| match token {
++            HtmlToken::StartTag {
++                name,
++                is_self_closing: false,
++                ..
++            } if *name == tag => open + 1,
++            HtmlToken::EndTag { name } if *name == tag => open - 1,
++            _ => open,
++        });
++        for _ in 0..open {
++            tokens.push(HtmlToken::EndTag { name: tag });
++        }
++    }
++}
++
+ impl SpamFilterInit for Server {
+     fn spam_filter_init<'x>(&self, mut input: SpamFilterInput<'x>) -> SpamFilterContext<'x> {
+         let mut subject = "";
+@@ -141,14 +226,20 @@ impl SpamFilterInit for Server {
+         let mut text_parts_nested = Vec::new();
+         let mut message_stack = Vec::new();
+         let mut message_iter = input.message.parts.iter();
++        let mut analysed_left = MAX_ANALYSED_MESSAGE;
++        let mut html_left = MAX_READ_HTML;
+ 
+         loop {
+             while let Some(part) = message_iter.next() {
+                 let is_main_message = message_stack.is_empty();
++                let analysed_text = match &part.body {
++                    PartType::Text(text) => analysed(text, MAX_ANALYSED_PART, &mut analysed_left),
++                    _ => "",
++                };
+                 let text_part = match &part.body {
+-                    PartType::Text(text) => TextPart::Plain {
+-                        text_body: text.as_ref(),
+-                        tokens: TypesTokenizer::new(text.as_ref())
++                    PartType::Text(_) => TextPart::Plain {
++                        text_body: analysed_text,
++                        tokens: TypesTokenizer::new(analysed_text)
+                             .tokenize_numbers(false)
+                             .tokenize_urls(true)
+                             .tokenize_urls_without_scheme(true)
+@@ -172,7 +263,11 @@ impl SpamFilterInit for Server {
+                             .collect::<Vec<_>>(),
+                     },
+                     PartType::Html(html) => {
+-                        let html_tokens = html_to_tokens(html);
++                        let (markup, cut) = readable_html(html, &mut html_left);
++                        let mut html_tokens = html_to_tokens(&markup);
++                        if cut {
++                            close_cut_html(&mut html_tokens);
++                        }
+                         let text_body_len = html_tokens
+                             .iter()
+                             .filter_map(|t| match t {
+@@ -202,6 +297,9 @@ impl SpamFilterInit for Server {
+                                 _ => {}
+                             }
+                         }
++                        text_body.truncate(
++                            analysed(&text_body, MAX_ANALYSED_PART, &mut analysed_left).len(),
++                        );
+ 
+                         TextPart::Html {
+                             tokens: TypesTokenizer::new(&text_body)
