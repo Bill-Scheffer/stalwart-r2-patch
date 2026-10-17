@@ -241,35 +241,40 @@ message is accepted, also while a `BDAT` that declares 94 MiB and sends nothing 
 
 The inbound spam filter turns every word and every space of a text part into a 224-byte token and holds them all until
 the message is scored, so it costs about 40 times the text it reads (measured with Stalwart's own tokenizer: 1.86
-million tokens, +397 MiB, for 10 MiB of text). By SMTP a 10 MiB `text/plain` message cost ~430 MiB, against ~30 MiB by
-IMAP `APPEND`, which does not filter; a message under the tenth change's 5 MiB threshold is not counted at all, so a
-few plain-text messages on port 25, before any authentication, could take the pod past what the budgets imply
-(MAI-1077).
+million tokens, +397 MiB, for 10 MiB of text). By SMTP a 10 MiB `text/plain` message cost 280–466 MiB across runs on
+`-bodycap1`, against 30–52 MiB by IMAP `APPEND`, which does not filter; a message under the tenth change's 5 MiB
+threshold is not counted at all, so a few plain-text messages on port 25, before any authentication, could take the
+pod past what the budgets imply (MAI-1077).
 [`patches/0011-spam-filter-analyses-a-bounded-start-of-each-text.patch`](patches/0011-spam-filter-analyses-a-bounded-start-of-each-text.patch)
-analyses the first 512 KiB of each part's text, and 1 MiB per message, as other filters do (SpamAssassin skips bodies
-past 500 KB). Everything the filter derives from the text reads the same slice: the tokens, URLs, emails and IPs, the
-rules and the classifier, in training too. An HTML part is cut on the text extracted from it, not on its markup, so
-the plain and HTML alternatives of a message are cut at the same point: cut on markup, a large newsletter's HTML lost
-text its plain twin kept, and scored `PARTS_DIFFER` (+1.0) from the cut alone (measured on the first build). Markup
-costs ~5 times itself to parse (~1 for an inline image), so up to 4 MiB of it is read per message; an HTML part cut
-there has the `<head>` and `<body>` it left open closed, so the cut never scores as unbalanced HTML. So a message
-costs at most ~65 MiB to analyse, whatever it holds. Mail with under 512 KiB of text per part, which is nearly all of
-it, is analysed exactly as before. Pyzor hashes the message as before.
+analyses the first 512 KiB of each part's text, and 1 MiB of text per message, as other filters do (SpamAssassin skips
+bodies past 500 KB). Everything derived from the text reads that slice: its tokens, the URLs, emails and IPs written
+in it, the rules and the classifier, in training too. An HTML part is cut on the text extracted from it, not on its
+markup, so the plain and HTML alternatives of a message are cut at about the same point (each at 512 KiB of its own
+text): cut on markup, a large newsletter's HTML lost text its plain twin kept, and scored `PARTS_DIFFER` (+1.0) from the
+cut alone (measured on the first build). HTML markup is read up to 2 MiB per message, and what the filter takes from
+tags rather than text, the links and images, is read from all of that. Markup costs 5 to 24 times itself to parse
+(measured: a newsletter's table cells 5, the smallest tags with bare attributes 24); an HTML part cut there has the
+`<head>` and `<body>` it left open closed, so the cut never scores as unbalanced HTML. So one message costs at most
+~90 MiB to analyse, whatever it holds. That is per message: messages filtered at once are bounded by the SMTP limits,
+not by the tenth change's budgets. (Pyzor, when enabled, still hashes the whole message, at about 1 times its HTML.)
+A message is analysed exactly as before when each part has under 512 KiB of text, the whole message under 1 MiB of
+text, and its HTML under 2 MiB of markup: nearly all mail.
 
-⚠️ **The trade: padding evades it.** Nothing past the cut is seen, a URL included: URL extraction reads the same
-tokens, not the raw body, and the e2e checks that a URL past the cut is missed. So a spammer who puts 512 KiB of filler
-before the payload hides it. Accepted because such mail is rare and conspicuous, because its envelope, headers,
-sender and first 512 KiB still score, and because SpamAssassin and other filters make the same cut for the same
-reason. Revisit if padded spam turns up in practice, or if a whole-body signal is needed.
+⚠️ **The trade: padding evades it.** Text past the cut is not seen, and that includes a URL written in it: URL
+extraction reads the same tokens, not the raw body, and the e2e checks that a URL past the cut is missed, in a text
+part and in an HTML part's text. (An HTML link's `href` is still read, up to 2 MiB of markup.) So a spammer who puts
+512 KiB of filler before the payload hides it. Accepted because such mail is rare and conspicuous, because its
+envelope, headers, sender and first 512 KiB still score, and because SpamAssassin and other filters make the same cut
+for the same reason. Revisit if padded spam turns up in practice, or if a whole-body signal is needed.
 [`scripts/e2e-spam-text-cap.sh`](scripts/e2e-spam-text-cap.sh) checks that an 8 MiB `text/plain` message on port 25
-costs under 150 MiB while it is received, filtered and delivered (`-bodycap1`: ~460 MiB), that a URL past the first
-512 KiB of a part, or at the start of a third part past the first 1 MiB, is not analysed while one early in a 2 MiB
-part or in a second part is, and that a control set scores exactly as on `-bodycap1`: ordinary mail small and large,
-plain and HTML, a large newsletter whose topics and links change through it, unclosed HTML, and spam whose signal sits
-early in a 2 MiB body (a suspicious URL, a phishing link, URL rules). The
-scores come from upstream's pinned rules release (v3.0.2, by hash), served on an internal network with a DNS stub, so
-no score depends on the runner's network. Against `-bodycap1` the memory check and both bound checks FAIL and the
-control set passes (measured), and the build requires both.
+costs under 150 MiB while it is received, filtered and delivered (`-bodycap1`: ~460 MiB); that a URL past the first
+512 KiB of a text part, of an HTML part's text, or at the start of a third part past the first 1 MiB, is not analysed,
+while one early in each is; and that a control set scores exactly as on `-bodycap1`: ordinary mail small and large,
+plain and HTML, a newsletter whose plain and HTML alternatives are both cut while its topics and links change, HTML past
+2 MiB of markup, unclosed HTML, and spam whose signal sits early in a 2 MiB body (a suspicious URL, a phishing link, URL
+rules). The scores come from upstream's pinned rules release (v3.0.2, by hash), served on an internal network with a
+DNS stub, so no score depends on the runner's network. Against `-bodycap1` the memory check and the three bound checks
+FAIL and the control set passes (measured), and the build requires both.
 
 Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1-textcap1`.
 

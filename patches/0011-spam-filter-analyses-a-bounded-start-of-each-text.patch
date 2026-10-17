@@ -1,5 +1,5 @@
 diff --git a/crates/spam-filter/src/analysis/init.rs b/crates/spam-filter/src/analysis/init.rs
-index 0bdfe8d..e0f4ecf 100644
+index 0bdfe8d..1888d4b 100644
 --- a/crates/spam-filter/src/analysis/init.rs
 +++ b/crates/spam-filter/src/analysis/init.rs
 @@ -13,7 +13,7 @@ use nlp::tokenizers::types::{TokenType, TypesTokenizer};
@@ -18,12 +18,12 @@ index 0bdfe8d..e0f4ecf 100644
 +// Every word and every space of a text part becomes a 224-byte token, held until the message is scored, so the
 +// filter costs about 40 times the text it analyses: 400 MiB for a 10 MiB text/plain message, which no size limit
 +// sees. Like other filters (SpamAssassin skips bodies past 500 KB), analyse only the start of each part's text, plain
-+// or extracted from HTML, so both alternatives of a message are cut at the same point, and only so much per message.
-+// HTML markup costs ~5 times itself to parse, so it is read up to its own, larger limit. A message then costs at most
-+// ~65 MiB to analyse, whatever it holds.
++// or extracted from HTML, so both alternatives of a message are cut at about the same point, and only so much per
++// message. HTML markup costs 5 to 24 times itself to parse (measured), so it is read up to its own limit. A message
++// then costs at most ~90 MiB to analyse, whatever it holds.
 +const MAX_ANALYSED_PART: usize = 512 * 1024;
 +const MAX_ANALYSED_MESSAGE: usize = 1024 * 1024;
-+const MAX_READ_HTML: usize = 4 * 1024 * 1024;
++const MAX_READ_HTML: usize = 2 * 1024 * 1024;
 +
 +/// The start of `text`, at most `max` bytes, cut on a character boundary and taken from what the message has left.
 +fn analysed<'x>(text: &'x str, max: usize, left: &mut usize) -> &'x str {

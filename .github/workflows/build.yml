@@ -35,8 +35,8 @@
 #    [UNAVAILABLE]). Upstream bounds each account, or each sender IP, only, so a burst across them could OOM-kill the
 #    process (measured, MAI-1000).
 # 11. patches/0011-spam-filter-analyses-a-bounded-start-of-each-text.patch: the inbound spam filter analyses the first
-#    512 KiB of each part's text, plain or extracted from HTML, 1 MiB per message, and reads up to 4 MiB of HTML markup.
-#    Upstream tokenizes all of it, at ~40 times the text in memory, so a 10 MiB text/plain message cost ~430 MiB by
+#    512 KiB of each part's text, plain or extracted from HTML, 1 MiB per message, and reads up to 2 MiB of HTML markup.
+#    Upstream tokenizes all of it, at ~40 times the text in memory, so a 10 MiB text/plain message cost 280-466 MiB by
 #    SMTP, past what 0010's budgets count (measured, MAI-1077).
 # Everything else is upstream: the tag's source, its Dockerfile, its features.
 # The release tag is pushed only from main; a dispatch from another branch pushes branch-<short sha>
@@ -425,12 +425,13 @@ jobs:
 
       # The control set's verdict is required too: it scores the same on the image before 0011 (each control is listed
       # in the log).
-      - name: The same check FAILS on the last image before 0011, on its memory and its bound, and its control set PASSES there
+      - name: The same check FAILS on the last image before 0011, on its memory and its bounds, and its control set PASSES there
         run: |
           bash patch/scripts/previous-must-fail.sh "${MAI1077_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-spam-text-cap.sh \
             'FAIL and receiving, filtering and delivering it costs under 150 MiB, not ~40 times its text' \
             'FAIL a URL past the first 512 KiB of a text part is not analysed' \
             'FAIL a URL at the start of a third text part, past the first 1 MiB of the message, is not analysed' \
+            "FAIL a URL past the first 512 KiB of an HTML part's text is not analysed" \
             'PASS the control set scores as it did before the patch'
 
       # ⛔ The release tag is pushed only from main (a push, or a dispatch on main). A dispatch from any

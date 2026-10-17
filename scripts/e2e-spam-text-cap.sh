@@ -4,20 +4,20 @@
 # usage: e2e-spam-text-cap.sh <stalwart image>
 #
 # Every word and every space of a text part becomes a 224-byte token, held until the message is scored, so the filter
-# cost ~40 times the text: a 10 MiB text/plain message by SMTP took ~430 MiB, against ~30 MiB by IMAP APPEND, which
+# cost ~40 times the text: a 10 MiB text/plain message by SMTP took 280-466 MiB, against 30-52 MiB by IMAP APPEND, which
 # does not filter (measured on -bodycap1, MAI-1077). Patch 0011 analyses the first 512 KiB of each part's text, plain
-# or extracted from HTML, and 1 MiB per message, and reads up to 4 MiB of HTML markup. Here:
+# or extracted from HTML, and 1 MiB per message, and reads up to 2 MiB of HTML markup. Here:
 # - an 8 MiB text/plain message on port 25 costs under 150 MiB of anonymous memory while it is received, filtered and
 #   delivered (sampled from the container's own cgroup);
-# - a URL past the first 512 KiB of a part, and one at the start of a third part past the first 1 MiB of the message,
-#   are not analysed, while the same URL early in a large part, or in a second part, still is;
+# - a URL past the first 512 KiB of a text part or of an HTML part's text, and one at the start of a third part past
+#   the first 1 MiB of the message, are not analysed, while the same URL early in each still is;
 # - a control set, ordinary mail (a large plain-and-HTML newsletter among it) and spam whose signal sits early in a
 #   large body, scores exactly as -bodycap1 scored it: the same verdict, score and tags (measured with this script).
 # The scores come from Stalwart's spam rules, which a server downloads at startup (production takes upstream's latest
 # release): here a pinned release, checked by hash and served on an internal network, with a DNS stub that answers
 # NXDOMAIN to all but the sender's own names, so no score depends on the runner's network or resolver. Pyzor, a network
 # lookup, is off.
-# Against -bodycap1 the memory check and the two past-the-bound checks FAIL, and the control set passes. Against a
+# Against -bodycap1 the memory check and the three past-the-bound checks FAIL, and the control set passes. Against a
 # build that cut HTML on its markup, the newsletter scored PARTS_DIFFER (+1.0) and the control set FAILED.
 set -euo pipefail
 IMG=${1:?usage: $0 <stalwart image>}
@@ -105,12 +105,15 @@ r=calls(ADM,[["x:SpamPyzor/set",{"accountId":A,"update":{"singleton":{"enable":F
              ["x:Action/set",{"accountId":A,"create":{"a":{"@type":"ReloadSettings"}}},"a"],
              ["x:Task/set",{"accountId":A,"create":{"t":{"@type":"SpamFilterMaintenance","maintenanceType":"updateRules"}}},"t"]])
 if any("singleton" not in (x[1].get("updated") or {}) for x in r[:2]) or "a" not in (r[2][1].get("created") or {}) or "t" not in (r[3][1].get("created") or {}): raise SystemExit(f"rules not requested: {r}")
+# A task that succeeds is deleted, and it activates the rules last, so wait for it to be gone.
+TASK=r[3][1]["created"]["t"]["id"]
 for _ in range(120):
-    if calls(ADM,[["x:SpamTag/query",{"accountId":A,"calculateTotal":True},"q"]])[0][1].get("total"): break
+    t=calls(ADM,[["x:Task/get",{"accountId":A,"ids":[TASK]},"g"]])[0][1]
+    if TASK in t.get("notFound",[]): break
+    if any(x["status"]["@type"]=="Failed" for x in t["list"]): raise SystemExit(f"the spam rules failed to load: {t['list']}")
     time.sleep(0.5)
-else:
-    t=calls(ADM,[["x:Task/get",{"accountId":A,"ids":[r[3][1]["created"]["t"]["id"]]},"g"]])[0][1]["list"]
-    raise SystemExit(f"the spam rules never loaded: {t}")
+else: raise SystemExit(f"the spam rules never loaded: {t['list']}")
+if not calls(ADM,[["x:SpamTag/query",{"accountId":A,"calculateTotal":True},"q"]])[0][1].get("total"): raise SystemExit("the rules task finished with no tags")
 AU=basic("u0@one.test",PW); J=json.loads(req("/jmap/session",AU))["primaryAccounts"]["urn:ietf:params:jmap:mail"]
 KiB=1024; MiB=1024*KiB
 
@@ -159,14 +162,15 @@ def html_of(text): return b"<html><body><p>"+text.replace(b"\r\n",b"</p>\r\n<p>"
 # 1. Memory. One small message first, so what the first delivery allocates once is not counted.
 smtp(msg("warm up","text/plain; charset=utf-8",PROSE)); delivered("warm up"); time.sleep(2)
 def anon(): return int(next(l.split()[1] for l in open("/cg/memory.stat") if l.startswith("anon ")))
-base=anon(); peak=[base]; done=threading.Event()
+base=anon(); peak=[base]; samples=[0]; done=threading.Event()
 def sample():
-    while not done.is_set(): peak[0]=max(peak[0],anon()); time.sleep(0.02)
+    while not done.is_set(): peak[0]=max(peak[0],anon()); samples[0]+=1; time.sleep(0.02)
 t=threading.Thread(target=sample); t.start()
 ascii_line=b"abcdefghij "*7+b"\r\n"
 st=smtp(msg("eight mib of text","text/plain; charset=utf-8",ascii_line*(8*MiB//len(ascii_line))))
 delivered("eight mib of text"); time.sleep(1); done.set(); t.join()
 cost=(peak[0]-base)//MiB
+if samples[0]<20: raise SystemExit(f"the memory sampler took {samples[0]} samples: nothing was measured")
 check(st=="250","an 8 MiB text/plain message on port 25 is accepted",st)
 check(cost<150,"and receiving, filtering and delivering it costs under 150 MiB, not ~40 times its text",f"{cost} MiB")
 
@@ -180,6 +184,10 @@ cases={
       "a URL at the start of a third text part, past the first 1 MiB of the message, is not analysed"),
   "url in a second part": ("multipart/mixed; boundary=b",mixed(prose(600*KiB),URL+prose(KiB)),True,
       "and one at the start of the second part still is"),
+  "url past the html bound": ("text/html; charset=utf-8",html_of(prose(600*KiB)+URL),False,
+      "a URL past the first 512 KiB of an HTML part's text is not analysed"),
+  "url early in large html": ("text/html; charset=utf-8",html_of(URL+prose(600*KiB)),True,
+      "and one at the start of it still is"),
 }
 for subject,(ctype,body,_,_) in cases.items(): smtp(msg(subject,ctype,body))
 for subject,(_,_,want,label) in cases.items():
@@ -192,7 +200,7 @@ def newsletter():
            b"kitchen recipe flour butter oven bread pastry sugar lemon ginger soup noodle spice pepper garlic "
            b"finance savings budget pension mortgage interest account rates invest shares bonds income taxes credit").split()
     plain=html=b""
-    for i in range(40):
+    for i in range(100):
         w=words[i*3%len(words):][:15] or words[:15]; r=random.Random(i)
         text=b" ".join(b" ".join(r.choice(w) for _ in range(12))+b"." for _ in range(80))
         url=b"https://shop.news%d.example/section" % i
@@ -236,6 +244,10 @@ CONTROLS={
   # Cut on the HTML's markup instead of its text, the two alternatives would differ (PARTS_DIFFER, URI_COUNT_ODD).
   "the weekly newsletter": ("multipart/alternative; boundary=b",alternative(*newsletter()),
     HAM),
+  # Past 2 MiB of markup the HTML read is cut, and the head and body it left open are closed: not unbalanced HTML.
+  "the long html report": ("text/html; charset=utf-8",html_of(prose(3*MiB)),
+    ('ham, score=3.40',
+      'ARC_NA (0.00), DKIM2_NA (0.00), DKIM_NA (0.00), FROM_EQ_ENV_FROM (0.00), FROM_HAS_DN (0.00), MID_RHS_MATCH_ENV_FROM (0.00), RCPT_COUNT_ONE (0.00), SPF_NA (0.00), TO_DN_NONE (0.00), TO_MATCH_ENVRCPT_ALL (0.00), RCVD_COUNT_ZERO (0.10), RCVD_NO_TLS_LAST (0.10), MIME_HTML_ONLY (0.20), AUTH_NA (1.00), DMARC_NA (1.00), MID_RHS_MATCH_FROM (1.00)')),
 }
 results=[]
 for subject,(ctype,body,_) in CONTROLS.items(): smtp(msg(subject,ctype,body))
