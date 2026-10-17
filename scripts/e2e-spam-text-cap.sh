@@ -193,6 +193,8 @@ CONTROLS={
   "you won big": ("text/plain; charset=utf-8",URL+prose(2*MiB)),
   "your invoice": ("text/plain; charset=utf-8",b"Your invoice: http://cdn.example.org/wp-content/uploads/invoice.php or http://inv0ice.onion/pay\r\n"
       +prose(2*MiB)),
+  # Unclosed HTML that was not cut still scores as unbalanced: only a part the filter cut has its closing tags restored.
+  "a note in unclosed html": ("text/html; charset=utf-8",b"<html><body><p>See you at noon on Friday, the usual place.</p>\r\n"),
   "verify your account": ("text/html; charset=utf-8",b"<html><body><p>Your account is suspended. <a href=\"http://192.0.2.10/login\">https://www.paypal.com/signin</a></p>\r\n"
       +html_of(prose(2*MiB))[len(b"<html><body>"):]),
 }
@@ -211,6 +213,8 @@ EXPECTED={
     'ARC_NA (0.00), DKIM2_NA (0.00), DKIM_NA (0.00), FROM_EQ_ENV_FROM (0.00), FROM_HAS_DN (0.00), MID_RHS_MATCH_ENV_FROM (0.00), RCPT_COUNT_ONE (0.00), SPF_NA (0.00), TO_DN_NONE (0.00), TO_MATCH_ENVRCPT_ALL (0.00), RCVD_COUNT_ZERO (0.10), RCVD_NO_TLS_LAST (0.10), AUTH_NA (1.00), DMARC_NA (1.00), MID_RHS_MATCH_FROM (1.00), SUSPICIOUS_URL (5.00)'),
   'your invoice': ('ham, score=3.30',
     'ARC_NA (0.00), DKIM2_NA (0.00), DKIM_NA (0.00), FROM_EQ_ENV_FROM (0.00), FROM_HAS_DN (0.00), HAS_ONION_URI (0.00), MID_RHS_MATCH_ENV_FROM (0.00), RCPT_COUNT_ONE (0.00), SPF_NA (0.00), TO_DN_NONE (0.00), TO_MATCH_ENVRCPT_ALL (0.00), WP_COMPROMISED (0.00), HAS_ANON_DOMAIN (0.10), RCVD_COUNT_ZERO (0.10), RCVD_NO_TLS_LAST (0.10), AUTH_NA (1.00), DMARC_NA (1.00), MID_RHS_MATCH_FROM (1.00)'),
+  'a note in unclosed html': ('ham, score=3.90',
+    'ARC_NA (0.00), DKIM2_NA (0.00), DKIM_NA (0.00), FROM_EQ_ENV_FROM (0.00), FROM_HAS_DN (0.00), HTML_SHORT_1 (0.00), MID_RHS_MATCH_ENV_FROM (0.00), RCPT_COUNT_ONE (0.00), SPF_NA (0.00), TO_DN_NONE (0.00), TO_MATCH_ENVRCPT_ALL (0.00), RCVD_COUNT_ZERO (0.10), RCVD_NO_TLS_LAST (0.10), MIME_HTML_ONLY (0.20), HTML_UNBALANCED_TAG (0.50), AUTH_NA (1.00), DMARC_NA (1.00), MID_RHS_MATCH_FROM (1.00)'),
   'verify your account': ('spam, score=13.90',
     'ARC_NA (0.00), DKIM2_NA (0.00), DKIM_NA (0.00), FROM_EQ_ENV_FROM (0.00), FROM_HAS_DN (0.00), MID_RHS_MATCH_ENV_FROM (0.00), RCPT_COUNT_ONE (0.00), SPF_NA (0.00), TO_DN_NONE (0.00), TO_MATCH_ENVRCPT_ALL (0.00), RCVD_COUNT_ZERO (0.10), RCVD_NO_TLS_LAST (0.10), MIME_HTML_ONLY (0.20), HTTP_TO_HTTPS (0.50), AUTH_NA (1.00), DMARC_NA (1.00), HTTP_TO_IP (1.00), MID_RHS_MATCH_FROM (1.00), PHISHING (4.00), SUSPICIOUS_URL (5.00)'),
 }

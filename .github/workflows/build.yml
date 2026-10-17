@@ -436,6 +436,7 @@ jobs:
             "PASS control 'you won' scores as it did before the patch" \
             "PASS control 'you won big' scores as it did before the patch" \
             "PASS control 'your invoice' scores as it did before the patch" \
+            "PASS control 'a note in unclosed html' scores as it did before the patch" \
             "PASS control 'verify your account' scores as it did before the patch"
 
       # ⛔ The release tag is pushed only from main (a push, or a dispatch on main). A dispatch from any

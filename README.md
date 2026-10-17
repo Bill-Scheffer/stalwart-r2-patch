@@ -250,7 +250,8 @@ analyses the first 512 KiB of each text or HTML part and 1 MiB per message, cut 
 filters do (SpamAssassin skips bodies past 500 KB). Everything the filter derives from the text reads the same slice:
 the tokens, URLs, emails and IPs, the rules, and the classifier, in training too. So a message costs at most ~40 MiB to
 filter, whatever it holds. The cost is per part as well as per message, so a large plain part never leaves the HTML
-alternative after it empty (which would score as parts that differ). Mail whose text is under 512 KiB, which is nearly
+alternative after it empty (which would score as parts that differ), and a cut HTML part has the `<head>` and
+`<body>` it left open closed, so the cut itself never scores as unbalanced HTML. Mail whose text is under 512 KiB, which is nearly
 all of it, is analysed exactly as before. Pyzor hashes the message as before.
 
 ⚠️ **The trade: padding evades it.** Nothing past the cut is seen, a URL included: URL extraction reads the same
