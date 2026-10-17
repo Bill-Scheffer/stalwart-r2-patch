@@ -251,8 +251,13 @@ filters do (SpamAssassin skips bodies past 500 KB). Everything the filter derive
 the tokens, URLs, emails and IPs, the rules, and the classifier, in training too. So a message costs at most ~40 MiB to
 filter, whatever it holds. The cost is per part as well as per message, so a large plain part never leaves the HTML
 alternative after it empty (which would score as parts that differ). Mail whose text is under 512 KiB, which is nearly
-all of it, is analysed exactly as before; past it, a signal is missed only if nothing before it carries one. Pyzor
-hashes the message as before.
+all of it, is analysed exactly as before. Pyzor hashes the message as before.
+
+⚠️ **The trade: padding evades it.** Nothing past the cut is seen, a URL included: URL extraction reads the same
+tokens, not the raw body, and the e2e checks that a URL past the cut is missed. So a spammer who puts 512 KiB of filler
+before the payload hides it. Accepted because such mail is rare and conspicuous, because its envelope, headers,
+sender and first 512 KiB still score, and because SpamAssassin and other filters make the same cut for the same
+reason. Revisit if padded spam turns up in practice, or if a whole-body signal is needed.
 [`scripts/e2e-spam-text-cap.sh`](scripts/e2e-spam-text-cap.sh) checks that an 8 MiB `text/plain` message on port 25
 costs under 150 MiB while it is received, filtered and delivered (`-bodycap1`: ~460 MiB), that a URL past the first
 512 KiB of a part, or at the start of a third part past the first 1 MiB, is not analysed while one early in a 2 MiB
