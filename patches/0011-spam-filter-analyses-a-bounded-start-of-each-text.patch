@@ -1,8 +1,16 @@
 diff --git a/crates/spam-filter/src/analysis/init.rs b/crates/spam-filter/src/analysis/init.rs
-index 0bdfe8d..1888d4b 100644
+index 0bdfe8d..76ed988 100644
 --- a/crates/spam-filter/src/analysis/init.rs
 +++ b/crates/spam-filter/src/analysis/init.rs
-@@ -13,7 +13,7 @@ use nlp::tokenizers::types::{TokenType, TypesTokenizer};
+@@ -5,6 +5,7 @@
+  */
+ 
+ use common::Server;
++use std::borrow::Cow;
+ 
+ use mail_auth::DmarcResult;
+ use mail_parser::{HeaderName, PartType, parsers::fields::thread::thread_name};
+@@ -13,7 +14,7 @@ use nlp::tokenizers::types::{TokenType, TypesTokenizer};
  use crate::{
      Email, Hostname, IpParts, Recipient, SpamFilterContext, SpamFilterInput, SpamFilterOutput,
      SpamFilterResult, TextPart,
@@ -11,7 +19,7 @@ index 0bdfe8d..1888d4b 100644
  };
  
  use super::url::UrlParts;
-@@ -24,6 +24,42 @@ pub trait SpamFilterInit {
+@@ -24,6 +25,75 @@ pub trait SpamFilterInit {
  
  const POSTMASTER_ADDRESSES: [&str; 3] = ["postmaster", "mailer-daemon", "root"];
  
@@ -30,6 +38,39 @@ index 0bdfe8d..1888d4b 100644
 +    let end = text.floor_char_boundary(max.min(*left));
 +    *left -= end;
 +    &text[..end]
++}
++
++/// The HTML that is read, up to what the message has left of `MAX_READ_HTML`, and whether any was left out. A data:
++/// URI's payload is not markup and is left out (its header, which the analysis reads, is kept): a large inline image
++/// would otherwise use up the budget before any of the text.
++fn readable_html<'x>(html: &'x str, left: &mut usize) -> (Cow<'x, str>, bool) {
++    if !html.contains("data:") {
++        let read = analysed(html, usize::MAX, left);
++        return (read.into(), read.len() < html.len());
++    }
++    let mut read = String::new();
++    let mut rest = html;
++    while let Some(at) = rest.find("data:").filter(|&at| read.len() + at < *left) {
++        let head = &rest.as_bytes()[at..rest.len().min(at + 100)];
++        let header = head
++            .windows(8)
++            .position(|w| w == b";base64,")
++            .filter(|&i| !head[..i].iter().any(|b| b"\"' <>".contains(b)));
++        let keep = at + header.map_or(5, |i| i + 8);
++        read.push_str(&rest[..keep]);
++        rest = &rest[keep..];
++        if header.is_some() {
++            rest = rest
++                .trim_start_matches(|c: char| c.is_ascii_alphanumeric() || "+/=\r\n".contains(c));
++        }
++    }
++    let pushed = rest.floor_char_boundary(left.saturating_sub(read.len()));
++    read.push_str(&rest[..pushed]);
++    let end = read.floor_char_boundary(*left);
++    let cut = pushed < rest.len() || end < read.len();
++    read.truncate(end);
++    *left -= end;
++    (read.into(), cut)
 +}
 +
 +/// A cut HTML part has lost its closing tags, which would score as unbalanced HTML: close the head and body it left
@@ -54,7 +95,7 @@ index 0bdfe8d..1888d4b 100644
  impl SpamFilterInit for Server {
      fn spam_filter_init<'x>(&self, mut input: SpamFilterInput<'x>) -> SpamFilterContext<'x> {
          let mut subject = "";
-@@ -141,14 +177,21 @@ impl SpamFilterInit for Server {
+@@ -141,14 +211,20 @@ impl SpamFilterInit for Server {
          let mut text_parts_nested = Vec::new();
          let mut message_stack = Vec::new();
          let mut message_iter = input.message.parts.iter();
@@ -66,7 +107,6 @@ index 0bdfe8d..1888d4b 100644
                  let is_main_message = message_stack.is_empty();
 +                let analysed_text = match &part.body {
 +                    PartType::Text(text) => analysed(text, MAX_ANALYSED_PART, &mut analysed_left),
-+                    PartType::Html(html) => analysed(html, usize::MAX, &mut html_left),
 +                    _ => "",
 +                };
                  let text_part = match &part.body {
@@ -79,19 +119,20 @@ index 0bdfe8d..1888d4b 100644
                              .tokenize_numbers(false)
                              .tokenize_urls(true)
                              .tokenize_urls_without_scheme(true)
-@@ -172,7 +215,10 @@ impl SpamFilterInit for Server {
+@@ -172,7 +248,11 @@ impl SpamFilterInit for Server {
                              .collect::<Vec<_>>(),
                      },
                      PartType::Html(html) => {
 -                        let html_tokens = html_to_tokens(html);
-+                        let mut html_tokens = html_to_tokens(analysed_text);
-+                        if analysed_text.len() < html.len() {
++                        let (markup, cut) = readable_html(html, &mut html_left);
++                        let mut html_tokens = html_to_tokens(&markup);
++                        if cut {
 +                            close_cut_html(&mut html_tokens);
 +                        }
                          let text_body_len = html_tokens
                              .iter()
                              .filter_map(|t| match t {
-@@ -202,6 +248,9 @@ impl SpamFilterInit for Server {
+@@ -202,6 +282,9 @@ impl SpamFilterInit for Server {
                                  _ => {}
                              }
                          }

@@ -244,6 +244,13 @@ CONTROLS={
   # Cut on the HTML's markup instead of its text, the two alternatives would differ (PARTS_DIFFER, URI_COUNT_ODD).
   "the weekly newsletter": ("multipart/alternative; boundary=b",alternative(*newsletter()),
     HAM),
+  # A newsletter whose HTML opens with a 3 MiB inline image, as some marketing tools embed them. Counted as markup, it
+  # used up the HTML read before any text, and the cut scored it spam, 5.20 (measured on branch-b0af4c7).
+  "the newsletter with an inline image": ("multipart/alternative; boundary=b",alternative(PROSE*20,
+      b"<html><head><style>p{margin:0}</style></head><body><p><img width=\"600\" height=\"300\" alt=\"This week\" src=\"data:image/png;base64,"
+      +base64.b64encode(random.Random(1).randbytes(3*MiB*3//4))+b"\"></p>\r\n"+html_of(PROSE*20)[len(b"<html><body>"):]),
+    ('ham, score=3.20',
+      'ARC_NA (0.00), DKIM2_NA (0.00), DKIM_NA (0.00), FROM_EQ_ENV_FROM (0.00), FROM_HAS_DN (0.00), HAS_DATA_URI (0.00), MID_RHS_MATCH_ENV_FROM (0.00), RCPT_COUNT_ONE (0.00), SPF_NA (0.00), TO_DN_NONE (0.00), TO_MATCH_ENVRCPT_ALL (0.00), RCVD_COUNT_ZERO (0.10), RCVD_NO_TLS_LAST (0.10), AUTH_NA (1.00), DMARC_NA (1.00), MID_RHS_MATCH_FROM (1.00)')),
   # Past 2 MiB of markup the HTML read is cut, and the head and body it left open are closed: not unbalanced HTML.
   "the long html report": ("text/html; charset=utf-8",html_of(prose(3*MiB)),
     ('ham, score=3.40',

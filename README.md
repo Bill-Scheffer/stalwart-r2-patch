@@ -253,7 +253,10 @@ markup, so the plain and HTML alternatives of a message are cut at about the sam
 text): cut on markup, a large newsletter's HTML lost text its plain twin kept, and scored `PARTS_DIFFER` (+1.0) from the
 cut alone (measured on the first build). HTML markup is read up to 2 MiB per message, and what the filter takes from
 tags rather than text, the links and images, is read from all of that. Markup costs 5 to 24 times itself to parse
-(measured: a newsletter's table cells 5, the smallest tags with bare attributes 24); an HTML part cut there has the
+(measured: a newsletter's table cells 5, the smallest tags with bare attributes 24). A `data:` URI's payload, an inline
+image, is not markup: it is neither read nor counted, while its header, which the analysis reads, is. Counted, a
+newsletter that opens with a 3 MiB inline image used up the read before any text and scored spam, 5.20, against 3.20
+(measured on the second build); a `<head>` or `<style>` block over 2 MiB still would. An HTML part cut there has the
 `<head>` and `<body>` it left open closed, so the cut never scores as unbalanced HTML. So one message costs at most
 ~90 MiB to analyse, whatever it holds. That is per message: messages filtered at once are bounded by the SMTP limits,
 not by the tenth change's budgets. (Pyzor, when enabled, still hashes the whole message, at about 1 times its HTML.)
@@ -270,8 +273,8 @@ for the same reason. Revisit if padded spam turns up in practice, or if a whole-
 costs under 150 MiB while it is received, filtered and delivered (`-bodycap1`: ~460 MiB); that a URL past the first
 512 KiB of a text part, of an HTML part's text, or at the start of a third part past the first 1 MiB, is not analysed,
 while one early in each is; and that a control set scores exactly as on `-bodycap1`: ordinary mail small and large,
-plain and HTML, a newsletter whose plain and HTML alternatives are both cut while its topics and links change, HTML past
-2 MiB of markup, unclosed HTML, and spam whose signal sits early in a 2 MiB body (a suspicious URL, a phishing link, URL
+plain and HTML, a newsletter whose plain and HTML alternatives are both cut while its topics and links change, a
+newsletter that opens with a 3 MiB inline image, HTML past 2 MiB of markup, unclosed HTML, and spam whose signal sits early in a 2 MiB body (a suspicious URL, a phishing link, URL
 rules). The scores come from upstream's pinned rules release (v3.0.2, by hash), served on an internal network with a
 DNS stub, so no score depends on the runner's network. Against `-bodycap1` the memory check and the three bound checks
 FAIL and the control set passes (measured), and the build requires both.
