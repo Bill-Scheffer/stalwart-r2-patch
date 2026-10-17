@@ -253,8 +253,10 @@ markup, so the plain and HTML alternatives of a message are cut at about the sam
 text): cut on markup, a large newsletter's HTML lost text its plain twin kept, and scored `PARTS_DIFFER` (+1.0) from the
 cut alone (measured on the first build). HTML markup is read up to 2 MiB per message, and what the filter takes from
 tags rather than text, the links and images, is read from all of that. Markup costs 5 to 24 times itself to parse
-(measured: a newsletter's table cells 5, the smallest tags with bare attributes 24). A `data:` URI's payload, an inline
-image, is not markup: it is neither read nor counted, while its header, which the analysis reads, is. Counted, a
+(measured: a newsletter's table cells 5, the smallest tags with bare attributes 24). A `data:` URI's payload in a `src` or
+`href`, an inline image, is not markup: it is neither read nor counted, while its header, which the analysis reads,
+is. Anywhere else (text, `alt`, `title`) it is read as written, so it cannot hide words: the e2e checks that words
+after a `data:` in a text node are still read (measured: on the build that skipped it everywhere, they were not). Counted, a
 newsletter that opens with a 3 MiB inline image used up the read before any text and scored spam, 5.20, against 3.20
 (measured on the second build); a `<head>` or `<style>` block over 2 MiB still would. An HTML part cut there has the
 `<head>` and `<body>` it left open closed, so the cut never scores as unbalanced HTML. So one message costs at most

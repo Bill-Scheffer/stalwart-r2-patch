@@ -192,6 +192,12 @@ cases={
 for subject,(ctype,body,_,_) in cases.items(): smtp(msg(subject,ctype,body))
 for subject,(_,_,want,label) in cases.items():
     got=tags(delivered(subject)); check(("SUSPICIOUS_URL" in got)==want,label,sorted(got))
+# Only a data: URI's payload in a src or href is skipped. In text it hides nothing: ~3 KiB of words after one, split by
+# line breaks (which render as spaces), are still read, so the part is not "short" (HTML_SHORT_1, under 1 KiB of text).
+smtp(msg("data in an html text node","text/html; charset=utf-8",
+    b"<html><body><p>data:;base64,"+b"Cheap\r\nwatches\r\nBuy\r\nnow\r\n"*150+b"</p></body></html>\r\n"))
+got=tags(delivered("data in an html text node"))
+check("HTML_SHORT_1" not in got,"a data: in an HTML text node hides nothing: the words after it are still read",sorted(got))
 
 # 3. The control set: what -bodycap1 wrote, exactly (score and tags), measured with this script.
 def newsletter():
