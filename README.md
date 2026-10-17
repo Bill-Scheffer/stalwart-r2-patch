@@ -1,10 +1,11 @@
 # stalwart-r2-patch
 
-[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **ten**
+[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **eleven**
 changes: it can delete blobs from **Cloudflare R2**, **sharing never crosses tenants**, stored files
 and mail written into a mailbox are **scanned**, a ban that expired is **enforced again**, a narrow
 key **cannot take over an Admin**, an operator can run **admin verbs on a mailbox without reading
-its mail**, calendar mail carries **no Stalwart logo**, and a burst of large uploads or messages is **refused, not an OOM**.
+its mail**, calendar mail carries **no Stalwart logo**, a burst of large uploads or messages is **refused, not an OOM**, and the spam filter reads a
+**bounded start** of each message's text.
 
 ## The problem
 
@@ -221,10 +222,10 @@ so a count would bound nothing:
   mail is never counted: a 1 MiB message costs a few MiB.
 
 Unset, a budget is no bound (upstream's behaviour), and the server says so on stderr at startup, as it does for a
-value that is not a whole number of MiB; a budget below the largest body allowed refuses that body always. ⚠️ Not
-bounded: the inbound spam filter costs ~30–40 times a `text/plain` body (an attachment ~6), so huge plain-text mail
-on port 25 can still take more than the budget implies (MAI-1000's follow-up). A synchronizing IMAP literal reserves
-its declared size when it is announced (a logged-in client only).
+value that is not a whole number of MiB; a budget below the largest body allowed refuses that body always. The
+inbound spam filter cost ~30–40 times a `text/plain` body (an attachment ~6), which these budgets do not count: the
+eleventh change bounds it. A synchronizing IMAP literal reserves its declared size when it is announced (a logged-in
+client only).
 [`scripts/e2e-upload-cap.sh`](scripts/e2e-upload-cap.sh) sets 30 MiB and 110 MiB. It holds two 14 MiB uploads open at
 13 MiB and checks that a third of 8 MiB, by WebDAV `PUT` and by JMAP upload from other accounts, is refused while a
 small file is stored, that both store on retry once the held uploads finish, that a 25 MiB body alone still meets its
@@ -236,7 +237,32 @@ ordinary messages up to 4.5 MiB and a small `APPEND` are all accepted while the 
 refused message and `APPEND` are accepted on retry, two stalled pre-login literals take nothing, and a single 100 MiB
 message is accepted, also while a `BDAT` that declares 94 MiB and sends nothing is open. Against `-nologo1` the refusals FAIL (measured), and the build requires that.
 
-Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1`.
+## The eleventh change: the spam filter analyses a bounded start of each message's text
+
+The inbound spam filter turns every word and every space of a text part into a 224-byte token and holds them all until
+the message is scored, so it costs about 40 times the text it reads (measured with Stalwart's own tokenizer: 1.86
+million tokens, +397 MiB, for 10 MiB of text). By SMTP a 10 MiB `text/plain` message cost ~430 MiB, against ~30 MiB by
+IMAP `APPEND`, which does not filter; a message under the tenth change's 5 MiB threshold is not counted at all, so a
+few plain-text messages on port 25, before any authentication, could take the pod past what the budgets imply
+(MAI-1077).
+[`patches/0011-spam-filter-analyses-a-bounded-start-of-each-text.patch`](patches/0011-spam-filter-analyses-a-bounded-start-of-each-text.patch)
+analyses the first 512 KiB of each text or HTML part and 1 MiB per message, cut on a character boundary, as other
+filters do (SpamAssassin skips bodies past 500 KB). Everything the filter derives from the text reads the same slice:
+the tokens, URLs, emails and IPs, the rules, and the classifier, in training too. So a message costs at most ~40 MiB to
+filter, whatever it holds. The cost is per part as well as per message, so a large plain part never leaves the HTML
+alternative after it empty (which would score as parts that differ). Mail whose text is under 512 KiB, which is nearly
+all of it, is analysed exactly as before; past it, a signal is missed only if nothing before it carries one. Pyzor
+hashes the message as before.
+[`scripts/e2e-spam-text-cap.sh`](scripts/e2e-spam-text-cap.sh) checks that an 8 MiB `text/plain` message on port 25
+costs under 150 MiB while it is received, filtered and delivered (`-bodycap1`: ~460 MiB), that a URL past the first
+512 KiB of a part, or at the start of a third part past the first 1 MiB, is not analysed while one early in a 2 MiB
+part or in a second part is, and that a control set scores exactly as on `-bodycap1`: ordinary mail small and large,
+plain and HTML, and spam whose signal sits early in a 2 MiB body (a suspicious URL, a phishing link, URL rules). The
+scores come from upstream's pinned rules release (v3.0.2, by hash), served on an internal network with a DNS stub, so
+no score depends on the runner's network. Against `-bodycap1` the memory check and both bound checks FAIL and the
+control set passes (measured), and the build requires both.
+
+Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1-textcap1`.
 
 ## Builds, tags and testing a change before it merges
 

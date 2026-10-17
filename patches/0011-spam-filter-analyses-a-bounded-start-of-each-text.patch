@@ -1,0 +1,64 @@
+diff --git a/crates/spam-filter/src/analysis/init.rs b/crates/spam-filter/src/analysis/init.rs
+index 0bdfe8d..6ea8977 100644
+--- a/crates/spam-filter/src/analysis/init.rs
++++ b/crates/spam-filter/src/analysis/init.rs
+@@ -24,6 +24,23 @@ pub trait SpamFilterInit {
+ 
+ const POSTMASTER_ADDRESSES: [&str; 3] = ["postmaster", "mailer-daemon", "root"];
+ 
++// Every word and every space of a text part becomes a 224-byte token, held until the message is scored, so the
++// filter costs about 40 times the text it analyses: 400 MiB for a 10 MiB text/plain message, which no size limit
++// sees. Like other filters (SpamAssassin skips bodies past 500 KB), analyse only the start of each text or HTML
++// part, and only so much per message, so that cost is bounded whatever the message holds: at most ~40 MiB.
++const MAX_ANALYSED_PART: usize = 512 * 1024;
++const MAX_ANALYSED_MESSAGE: usize = 1024 * 1024;
++
++/// The start of `text` that is analysed, cut on a character boundary, taken from what the message has left.
++fn analysed<'x>(text: &'x str, left: &mut usize) -> &'x str {
++    let mut end = text.len().min(MAX_ANALYSED_PART).min(*left);
++    while !text.is_char_boundary(end) {
++        end -= 1;
++    }
++    *left -= end;
++    &text[..end]
++}
++
+ impl SpamFilterInit for Server {
+     fn spam_filter_init<'x>(&self, mut input: SpamFilterInput<'x>) -> SpamFilterContext<'x> {
+         let mut subject = "";
+@@ -141,14 +158,21 @@ impl SpamFilterInit for Server {
+         let mut text_parts_nested = Vec::new();
+         let mut message_stack = Vec::new();
+         let mut message_iter = input.message.parts.iter();
++        let mut analysed_left = MAX_ANALYSED_MESSAGE;
+ 
+         loop {
+             while let Some(part) = message_iter.next() {
+                 let is_main_message = message_stack.is_empty();
++                let analysed_text = match &part.body {
++                    PartType::Text(text) | PartType::Html(text) => {
++                        analysed(text.as_ref(), &mut analysed_left)
++                    }
++                    _ => "",
++                };
+                 let text_part = match &part.body {
+-                    PartType::Text(text) => TextPart::Plain {
+-                        text_body: text.as_ref(),
+-                        tokens: TypesTokenizer::new(text.as_ref())
++                    PartType::Text(_) => TextPart::Plain {
++                        text_body: analysed_text,
++                        tokens: TypesTokenizer::new(analysed_text)
+                             .tokenize_numbers(false)
+                             .tokenize_urls(true)
+                             .tokenize_urls_without_scheme(true)
+@@ -171,8 +195,8 @@ impl SpamFilterInit for Server {
+                             })
+                             .collect::<Vec<_>>(),
+                     },
+-                    PartType::Html(html) => {
+-                        let html_tokens = html_to_tokens(html);
++                    PartType::Html(_) => {
++                        let html_tokens = html_to_tokens(analysed_text);
+                         let text_body_len = html_tokens
+                             .iter()
+                             .filter_map(|t| match t {
