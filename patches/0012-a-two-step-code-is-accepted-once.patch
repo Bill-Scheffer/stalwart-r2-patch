@@ -1,0 +1,202 @@
+diff --git a/crates/common/src/auth/authentication.rs b/crates/common/src/auth/authentication.rs
+index 1ce0829..0294067 100644
+--- a/crates/common/src/auth/authentication.rs
++++ b/crates/common/src/auth/authentication.rs
+@@ -205,15 +205,27 @@ impl Server {
+                                 .reason("Password credential not found for account"));
+                         };
+ 
+-                        match verify_mfa_secret_hash(
++                        let verification = verify_mfa_secret_hash(
+                             credential.otp_auth.as_deref(),
+                             mfa_token.as_deref(),
+                             credential.secret.as_str(),
+                             secret,
+                         )
+-                        .await?
++                        .await?;
++                        if let SecretVerificationResult::ValidTotp { step, valid_for } = verification
++                            && !self.accept_totp_step_once(account_id, step, valid_for).await?
+                         {
+-                            SecretVerificationResult::Valid => {
++                            return Err(trc::AuthEvent::Failed
++                                .into_err()
++                                .ctx(trc::Key::AccountName, auth_as_address.to_string())
++                                .ctx(trc::Key::AccountId, account_id)
++                                .ctx(trc::Key::SpanId, req.session_id)
++                                .reason("TOTP code already used"));
++                        }
++
++                        match verification {
++                            SecretVerificationResult::Valid
++                            | SecretVerificationResult::ValidTotp { .. } => {
+                                 is_alias_login = account.name != auth_as_local;
+                                 self.access_token(account_id)
+                                     .await
+@@ -582,6 +594,24 @@ impl Server {
+ 
+         self.get_default_directory()
+     }
++
++    /// True the first time an account's two-step code for `step` is accepted, false every time after.
++    /// The mark lives in the in-memory store, which every node shares, and is set atomically (Valkey
++    /// `SET NX`), so two nodes cannot both accept the same code.
++    pub async fn accept_totp_step_once(
++        &self,
++        account_id: u32,
++        step: u64,
++        valid_for: u64,
++    ) -> trc::Result<bool> {
++        let mut key = Vec::with_capacity(12);
++        key.extend_from_slice(&account_id.to_be_bytes());
++        key.extend_from_slice(&step.to_be_bytes());
++        self.in_memory_store()
++            .try_lock(crate::KV_TOTP_STEP_USED, &key, valid_for)
++            .await
++            .caused_by(trc::location!())
++    }
+ }
+ 
+ #[derive(Deserialize)]
+diff --git a/crates/common/src/lib.rs b/crates/common/src/lib.rs
+index 16b2c69..03acc84 100644
+--- a/crates/common/src/lib.rs
++++ b/crates/common/src/lib.rs
+@@ -128,6 +128,9 @@ pub const KV_LOCK_QUEUE_MESSAGE: u8 = 21;
+ pub const KV_LOCK_TASK: u8 = 23;
+ pub const KV_LOCK_DAV: u8 = 25;
+ pub const KV_SIEVE_ID: u8 = 26;
++// A two-step code's time step, marked when the code is accepted so it is accepted once (RFC 6238 § 5.2).
++// Far from upstream's prefixes, so a later upstream one cannot collide with it.
++pub const KV_TOTP_STEP_USED: u8 = 200;
+ 
+ #[derive(Clone)]
+ pub struct Server {
+diff --git a/crates/directory/src/core/secret.rs b/crates/directory/src/core/secret.rs
+index f0d2c8f..973f039 100644
+--- a/crates/directory/src/core/secret.rs
++++ b/crates/directory/src/core/secret.rs
+@@ -24,6 +24,10 @@ use totp_rs::Totp;
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum SecretVerificationResult {
+     Valid,
++    // The password and the two-step code are correct. The caller accepts the code only once: it marks
++    // `step` used for `valid_for` seconds, the time it can still be accepted (totp-rs leaves this to the
++    // caller, RFC 6238 § 5.2).
++    ValidTotp { step: u64, valid_for: u64 },
+     Invalid,
+     MissingMfaToken,
+ }
+@@ -36,19 +40,23 @@ pub async fn verify_mfa_secret_hash(
+ ) -> trc::Result<SecretVerificationResult> {
+     if let Some(totp_uri) = totp_uri {
+         if let Some(totp_token) = totp_token {
+-            let result = verify_secret_hash(hashed_secret, secret.as_bytes()).await?
+-                && Totp::from_url(totp_uri)
+-                    .map_err(|err| {
+-                        trc::AuthEvent::Error
+-                            .reason(err)
+-                            .details(totp_uri.to_string())
+-                    })?
+-                    .check_current(totp_token)
+-                    .is_some();
+-            Ok(if result {
+-                SecretVerificationResult::Valid
++            let step = if verify_secret_hash(hashed_secret, secret.as_bytes()).await? {
++                let totp = Totp::from_url(totp_uri).map_err(|err| {
++                    trc::AuthEvent::Error
++                        .reason(err)
++                        .details(totp_uri.to_string())
++                })?;
++                totp.check_current(totp_token).map(|step| (totp.next_step(0), step))
+             } else {
+-                SecretVerificationResult::Invalid
++                None
++            };
++            Ok(match step {
++                // A step is accepted until the step after it ends (an otpauth URL always has a skew of 1).
++                Some((period, step)) => SecretVerificationResult::ValidTotp {
++                    step,
++                    valid_for: ((step + 2) * period).saturating_sub(store::write::now()) + 1,
++                },
++                None => SecretVerificationResult::Invalid,
+             })
+         } else if !hashed_secret.is_empty()
+             && !secret.is_empty()
+diff --git a/crates/jmap/src/registry/mapping/account.rs b/crates/jmap/src/registry/mapping/account.rs
+index 4a67652..3e04462 100644
+--- a/crates/jmap/src/registry/mapping/account.rs
++++ b/crates/jmap/src/registry/mapping/account.rs
+@@ -231,7 +231,7 @@ pub(crate) async fn account_set(
+ 
+                             let current_otp_code = account_pass.otp_auth.otp_code;
+                             if let Some(current_secret) = account_pass.current_secret {
+-                                match verify_mfa_secret_hash(
++                                let totp_step = match verify_mfa_secret_hash(
+                                     old_credential.otp_auth.as_deref(),
+                                     current_otp_code.as_deref(),
+                                     &old_credential.secret,
+@@ -239,7 +239,10 @@ pub(crate) async fn account_set(
+                                 )
+                                 .await?
+                                 {
+-                                    SecretVerificationResult::Valid => {}
++                                    SecretVerificationResult::Valid => None,
++                                    SecretVerificationResult::ValidTotp { step, valid_for } => {
++                                        Some((step, valid_for))
++                                    }
+                                     SecretVerificationResult::Invalid => {
+                                         let account = set.server.account(set.account_id).await?;
+                                         if set.server.has_auth_fail2ban()
+@@ -280,21 +283,39 @@ pub(crate) async fn account_set(
+                                             );
+                                         continue 'outer;
+                                     }
+-                                }
++                                };
+ 
+-                                if user_provided_secret != old_credential.secret {
+-                                    if let Err(err) =
++                                // Checked before the code is marked used, so a refused new password
++                                // does not spend the code.
++                                if user_provided_secret != old_credential.secret
++                                    && let Err(err) =
+                                         set.server.is_secure_password(user_provided_secret, &[])
+-                                    {
+-                                        set.response.not_updated.append(
+-                                            id,
+-                                            SetError::invalid_properties()
+-                                                .with_property(Property::Secret)
+-                                                .with_description(err),
+-                                        );
+-                                        continue 'outer;
+-                                    }
++                                {
++                                    set.response.not_updated.append(
++                                        id,
++                                        SetError::invalid_properties()
++                                            .with_property(Property::Secret)
++                                            .with_description(err),
++                                    );
++                                    continue 'outer;
++                                }
+ 
++                                if let Some((step, valid_for)) = totp_step
++                                    && !set
++                                        .server
++                                        .accept_totp_step_once(set.account_id, step, valid_for)
++                                        .await?
++                                {
++                                    set.response.not_updated.append(
++                                        id,
++                                        SetError::forbidden().with_description(
++                                            "This two-step code was already used. Wait for the next one.",
++                                        ),
++                                    );
++                                    continue 'outer;
++                                }
++
++                                if user_provided_secret != old_credential.secret {
+                                     if let Some(expires_at) =
+                                         set.server.core.network.security.password_default_expiration
+                                     {

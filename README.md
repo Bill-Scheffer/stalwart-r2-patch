@@ -1,11 +1,11 @@
 # stalwart-r2-patch
 
-[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **eleven**
+[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **twelve**
 changes: it can delete blobs from **Cloudflare R2**, **sharing never crosses tenants**, stored files
 and mail written into a mailbox are **scanned**, a ban that expired is **enforced again**, a narrow
 key **cannot take over an Admin**, an operator can run **admin verbs on a mailbox without reading
-its mail**, calendar mail carries **no Stalwart logo**, a burst of large uploads or messages is **refused, not an OOM**, and the spam filter reads a
-**bounded start** of each message's text.
+its mail**, calendar mail carries **no Stalwart logo**, a burst of large uploads or messages is **refused, not an OOM**, the spam filter reads a
+**bounded start** of each message's text, and a two-step code is **accepted once**.
 
 ## The problem
 
@@ -281,7 +281,39 @@ rules). The scores come from upstream's pinned rules release (v3.0.2, by hash), 
 DNS stub, so no score depends on the runner's network. Against `-bodycap1` the memory check and the three bound checks
 FAIL and the control set passes (measured), and the build requires both.
 
-Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1-textcap1`.
+## The twelfth change: a two-step code is accepted once
+
+Upstream checks a two-step (TOTP) code against the account's `otpauth` URL and keeps no record of it, so the same six
+digits sign in again, and confirm a password change again, until their window closes: about 60 to 90 seconds, since a
+code is accepted one step either side of its own (measured on production's image, MainThrive MAI-989 and MAI-997). A
+code that was seen (over a shoulder, in a phishing page, in a log) can be replayed for that long. RFC 6238 § 5.2 says a
+verifier must not accept the second attempt, and `totp-rs`, which Stalwart uses, returns the matched step and documents
+that refusing a second use of it is the caller's job. Stalwart discards the step.
+
+A code reaches Stalwart in two places, both through `verify_mfa_secret_hash`: a sign-in (`/api/auth`, the login every
+two-step client uses: an authorization code or a device code) and the password or two-step change
+(`x:AccountPassword/set`). IMAP, SMTP, POP3, ManageSieve and HTTP Basic carry no code, so a two-step account cannot
+sign in there with its password at all, only with an app password; nothing changes there.
+
+[`patches/0012-a-two-step-code-is-accepted-once.patch`](patches/0012-a-two-step-code-is-accepted-once.patch): the
+verifier returns the matched step and how long it can still be accepted, and both callers mark (account, step) used,
+with `try_lock` in the in-memory store, before they accept the code. A second use is refused: a sign-in as a failed
+one (logged with the reason `TOTP code already used`; it counts towards the auth-failure ban like any other), a change
+with *"This two-step code was already used. Wait for the next one."* The mark is set atomically in both backends
+(Valkey `SET NX EX`; in the data store, an asserted write), so with the in-memory store in Valkey, as MainThrive runs
+it, two nodes cannot both accept one code. It expires when the step can no longer be accepted. A change checks the new
+password's strength before it marks the code, so a refused password does not spend it. ⚠️ With the in-memory store in
+the data store, the expired marks stay as rows (one per two-step sign-in, a few bytes each), as upstream's own locks do.
+⚠️ A webmail that signs in again after a password change with the code the change was confirmed with is refused: it must
+ask for the next code (MainThrive's bulwark-client-ip `0014`).
+[`scripts/e2e-totp-replay.sh`](scripts/e2e-totp-replay.sh) runs every check twice, with the in-memory store in the data
+store and then in Valkey: the same code twice in one window, a code that confirmed a password change used again to sign
+in, and a code already used to confirm a change, are each refused, while a fresh code, the next window's code, and a
+code carried by a change refused for a too-short password all still work, and IMAP and HTTP Basic refuse the password
+alone while an app password signs in. Against the last image before it (`MAI997_BUG_REFERENCE_IMAGE`) the three reuse
+checks FAIL and the controls pass (measured), and the build requires both.
+
+Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1-textcap1-totponce1`.
 
 ## Builds, tags and testing a change before it merges
 

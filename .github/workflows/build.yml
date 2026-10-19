@@ -1,4 +1,4 @@
-# Builds Stalwart from its own release source with ELEVEN changes, each pinned to its exact files:
+# Builds Stalwart from its own release source with TWELVE changes, each pinned to its exact files:
 # 1. the rust-s3 crate is taken from the commit of rust-s3 PR #467, which stops DeleteObject signing
 #    headers it never sends. Without it, every blob DELETE against Cloudflare R2 fails with
 #    SignatureDoesNotMatch (rust-s3 #466, Stalwart #3185).
@@ -38,6 +38,10 @@
 #    512 KiB of each part's text, plain or extracted from HTML, 1 MiB per message, and reads up to 2 MiB of HTML markup.
 #    Upstream tokenizes all of it, at ~40 times the text in memory, so a 10 MiB text/plain message cost 280-466 MiB by
 #    SMTP, past what 0010's budgets count (measured, MAI-1077).
+# 12. patches/0012-a-two-step-code-is-accepted-once.patch: a two-step (TOTP) code is accepted once, at sign-in and to
+#    confirm a password or two-step change. Upstream keeps no record, so the same code signed in again until its window
+#    closed (measured, MAI-989/MAI-997; RFC 6238 § 5.2). The mark is per account and time step, in the in-memory store
+#    every node shares, set with SET NX.
 # Everything else is upstream: the tag's source, its Dockerfile, its features.
 # The release tag is pushed only from main; a dispatch from another branch pushes branch-<short sha>
 # instead, and a pull request runs every step but the registry login and the push (MAI-1019). A release tag is
@@ -76,7 +80,7 @@ env:
   RUSTS3_REV: 505aded53d2e668bad472bd7834019e8b1f7a4dd
   IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch
   # The tag after the Stalwart release: bump it with any change to what is built.
-  VARIANT: rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1-textcap1
+  VARIANT: rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1-textcap1-totponce1
   # A FIXED image that HAS the expired-ban bug (the last build before 0006), which the ban-expiry check must FAIL
   # on the bug's own line: that proves the check can fail. ⛔ NEVER bumped with releases: every build after 0006
   # lacks the bug and PASSES the check, so it could never be the reference. Pinned by tag AND digest, because a tag
@@ -91,6 +95,9 @@ env:
   # The same for 0011: the last build before it (production's image until then), which the spam-text check must FAIL on
   # its memory and on the bound itself, and pass on its control set. ⛔ NEVER bumped, for the same reason.
   MAI1077_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:v0.16.25-rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1@sha256:31bb44037de8136c188b22f7ec6b144b846d852f166c7525d5705b7066879ab5
+  # The same for 0012: the last build before it (production's image until then), which the two-step check must FAIL on
+  # each reuse, and pass on its controls. ⛔ NEVER bumped, for the same reason. Pinned by its pinned- tag's digest.
+  MAI997_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:pinned-bee5bddff49d@sha256:bee5bddff49d91a8acec978b85f93541fd91dcf8eccc4d7d8caa326d61e635d0
 
 jobs:
   build:
@@ -334,6 +341,20 @@ jobs:
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
+          # Stage 0011, so the next step's diff under crates/ is 0012 alone.
+          git add -- crates/
+
+      - name: Apply the two-step code patch, and prove it changed only its own files
+        working-directory: stalwart
+        run: |
+          set -eu
+          P=../patch/patches/0012-a-two-step-code-is-accepted-once.patch
+          git apply --check "$P" && git apply "$P"
+          got=$(git diff --name-only | sort | tr '\n' ' ')
+          [ "$got" = "Cargo.lock Cargo.toml crates/common/src/auth/authentication.rs crates/common/src/lib.rs crates/directory/src/core/secret.rs crates/jmap/src/registry/mapping/account.rs " ] \
+            || { echo "::error::changed files: $got"; exit 1; }
+          diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
+            || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
 
       - name: Swap, as Stalwart's own CI adds for its release build
         run: |
@@ -359,7 +380,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ env.STALWART_TAG }}-${{ env.VARIANT }}
-            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with rust-s3 PR 467 (R2 DeleteObject fix) tenant-scoped sharing (JMAP, IMAP, WebDAV), scanned, capped file writes, expired bans replaced, account writes within the caller's grant, admin verbs without impersonate, no logo on calendar mail, and a server-wide cap on large uploads and messages, and a bounded spam-filter text analysis
+            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with rust-s3 PR 467 (R2 DeleteObject fix) tenant-scoped sharing (JMAP, IMAP, WebDAV), scanned, capped file writes, expired bans replaced, account writes within the caller's grant, admin verbs without impersonate, no logo on calendar mail, and a server-wide cap on large uploads and messages, and a bounded spam-filter text analysis, and a two-step code accepted once
             org.opencontainers.image.licenses=AGPL-3.0-only
           cache-from: type=gha
           # Only main writes the cache: a pull request reads main's, and a Rust build cache written per
@@ -433,6 +454,16 @@ jobs:
             'FAIL a URL at the start of a third text part, past the first 1 MiB of the message, is not analysed' \
             "FAIL a URL past the first 512 KiB of an HTML part's text is not analysed" \
             'PASS the control set scores as it did before the patch'
+
+      - name: A two-step code is accepted once, at sign-in and to confirm a change, with the in-memory store in the data store and in Valkey (end to end, the built image)
+        run: bash patch/scripts/e2e-totp-replay.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
+
+      - name: The same check FAILS on the last image before 0012, on each reuse, so it can tell the two apart
+        run: |
+          bash patch/scripts/previous-must-fail.sh "${MAI997_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-totp-replay.sh \
+            'FAIL the same code a second time, in the same window, is refused' \
+            'FAIL a code that confirmed a password change does not sign in again' \
+            'FAIL a code already used does not confirm a password change'
 
       # ⛔ The release tag is pushed only from main (a push, or a dispatch on main). A dispatch from any
       # other branch pushes the same tested image under branch-<short sha> alone, never the release tag,
