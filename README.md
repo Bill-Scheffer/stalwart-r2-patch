@@ -293,7 +293,9 @@ that refusing a second use of it is the caller's job. Stalwart discards the step
 A code reaches Stalwart in two places, both through `verify_mfa_secret_hash`: a sign-in (`/api/auth`, the login every
 two-step client uses: an authorization code or a device code) and the password or two-step change
 (`x:AccountPassword/set`). IMAP, SMTP, POP3, ManageSieve and HTTP Basic carry no code, so a two-step account cannot
-sign in there with its password at all, only with an app password; nothing changes there.
+sign in there with its password at all, only with an app password; nothing changes there. Those two are the only
+callers of the verifier: an external directory (LDAP, SQL, OIDC) checks its own credentials and is not covered
+(MainThrive uses none).
 
 [`patches/0012-a-two-step-code-is-accepted-once.patch`](patches/0012-a-two-step-code-is-accepted-once.patch): the
 verifier returns the matched step and how long it can still be accepted, and both callers mark (account, step) used,
