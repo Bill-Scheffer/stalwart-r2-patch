@@ -66,7 +66,7 @@ def req(path,body=None,auth=None,form=False):
 def basic(u,p): return "Basic "+base64.b64encode(f"{u}:{p}".encode()).decode()
 U=["urn:ietf:params:jmap:core","urn:stalwart:jmap"]
 def jmap(auth,calls):
-    s,b=req("/jmap/",{"using":U,"methodCalls":calls},auth); return s,b
+    return req("/jmap/",{"using":U,"methodCalls":calls},auth)
 def pwset(auth,patch):
     s,ses=req("/jmap/session",auth=auth); aid=ses["primaryAccounts"]["urn:stalwart:jmap"]
     s,b=jmap(auth,[["x:AccountPassword/set",{"accountId":aid,"update":{"singleton":patch}},"0"]])
