@@ -468,7 +468,8 @@ jobs:
             'FAIL [valkey] the same code a second time, in the same window, is refused' \
             'FAIL [valkey] a code that confirmed a password change does not sign in again' \
             'FAIL [valkey] a code already used does not confirm a password change, and says why' \
-            'PASS [valkey] every control passes'
+            'PASS [valkey] every control passes' \
+            'PASS [valkey] control: the in-memory store is Valkey'
 
       # ⛔ The release tag is pushed only from main (a push, or a dispatch on main). A dispatch from any
       # other branch pushes the same tested image under branch-<short sha> alone, never the release tag,

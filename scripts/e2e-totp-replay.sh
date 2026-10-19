@@ -170,6 +170,8 @@ try: print(json.load(urllib.request.urlopen(r,timeout=30)).get('type'))
 except urllib.error.HTTPError as e: print(e.code)
 except Exception as e: print(type(e).__name__)"; }
 up=$(probe); docker pause "$V" >/dev/null; paused=$(probe); docker unpause "$V" >/dev/null
-if [ "$up" = failure ] && [ "$paused" != failure ]; then echo "PASS [valkey] control: the in-memory store is Valkey (a failed sign-in: $up, with Valkey paused: $paused)"
-else echo "FAIL [valkey] control: the in-memory store is Valkey (a failed sign-in: $up, with Valkey paused: $paused)"; rc=1; fi
+# A fixed line, so the reference run can be required to print it too (its reuse FAILs are Valkey's, not RocksDB's).
+echo "   (a failed sign-in: $up; with Valkey paused: $paused)"
+if [ "$up" = failure ] && [ "$paused" != failure ]; then echo "PASS [valkey] control: the in-memory store is Valkey"
+else echo "FAIL [valkey] control: the in-memory store is Valkey"; rc=1; fi
 exit $rc
