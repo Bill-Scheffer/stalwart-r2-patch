@@ -51,8 +51,12 @@ checks() {
 docker exec -i -e USER="$1@one.test" -e PW="$2" -e STORE="$3" "$K" python3 - <<'PY'
 import base64,hashlib,hmac,imaplib,json,os,secrets,ssl,struct,time,urllib.error,urllib.parse,urllib.request
 B="http://stalwart:8080"; USER=os.environ["USER"]; pw=os.environ["PW"]; STORE=os.environ["STORE"]
-fails=[]
+fails=[]; reuse_fails=[]
 def check(ok,msg): print(("PASS " if ok else "FAIL ")+msg); ok or fails.append(msg)
+# The three reuse checks: each FAILS on the image before 0012, so they are tallied apart from the controls.
+def reuse(ok,msg):
+    check(ok,f"[{STORE}] {msg}")
+    ok or reuse_fails.append(msg)
 def req(path,body=None,auth=None,form=False):
     h={}
     if auth: h["Authorization"]=auth
@@ -113,7 +117,7 @@ app=((b["methodResponses"][0][1].get("created") or {}).get("a") or {}).get("secr
 check(bool(app) and imap(USER,app)=="ok", f"[{STORE}] control: an app password signs in to IMAP")
 
 # 1. The same code twice in one window.
-check(signin(pw,code) is None, "the same code a second time, in the same window, is refused")
+reuse(signin(pw,code) is None, "the same code a second time, in the same window, is refused")
 check(signin(pw,"%06d"%((int(code)+1)%1000000)) is None, f"[{STORE}] control: a wrong code is refused")
 check(signin(pw,fresh(seed)) is not None, f"[{STORE}] the next window's code still signs in")
 
@@ -121,14 +125,14 @@ check(signin(pw,fresh(seed)) is not None, f"[{STORE}] the next window's code sti
 new=secrets.token_urlsafe(16); c2=fresh(seed)
 check(pwset(tok,{"currentSecret":pw,"secret":new,"otpAuth/otpCode":c2})=="updated", f"[{STORE}] a password change confirmed with a fresh code succeeds")
 pw=new
-check(signin(pw,c2) is None, "a code that confirmed a password change does not sign in again")
+reuse(signin(pw,c2) is None, "a code that confirmed a password change does not sign in again")
 
 # 3. A code already used does not confirm a change; one spent on a REFUSED change is not spent.
 c3=fresh(seed); tok=signin(pw,c3)
 check(tok is not None, f"[{STORE}] sign-in with the new password and a fresh code")
 new=secrets.token_urlsafe(16)
 reused=pwset(tok,{"currentSecret":pw,"secret":new,"otpAuth/otpCode":c3})
-check(reused!="updated", "a code already used does not confirm a password change")
+reuse(reused=="This two-step code was already used. Wait for the next one.", "a code already used does not confirm a password change, and says why")
 if reused=="updated":
     # Without the patch the change went through and revoked the token: carry on as the account now is.
     pw=new; tok=signin(pw,fresh(seed))
@@ -137,6 +141,9 @@ check(pwset(tok,{"currentSecret":pw,"secret":"short","otpAuth/otpCode":c4})!="up
 new=secrets.token_urlsafe(16)
 check(pwset(tok,{"currentSecret":pw,"secret":new,"otpAuth/otpCode":c4})=="updated",
       f"[{STORE}] the code that the refused change carried still confirms the next change")
+# Every check other than the three reuse checks: these must pass on BOTH images, or a reuse FAIL proves nothing.
+controls_ok=len(fails)==len(reuse_fails)
+print(("PASS " if controls_ok else "FAIL ")+f"[{STORE}] every control passes")
 print(f"{len(fails)} failure(s)"); raise SystemExit(1 if fails else 0)
 PY
 }

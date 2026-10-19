@@ -304,8 +304,11 @@ one (logged with the reason `TOTP code already used`; it counts towards the auth
 with *"This two-step code was already used. Wait for the next one."* The mark is set atomically in both backends
 (Valkey `SET NX EX`; in the data store, an asserted write), so with the in-memory store in Valkey, as MainThrive runs
 it, two nodes cannot both accept one code. It expires when the step can no longer be accepted. A change checks the new
-password's strength before it marks the code, so a refused password does not spend it. ⚠️ With the in-memory store in
-the data store, the expired marks stay as rows (one per two-step sign-in, a few bytes each), as upstream's own locks do.
+password's strength before it marks the code, so a refused password does not spend it. What it does not cover: turning
+two-step ON proves no code against the new secret (upstream checks only the old one, and there is none), so nothing is
+marked then; and the mark is per account and step, not per secret, so a code from a secret enrolled within the same
+~60 s as a code from the old one was used is refused once. With the in-memory store in the data store, 0012 adds
+nothing that deletes an expired mark (one small row per two-step sign-in; Valkey expires its own).
 ⚠️ A webmail that signs in again after a password change with the code the change was confirmed with is refused: it must
 ask for the next code (MainThrive's bulwark-client-ip `0014`).
 [`scripts/e2e-totp-replay.sh`](scripts/e2e-totp-replay.sh) runs every check twice, with the in-memory store in the data

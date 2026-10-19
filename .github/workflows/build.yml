@@ -458,12 +458,17 @@ jobs:
       - name: A two-step code is accepted once, at sign-in and to confirm a change, with the in-memory store in the data store and in Valkey (end to end, the built image)
         run: bash patch/scripts/e2e-totp-replay.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
 
-      - name: The same check FAILS on the last image before 0012, on each reuse, so it can tell the two apart
+      - name: The same check FAILS on the last image before 0012, on each reuse in both stores, and its controls PASS there
         run: |
           bash patch/scripts/previous-must-fail.sh "${MAI997_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-totp-replay.sh \
-            'FAIL the same code a second time, in the same window, is refused' \
-            'FAIL a code that confirmed a password change does not sign in again' \
-            'FAIL a code already used does not confirm a password change'
+            'FAIL [rocksdb] the same code a second time, in the same window, is refused' \
+            'FAIL [rocksdb] a code that confirmed a password change does not sign in again' \
+            'FAIL [rocksdb] a code already used does not confirm a password change, and says why' \
+            'PASS [rocksdb] every control passes' \
+            'FAIL [valkey] the same code a second time, in the same window, is refused' \
+            'FAIL [valkey] a code that confirmed a password change does not sign in again' \
+            'FAIL [valkey] a code already used does not confirm a password change, and says why' \
+            'PASS [valkey] every control passes'
 
       # ⛔ The release tag is pushed only from main (a push, or a dispatch on main). A dispatch from any
       # other branch pushes the same tested image under branch-<short sha> alone, never the release tag,
