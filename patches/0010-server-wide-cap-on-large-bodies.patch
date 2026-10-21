@@ -1,5 +1,5 @@
 diff --git a/crates/dav/src/request.rs b/crates/dav/src/request.rs
-index 2aaa3cb..08bf8d4 100644
+index 2aaa3cbb..08bf8d47 100644
 --- a/crates/dav/src/request.rs
 +++ b/crates/dav/src/request.rs
 @@ -47,7 +47,10 @@ use dav_proto::{
@@ -54,7 +54,7 @@ index 2aaa3cb..08bf8d4 100644
          } else {
              Vec::new()
 diff --git a/crates/http-proto/Cargo.toml b/crates/http-proto/Cargo.toml
-index 5de066d..ebe50ff 100644
+index 87af79ab..aff9639c 100644
 --- a/crates/http-proto/Cargo.toml
 +++ b/crates/http-proto/Cargo.toml
 @@ -6,6 +6,7 @@ edition = "2024"
@@ -66,7 +66,7 @@ index 5de066d..ebe50ff 100644
  serde = { version = "1.0", features = ["derive"]}
  serde_json = "1.0"
 diff --git a/crates/http-proto/src/request.rs b/crates/http-proto/src/request.rs
-index 467dba3..ed1606e 100644
+index 467dba37..ed1606ef 100644
 --- a/crates/http-proto/src/request.rs
 +++ b/crates/http-proto/src/request.rs
 @@ -4,11 +4,13 @@
@@ -177,7 +177,7 @@ index 467dba3..ed1606e 100644
 +    Ok(bytes)
  }
 diff --git a/crates/http/src/request.rs b/crates/http/src/request.rs
-index 7a031f2..1e3b79b 100644
+index 7a031f29..1e3b79b8 100644
 --- a/crates/http/src/request.rs
 +++ b/crates/http/src/request.rs
 @@ -26,7 +26,8 @@ use dav::{DavMethod, request::DavRequestHandler};
@@ -244,7 +244,7 @@ index 7a031f2..1e3b79b 100644
                          }
                      }
 diff --git a/crates/imap-proto/src/parser/mod.rs b/crates/imap-proto/src/parser/mod.rs
-index 96cf8a0..1fe11b3 100644
+index 96cf8a0c..1fe11b3e 100644
 --- a/crates/imap-proto/src/parser/mod.rs
 +++ b/crates/imap-proto/src/parser/mod.rs
 @@ -90,6 +90,10 @@ impl CommandParser for Command {
@@ -259,7 +259,7 @@ index 96cf8a0..1fe11b3 100644
  
  impl Flag {
 diff --git a/crates/imap-proto/src/receiver.rs b/crates/imap-proto/src/receiver.rs
-index 945003a..f2b95dc 100644
+index 945003a5..f2b95dcd 100644
 --- a/crates/imap-proto/src/receiver.rs
 +++ b/crates/imap-proto/src/receiver.rs
 @@ -7,6 +7,7 @@
@@ -403,7 +403,7 @@ index 945003a..f2b95dc 100644
      }
  }
 diff --git a/crates/imap/src/core/client.rs b/crates/imap/src/core/client.rs
-index 2de60d8..bebfae0 100644
+index 2de60d8d..bebfae09 100644
 --- a/crates/imap/src/core/client.rs
 +++ b/crates/imap/src/core/client.rs
 @@ -4,7 +4,7 @@
@@ -468,7 +468,7 @@ index 2de60d8..bebfae0 100644
                      .map(|_| SessionResult::Continue),
                  Command::Close => self
 diff --git a/crates/imap/src/op/append.rs b/crates/imap/src/op/append.rs
-index a9c4c8d..0705a23 100644
+index 6bbb51b5..b9c2e40c 100644
 --- a/crates/imap/src/op/append.rs
 +++ b/crates/imap/src/op/append.rs
 @@ -24,9 +24,14 @@ use types::{
@@ -497,10 +497,10 @@ index a9c4c8d..0705a23 100644
                  .append_messages(arguments, selected_mailbox, mailbox, is_qresync, op_start)
                  .await?
 diff --git a/crates/main/src/main.rs b/crates/main/src/main.rs
-index db0a4c0..354eba5 100644
+index 96f6fe77..5c579925 100644
 --- a/crates/main/src/main.rs
 +++ b/crates/main/src/main.rs
-@@ -40,6 +40,9 @@ async fn main() -> std::io::Result<()> {
+@@ -48,6 +48,9 @@ async fn main() -> std::io::Result<()> {
      // Build the shared outbound TLS configurations
      utils::http::init_shared_tls_configs();
  
@@ -511,7 +511,7 @@ index db0a4c0..354eba5 100644
      let mut init = Box::pin(BootManager::init()).await;
  
 diff --git a/crates/smtp/src/core/mod.rs b/crates/smtp/src/core/mod.rs
-index 485b3c3..73b96af 100644
+index 485b3c3e..73b96afa 100644
 --- a/crates/smtp/src/core/mod.rs
 +++ b/crates/smtp/src/core/mod.rs
 @@ -23,7 +23,7 @@ use std::{
@@ -559,7 +559,7 @@ index 485b3c3..73b96af 100644
              auth_errors: 0,
              priority: 0,
 diff --git a/crates/smtp/src/inbound/session.rs b/crates/smtp/src/inbound/session.rs
-index 73b7737..f2b4f49 100644
+index 73b77378..f2b4f495 100644
 --- a/crates/smtp/src/inbound/session.rs
 +++ b/crates/smtp/src/inbound/session.rs
 @@ -21,9 +21,13 @@ use smtp_proto::{
@@ -674,7 +674,7 @@ index 73b7737..f2b4f49 100644
          self.data.future_release = 0;
 diff --git a/crates/utils/src/in_flight.rs b/crates/utils/src/in_flight.rs
 new file mode 100644
-index 0000000..cb2a2e4
+index 00000000..cb2a2e43
 --- /dev/null
 +++ b/crates/utils/src/in_flight.rs
 @@ -0,0 +1,124 @@
@@ -803,7 +803,7 @@ index 0000000..cb2a2e4
 +    }
 +}
 diff --git a/crates/utils/src/lib.rs b/crates/utils/src/lib.rs
-index 4629c3c..5cf6662 100644
+index 4629c3cc..5cf6662c 100644
 --- a/crates/utils/src/lib.rs
 +++ b/crates/utils/src/lib.rs
 @@ -14,6 +14,7 @@ pub mod codec;

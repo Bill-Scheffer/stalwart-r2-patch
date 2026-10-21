@@ -1,0 +1,51 @@
+diff --git a/crates/smtp/src/queue/dsn.rs b/crates/smtp/src/queue/dsn.rs
+index c08271be..33caed49 100644
+--- a/crates/smtp/src/queue/dsn.rs
++++ b/crates/smtp/src/queue/dsn.rs
+@@ -149,6 +149,34 @@ impl SendDsn for Server {
+ 
+ const MAX_HEADER_SIZE: usize = 4096;
+ 
++// The DSN returns the original's headers only, which is RFC 6522's text/rfc822-headers. Sent as
++// message/rfc822, a relay that parses the part as a message (Amazon SES) refuses the bounce: a
++// header-only message whose Content-Type names a multipart has no boundary, and quoted-printable
++// breaks the headers it encodes. So 7bit, or 8bit for UTF-8 headers. Neither may carry a lone CR or LF or
++// a NUL, which mail-builder would pass through as 7bit, so every line ends in CRLF and NULs are dropped;
++// a line past SMTP's 998 octets is left to mail-builder to encode.
++fn returned_headers(headers: String) -> MimePart<'static> {
++    let headers = headers
++        .replace("\r\n", "\n")
++        .replace(['\r', '\n'], "\r\n")
++        .replace('\0', "");
++    let encoding = if headers.split("\r\n").any(|line| line.len() > 998) {
++        None
++    } else if headers.is_ascii() {
++        Some("7bit")
++    } else {
++        Some("8bit")
++    };
++    let part = MimePart::new(
++        ContentType::new("text/rfc822-headers"),
++        BodyPart::Text(headers.into()),
++    );
++    match encoding {
++        Some(encoding) => part.transfer_encoding(encoding),
++        None => part,
++    }
++}
++
+ impl MessageWrapper {
+     pub async fn build_dsn(&self, server: &Server) -> Option<Vec<u8>> {
+         let config = &server.core.smtp.queue;
+@@ -362,10 +390,7 @@ impl MessageWrapper {
+                         ContentType::new("message/delivery-status"),
+                         BodyPart::Text(dsn.into()),
+                     ),
+-                    MimePart::new(
+-                        ContentType::new("message/rfc822"),
+-                        BodyPart::Text(headers.into()),
+-                    ),
++                    returned_headers(headers),
+                 ]),
+             ))
+             .write_to_vec()
