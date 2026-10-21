@@ -70,7 +70,7 @@ docker run -d --name "$C" --network "$NET" --network-alias stalwart --hostname m
   -v "$W/etc:/etc/stalwart" -v "$W/data:/var/lib/stalwart" "$IMG" >/dev/null
 docker run -d --name "$K" --network "$NET" -e ADMIN="$ADMIN" python:3.12-alpine sleep 900 >/dev/null
 docker exec -i "$K" python3 - <<'PY'
-import base64,json,os,secrets,sys,time,urllib.request,urllib.error
+import base64,email,json,os,secrets,sys,time,urllib.request,urllib.error
 B="http://stalwart:8080"; fails=[]
 for _ in range(90):
     try: urllib.request.urlopen(B+"/healthz/ready",timeout=2); break
@@ -104,7 +104,7 @@ def original(tag,subject):
             +'--=_e2e\r\nContent-Type: text/plain; charset="utf-8"\r\n\r\nhello\r\n--=_e2e--\r\n').encode()
 SENT={"ascii":original("ascii","an outside recipient that does not exist"),"utf8":original("utf8","Grüße, ein Empfänger, den es nicht gibt")}
 for tag,raw in SENT.items():
-    s,b=req(f"/jmap/upload/{ACC}/",ORG,raw,"message/rfc822")
+    _,b=req(f"/jmap/upload/{ACC}/",ORG,raw,"message/rfc822")
     blob=json.loads(b)["blobId"]
     r=r1(ORG,["Email/import",{"accountId":ACC,"emails":{"e":{"blobId":blob,"mailboxIds":{drafts:True},"keywords":{"$draft":True}}}},"e"])[1]
     eid=(r.get("created") or {}).get("e",{}).get("id")
@@ -118,7 +118,7 @@ def bounces():
         raw=req(f"/jmap/download/{ACC}/{g['blobId']}/m",ORG)[1]
         if b"multipart/report" not in raw.split(b"\r\n\r\n",1)[0]: continue
         for tag in SENT:
-            if f"<e2e-dsn-{tag}@one.test>".encode() in raw or f"e2e-dsn-{tag}@one.test".encode() in raw.replace(b"=\r\n",b""): found[tag]=raw
+            if f"e2e-dsn-{tag}@one.test".encode() in raw.replace(b"=\r\n",b""): found[tag]=raw
     return found
 got={}
 for _ in range(36):
@@ -126,23 +126,23 @@ for _ in range(36):
     if len(got)==len(SENT): break
     time.sleep(5)
 def third_part(raw):
-    # The raw bytes of the report's third part: its own headers, then its body, exactly as sent.
+    # The raw body of the report's third part, exactly as sent (the email package would decode it).
     head,body=raw.split(b"\r\n\r\n",1)
     b=head.split(b'boundary="',1)[1].split(b'"',1)[0]
     parts=body.split(b"--"+b)[1:-1]
     p=parts[2] if len(parts)>2 else b""
-    h,_,bd=p.lstrip(b"\r\n").partition(b"\r\n\r\n")
-    return h.decode(errors="replace"),bd
+    return p.lstrip(b"\r\n").partition(b"\r\n\r\n")[2]
 for tag,sent in SENT.items():
     raw=got.get(tag)
     check(raw is not None, f"setup: the {tag} original bounces back to org")
     if raw is None: continue
-    h,body=third_part(raw)
-    ctype=h.split("Content-Type:",1)[-1].split(";")[0].split("\r\n")[0].strip().lower()
-    cte=h.split("Content-Transfer-Encoding:",1)[-1].split("\r\n")[0].strip().lower() if "Content-Transfer-Encoding:" in h else ""
+    body=third_part(raw)
+    parts=email.message_from_bytes(raw).get_payload()
+    part=parts[2] if len(parts)>2 else email.message.Message()
+    ctype,cte=part.get_content_type(),(part.get("Content-Transfer-Encoding") or "").lower()
     headers=sent.split(b"\r\n\r\n",1)[0]
     # A control: whatever the encoding, the part carries the original's Message-ID (upstream's too, once decoded).
-    decoded=body.replace(b"=\r\n",b"").replace(b"=3D",b"=")
+    decoded=body.replace(b"=\r\n",b"")
     check(f"<e2e-dsn-{tag}@one.test>".encode() in decoded, f"control: the {tag} bounce's third part carries the original's Message-ID")
     want="8bit" if tag=="utf8" else "7bit"
     check(ctype=="text/rfc822-headers", f"the {tag} bounce returns the headers as text/rfc822-headers, not message/rfc822", ctype)

@@ -416,7 +416,8 @@ jobs:
           up=$(has "docker.io/stalwartlabs/stalwart:${STALWART_TAG}")
           [ "${up:-0}" -ge 1 ] || { echo "::error::control: upstream's ${STALWART_TAG} image should carry the check, the grep found '${up}'"; exit 1; }
           ours=$(has "${IMAGE}:${STALWART_TAG}-${VARIANT}")
-          [ "${ours:-0}" = 0 ] || { echo "::error::the built image carries the x86-64-v2 start-up check"; exit 1; }
+          # Exactly 0, no default: an empty answer means the grep never ran on our image, which must not read as a pass.
+          [ "$ours" = 0 ] || { echo "::error::the built image carries the x86-64-v2 start-up check (grep: '${ours}')"; exit 1; }
           echo "upstream's image carries the check (${up}); this build does not"
 
       - name: Sharing never crosses tenants (end to end, the built image)
