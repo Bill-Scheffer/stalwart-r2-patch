@@ -1,0 +1,29 @@
+diff --git a/crates/smtp/src/queue/dsn.rs b/crates/smtp/src/queue/dsn.rs
+index 33caed4..e922d03 100644
+--- a/crates/smtp/src/queue/dsn.rs
++++ b/crates/smtp/src/queue/dsn.rs
+@@ -147,7 +147,11 @@ impl SendDsn for Server {
+     }
+ }
+ 
+-const MAX_HEADER_SIZE: usize = 4096;
++// A bounce returns the original's header block, read to its blank line. 4096 bytes cut a real Gmail message before its
++// From, Subject and Message-ID: our own trace headers and Gmail's ARC and DKIM blocks come first and fill it (MainThrive
++// MAI-1131). 64 KiB is over ten times that block and still bounds what a pathological message makes one bounce scan and
++// return (get_blob fetches the whole blob whatever the range); a block past it is cut at its last whole line, as before.
++const MAX_HEADER_SIZE: usize = 64 * 1024;
+ 
+ // The DSN returns the original's headers only, which is RFC 6522's text/rfc822-headers. Sent as
+ // message/rfc822, a relay that parses the part as a message (Amazon SES) refuses the bounce: a
+@@ -349,7 +353,10 @@ impl MessageWrapper {
+                 if last_lf < MAX_HEADER_SIZE {
+                     buf.truncate(last_lf);
+                 }
+-                String::from_utf8(buf).unwrap_or_default()
++                // A header byte that is not UTF-8 (legacy or spam mail) used to empty the whole part, and a 64 KiB block
++                // is likelier to carry one than 4 KiB: replace it instead, and return everything else (MAI-1131).
++                String::from_utf8(buf)
++                    .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
+             }
+             Ok(None) => {
+                 trc::event!(

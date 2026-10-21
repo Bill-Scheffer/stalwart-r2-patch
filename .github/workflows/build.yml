@@ -1,4 +1,4 @@
-# Builds Stalwart from its own release source with TWELVE changes, each pinned to its exact files:
+# Builds Stalwart from its own release source with THIRTEEN changes, each pinned to its exact files:
 # 1. (retired) rust-s3 used to be taken from the commit of rust-s3 PR #467, which stops DeleteObject signing
 #    headers it never sends; without it every blob DELETE against Cloudflare R2 failed with SignatureDoesNotMatch
 #    (rust-s3 #466, Stalwart #3185). rust-s3 0.38.0 carries the fix (6c97cb9) and Stalwart v0.16.26 moved to it,
@@ -46,6 +46,10 @@
 # 13. patches/0013-bounces-return-headers-as-text-rfc822-headers.patch: a bounce returns the original's headers as
 #    text/rfc822-headers (RFC 6522), 7bit or 8bit, not as message/rfc822. Amazon SES parses a message/rfc822 part as a
 #    whole message and refused Stalwart's header-only one (554, measured through real SES, MainThrive MAI-1036).
+# 14. patches/0014-bounces-return-the-whole-header-block.patch: a bounce returns the original's header block up to 64 KiB,
+#    not 4 KiB. A real Gmail message's trace, ARC and DKIM headers filled upstream's 4096 bytes before its From, Subject and
+#    Message-ID, and that bounce went to Gmail's Spam (measured in production, MainThrive MAI-1127/MAI-1131). A header byte
+#    that is not UTF-8 is replaced, where upstream returned nothing at all.
 # Everything else is upstream: the tag's source, its Dockerfile, its features.
 # The release tag is pushed only from main; a dispatch from another branch pushes branch-<short sha>
 # instead, and a pull request runs every step but the registry login and the push (MAI-1019). A release tag is
@@ -83,7 +87,7 @@ env:
   RUSTS3_VERSION: 0.38.0
   IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch
   # The tag after the Stalwart release: bump it with any change to what is built.
-  VARIANT: tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1-textcap1-totponce1-dsnhdrs1
+  VARIANT: tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1-textcap1-totponce1-dsnhdrs1-dsnfull1
   # A FIXED image that HAS the expired-ban bug (the last build before 0006), which the ban-expiry check must FAIL
   # on the bug's own line: that proves the check can fail. ⛔ NEVER bumped with releases: every build after 0006
   # lacks the bug and PASSES the check, so it could never be the reference. Pinned by tag AND digest, because a tag
@@ -105,6 +109,9 @@ env:
   # returned part's type and encoding, and pass on its controls. ⛔ NEVER bumped, for the same reason. Pinned by the tag
   # that names that digest: production ran MAI-997's branch build, not the release tag's.
   MAI1127_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:branch-a88e016@sha256:dabddb17455449a4eabc0578ee1ecaddda166b93cadc27355cc001dad7c10e5b
+  # The same for 0014: the last build before it (production's image until then), which the bounce check must FAIL on the
+  # headers past 4 KiB, and pass on its controls. ⛔ NEVER bumped, for the same reason. Pinned by its pinned- tag's digest.
+  MAI1131_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:pinned-8343456bc29d@sha256:8343456bc29d04d0cf8f285d433f73a4a6228d2e5eee1f3119ff0ae14cbef3df
 
 jobs:
   build:
@@ -363,6 +370,20 @@ jobs:
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
+          # Stage 0013, so the next step's diff under crates/ is 0014 alone.
+          git add -- crates/
+
+      - name: Apply the bounce header-block patch, and prove it changed only its own file
+        working-directory: stalwart
+        run: |
+          set -eu
+          P=../patch/patches/0014-bounces-return-the-whole-header-block.patch
+          git apply --check "$P" && git apply "$P"
+          got=$(git diff --name-only | sort | tr '\n' ' ')
+          [ "$got" = "crates/smtp/src/queue/dsn.rs " ] \
+            || { echo "::error::changed files: $got"; exit 1; }
+          diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
+            || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
 
       - name: Swap, as Stalwart's own CI adds for its release build
         run: |
@@ -388,7 +409,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ env.STALWART_TAG }}-${{ env.VARIANT }}
-            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with tenant-scoped sharing (JMAP, IMAP, WebDAV), scanned, capped file writes, expired bans replaced, account writes within the caller's grant, admin verbs without impersonate, no logo on calendar mail, and a server-wide cap on large uploads and messages, and a bounded spam-filter text analysis, and a two-step code accepted once, and bounces returning the original's headers as text/rfc822-headers
+            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with tenant-scoped sharing (JMAP, IMAP, WebDAV), scanned, capped file writes, expired bans replaced, account writes within the caller's grant, admin verbs without impersonate, no logo on calendar mail, and a server-wide cap on large uploads and messages, and a bounded spam-filter text analysis, and a two-step code accepted once, and bounces returning the original's headers as text/rfc822-headers, up to 64 KiB, a byte that is not UTF-8 replaced
             org.opencontainers.image.licenses=AGPL-3.0-only
           cache-from: type=gha
           # Only main writes the cache: a pull request reads main's, and a Rust build cache written per
@@ -495,7 +516,7 @@ jobs:
             'PASS [valkey] every control passes' \
             'PASS [valkey] control: the in-memory store is Valkey'
 
-      - name: A bounce returns the original's headers as text/rfc822-headers, byte for byte, 7bit or 8bit, a lone CR ended as a line (end to end, the built image)
+      - name: A bounce returns the original's headers as text/rfc822-headers, byte for byte, 7bit or 8bit, a lone CR ended as a line, past 4 KiB up to 64 KiB (end to end, the built image)
         run: bash patch/scripts/e2e-dsn-headers.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
 
       - name: The same check FAILS on the last image before 0013, on the part's type and encoding, and its controls PASS there
@@ -512,6 +533,24 @@ jobs:
             'FAIL the lonecr bounce returns the headers as text/rfc822-headers, not message/rfc822' \
             'FAIL the lonecr bounce ends a lone CR as a line: every CR and LF in its 7bit part is a CRLF' \
             "PASS control: the lonecr bounce's third part carries the original's Message-ID"
+
+      - name: The same check FAILS on the last image before 0014, on the headers past 4 KiB and a byte that is not UTF-8, and its controls PASS there
+        run: |
+          bash patch/scripts/previous-must-fail.sh "${MAI1131_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-dsn-headers.sh \
+            "PASS setup: the gmail original's From, Subject and Message-ID start past byte 4096 of its headers" \
+            "PASS control: the gmail bounce's third part starts with the original's first header" \
+            "FAIL the gmail bounce returns the original's From, Subject and Message-ID" \
+            'FAIL the gmail bounce returns every header byte for byte, in 7bit' \
+            "PASS setup: the big original's From, Subject and Message-ID start past byte 4096 of its headers" \
+            "PASS control: the big bounce's third part starts with the original's first header" \
+            "FAIL the big bounce returns the original's From, Subject and Message-ID" \
+            'FAIL the big bounce returns every header byte for byte, in 7bit' \
+            "PASS control: the huge bounce's third part carries the original's Message-ID" \
+            'FAIL the huge bounce returns its headers up to the 64 KiB cap, cut at a whole line' \
+            "PASS control: the latin1 bounce reports its own recipient" \
+            'FAIL the latin1 bounce returns its headers, the byte that is not UTF-8 replaced, in 8bit' \
+            'PASS the ascii bounce returns every header byte for byte, in 7bit' \
+            'PASS the lonecr bounce ends a lone CR as a line: every CR and LF in its 7bit part is a CRLF'
 
       # ⛔ The release tag is pushed only from main (a push, or a dispatch on main). A dispatch from any
       # other branch pushes the same tested image under branch-<short sha> alone, never the release tag,
