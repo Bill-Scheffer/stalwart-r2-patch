@@ -70,7 +70,7 @@ docker run -d --name "$C" --network "$NET" --network-alias stalwart --hostname m
   -v "$W/etc:/etc/stalwart" -v "$W/data:/var/lib/stalwart" "$IMG" >/dev/null
 docker run -d --name "$K" --network "$NET" -e ADMIN="$ADMIN" python:3.12-alpine sleep 900 >/dev/null
 docker exec -i "$K" python3 - <<'PY'
-import base64,email,json,os,secrets,sys,time,urllib.request,urllib.error
+import base64,email,json,os,quopri,secrets,sys,time,urllib.request,urllib.error
 B="http://stalwart:8080"; fails=[]
 for _ in range(90):
     try: urllib.request.urlopen(B+"/healthz/ready",timeout=2); break
@@ -94,15 +94,21 @@ r1(ADM,["x:Account/set",{"accountId":A,"create":{"c":{"@type":"User","name":"org
 ORG=basic("org@one.test",PW); ACC=json.loads(req("/jmap/session",ORG)[1])["primaryAccounts"]["urn:ietf:params:jmap:mail"]
 drafts=[m["id"] for m in r1(ORG,["Mailbox/get",{"accountId":ACC},"m"])[1]["list"] if m.get("role")=="drafts"][0]
 ident=r1(ORG,["Identity/set",{"accountId":ACC,"create":{"i":{"name":"Org","email":"org@one.test"}}},"i"])[1]["created"]["i"]["id"]
-# Two originals: ASCII, with a header line past 77 characters (upstream quoted-printable-encodes the part then) and a
-# multipart Content-Type (SES then needs a boundary the part lacks); and one whose Subject is raw UTF-8.
+# Four originals: ASCII, with a header line past 77 characters (upstream quoted-printable-encodes the part then) and a
+# multipart Content-Type (SES then needs a boundary the part lacks); one whose Subject is raw UTF-8; one with a header
+# line past 998 octets, which neither 7bit nor 8bit may carry, so mail-builder encodes it; and one with a lone CR, which
+# 7bit may not carry either and which mail-builder passes through as 7bit (upstream's bounce does, measured), so 0013
+# ends it as a line.
 LONG="X-Long: "+"-".join(f"word{i}" for i in range(30))
-def original(tag,subject):
+LONGLINE="X-Very-Long: "+"y"*1000
+LONECR="X-Odd: a lone\rCR"
+def original(tag,subject,extra=LONG):
     return ("From: Org <org@one.test>\r\nTo: <nobody@two.test>\r\n"+f"Subject: {subject}\r\n"
             +"Date: Tue, 21 Oct 2026 12:00:00 +0000\r\n"+f"Message-ID: <e2e-dsn-{tag}@one.test>\r\n"
-            +LONG+"\r\nMIME-Version: 1.0\r\n"+'Content-Type: multipart/alternative; boundary="=_e2e"\r\n\r\n'
+            +extra+"\r\nMIME-Version: 1.0\r\n"+'Content-Type: multipart/alternative; boundary="=_e2e"\r\n\r\n'
             +'--=_e2e\r\nContent-Type: text/plain; charset="utf-8"\r\n\r\nhello\r\n--=_e2e--\r\n').encode()
-SENT={"ascii":original("ascii","an outside recipient that does not exist"),"utf8":original("utf8","Grüße, ein Empfänger, den es nicht gibt")}
+SENT={"ascii":original("ascii","an outside recipient that does not exist"),"utf8":original("utf8","Grüße, ein Empfänger, den es nicht gibt"),
+      "longline":original("longline","a header line past 998 octets",LONGLINE),"lonecr":original("lonecr","a lone CR",LONECR)}
 for tag,raw in SENT.items():
     _,b=req(f"/jmap/upload/{ACC}/",ORG,raw,"message/rfc822")
     blob=json.loads(b)["blobId"]
@@ -141,11 +147,18 @@ for tag,sent in SENT.items():
     part=parts[2] if len(parts)>2 else email.message.Message()
     ctype,cte=part.get_content_type(),(part.get("Content-Transfer-Encoding") or "").lower()
     headers=sent.split(b"\r\n\r\n",1)[0]
-    # A control: whatever the encoding, the part carries the original's Message-ID (upstream's too, once decoded).
-    decoded=body.replace(b"=\r\n",b"")
+    # A control: whatever the encoding, the part carries the original's Message-ID once decoded (upstream's too: the email
+    # package does not decode a message/* part, so its quoted-printable is decoded here).
+    decoded=quopri.decodestring(body) if part.get_content_maintype()=="message" else (part.get_payload(decode=True) or b"")
     check(f"<e2e-dsn-{tag}@one.test>".encode() in decoded, f"control: the {tag} bounce's third part carries the original's Message-ID")
-    want="8bit" if tag=="utf8" else "7bit"
     check(ctype=="text/rfc822-headers", f"the {tag} bounce returns the headers as text/rfc822-headers, not message/rfc822", ctype)
-    check(cte==want and headers in body, f"the {tag} bounce returns every header byte for byte, in {want}", cte)
+    if tag=="longline":
+        check(cte in ("quoted-printable","base64") and b"y"*1000 in decoded, "the longline bounce leaves a line past 998 octets to mail-builder's encoding, and decodes to it", cte)
+    elif tag=="lonecr":
+        paired=body.count(b"\r")==body.count(b"\r\n")==body.count(b"\n")
+        check(cte=="7bit" and paired and b"X-Odd: a lone\r\nCR\r\n" in body, "the lonecr bounce ends a lone CR as a line: every CR and LF in its 7bit part is a CRLF", cte)
+    else:
+        want="8bit" if tag=="utf8" else "7bit"
+        check(cte==want and headers in body, f"the {tag} bounce returns every header byte for byte, in {want}", cte)
 print("RESULT", "fail" if fails else "pass", len(fails)); sys.exit(1 if fails else 0)
 PY

@@ -495,7 +495,7 @@ jobs:
             'PASS [valkey] every control passes' \
             'PASS [valkey] control: the in-memory store is Valkey'
 
-      - name: A bounce returns the original's headers as text/rfc822-headers, byte for byte, 7bit or 8bit (end to end, the built image)
+      - name: A bounce returns the original's headers as text/rfc822-headers, byte for byte, 7bit or 8bit, a lone CR ended as a line (end to end, the built image)
         run: bash patch/scripts/e2e-dsn-headers.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
 
       - name: The same check FAILS on the last image before 0013, on the part's type and encoding, and its controls PASS there
@@ -506,7 +506,12 @@ jobs:
             "PASS control: the ascii bounce's third part carries the original's Message-ID" \
             'FAIL the utf8 bounce returns the headers as text/rfc822-headers, not message/rfc822' \
             'FAIL the utf8 bounce returns every header byte for byte, in 8bit' \
-            "PASS control: the utf8 bounce's third part carries the original's Message-ID"
+            "PASS control: the utf8 bounce's third part carries the original's Message-ID" \
+            'FAIL the longline bounce returns the headers as text/rfc822-headers, not message/rfc822' \
+            "PASS control: the longline bounce's third part carries the original's Message-ID" \
+            'FAIL the lonecr bounce returns the headers as text/rfc822-headers, not message/rfc822' \
+            'FAIL the lonecr bounce ends a lone CR as a line: every CR and LF in its 7bit part is a CRLF' \
+            "PASS control: the lonecr bounce's third part carries the original's Message-ID"
 
       # ⛔ The release tag is pushed only from main (a push, or a dispatch on main). A dispatch from any
       # other branch pushes the same tested image under branch-<short sha> alone, never the release tag,

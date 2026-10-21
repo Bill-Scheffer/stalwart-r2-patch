@@ -340,16 +340,20 @@ Content-Type names a multipart has no body and no boundary. It accepted `text/rf
 header arrived byte for byte.
 
 [`patches/0013-bounces-return-headers-as-text-rfc822-headers.patch`](patches/0013-bounces-return-headers-as-text-rfc822-headers.patch)
-sends RFC 6522's `text/rfc822-headers` instead: 7bit, or 8bit when a header carries raw UTF-8, with CRLF line endings,
-so the headers arrive as written. A line past SMTP's 998 octets (a header that long is itself out of spec) is left to
-mail-builder to encode. The first two parts, and which headers are returned (up to 4 KiB), are upstream's.
-[`scripts/e2e-dsn-headers.sh`](scripts/e2e-dsn-headers.sh) bounces two real messages: they are submitted to an
+sends RFC 6522's `text/rfc822-headers` instead: 7bit, or 8bit when a header carries raw UTF-8, so the headers arrive as
+written. Neither may carry a lone CR or LF or a NUL, and mail-builder passes those through as 7bit (upstream's bounce of
+a header with a lone CR went out so, measured), so every line ends in CRLF, a lone CR included, and NULs are dropped. A
+line past SMTP's 998 octets (a header that long is itself out of spec) is left to mail-builder to encode. The first
+two parts, and which headers are returned (up to 4 KiB), are upstream's. ⚠️ Only the 7bit shape was measured through
+real SES (MAI-1036); an 8bit one goes out without `BODY=8BITMIME`, as Stalwart sends all 8bit mail.
+[`scripts/e2e-dsn-headers.sh`](scripts/e2e-dsn-headers.sh) bounces four real messages: they are submitted to an
 outside domain whose MX, a stub on an internal network found through a DNS stub, refuses the recipient with 550. One is
-ASCII, with a header line past 77 characters and a multipart Content-Type; the other has a raw UTF-8 Subject. The
-script checks that each bounce's third part is `text/rfc822-headers`, in 7bit and 8bit respectively, and holds the
-original's headers byte for byte. Against production's image before it (MAI-997's branch build) all four checks FAIL
-(`message/rfc822`, quoted-printable), while its controls, that the bounce arrives and its third part carries the
-original's Message-ID once decoded, pass (measured). The build requires both.
+ASCII, with a header line past 77 characters and a multipart Content-Type; one has a raw UTF-8 Subject; one a header
+line past 998 octets; one a lone CR. Each bounce's third part must be `text/rfc822-headers`: the first two in 7bit and
+8bit holding the original's headers byte for byte, the third encoded by mail-builder, the fourth in 7bit with every CR
+and LF a CRLF. Against production's image before it (MAI-997's branch build) seven checks FAIL (`message/rfc822`,
+quoted-printable, and the lone CR sent raw in 7bit), while its controls, that each bounce arrives and its third part
+carries the original's Message-ID once decoded, pass (measured). The build requires both.
 
 Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1-textcap1-totponce1-dsnhdrs1`.
 
