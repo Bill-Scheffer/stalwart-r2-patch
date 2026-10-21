@@ -1,7 +1,8 @@
 # Builds Stalwart from its own release source with TWELVE changes, each pinned to its exact files:
-# 1. the rust-s3 crate is taken from the commit of rust-s3 PR #467, which stops DeleteObject signing
-#    headers it never sends. Without it, every blob DELETE against Cloudflare R2 fails with
-#    SignatureDoesNotMatch (rust-s3 #466, Stalwart #3185).
+# 1. (retired) rust-s3 used to be taken from the commit of rust-s3 PR #467, which stops DeleteObject signing
+#    headers it never sends; without it every blob DELETE against Cloudflare R2 failed with SignatureDoesNotMatch
+#    (rust-s3 #466, Stalwart #3185). rust-s3 0.38.0 carries the fix (6c97cb9) and Stalwart v0.16.26 moved to it,
+#    so the build now only asserts the lock still names it.
 # 2. patches/0002-tenant-scoped-sharing.patch: a JMAP `shareWith` or IMAP `SETACL` may only name an
 #    account in the caller's own tenant, as the JMAP directory already requires.
 #    Upstream v0.16.24 accepts any account on the server, so one customer could share with another.
@@ -42,6 +43,9 @@
 #    confirm a password or two-step change. Upstream keeps no record, so the same code signed in again until its window
 #    closed (measured, MAI-989/MAI-997; RFC 6238 § 5.2). The mark is per account and time step, in the in-memory store
 #    every node shares, set with SET NX.
+# 13. patches/0013-bounces-return-headers-as-text-rfc822-headers.patch: a bounce returns the original's headers as
+#    text/rfc822-headers (RFC 6522), 7bit or 8bit, not as message/rfc822. Amazon SES parses a message/rfc822 part as a
+#    whole message and refused Stalwart's header-only one (554, measured through real SES, MainThrive MAI-1036).
 # Everything else is upstream: the tag's source, its Dockerfile, its features.
 # The release tag is pushed only from main; a dispatch from another branch pushes branch-<short sha>
 # instead, and a pull request runs every step but the registry login and the push (MAI-1019). A release tag is
@@ -73,14 +77,13 @@ concurrency:
 
 env:
   # Upstream Stalwart release, pinned by commit: a tag can move, a commit cannot.
-  STALWART_TAG: v0.16.25
-  STALWART_SHA: 3f657330c0f49a015a3a372fb59669b5cccbca6d
-  # rust-s3 PR #467 (https://github.com/durch/rust-s3/pull/467): master at 0.37.2 plus one commit.
-  RUSTS3_GIT: https://github.com/Databanx/rust-s3
-  RUSTS3_REV: 505aded53d2e668bad472bd7834019e8b1f7a4dd
+  STALWART_TAG: v0.16.27
+  STALWART_SHA: aa47d8ef7bfba7200d3293198ac2592747b20e73
+  # The first rust-s3 release whose DeleteObject signs no header it never sends (6c97cb9, rust-s3 #466).
+  RUSTS3_VERSION: 0.38.0
   IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch
   # The tag after the Stalwart release: bump it with any change to what is built.
-  VARIANT: rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1-textcap1-totponce1
+  VARIANT: tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1-textcap1-totponce1-dsnhdrs1
   # A FIXED image that HAS the expired-ban bug (the last build before 0006), which the ban-expiry check must FAIL
   # on the bug's own line: that proves the check can fail. ⛔ NEVER bumped with releases: every build after 0006
   # lacks the bug and PASSES the check, so it could never be the reference. Pinned by tag AND digest, because a tag
@@ -98,6 +101,10 @@ env:
   # The same for 0012: the last build before it (production's image until then), which the two-step check must FAIL on
   # each reuse, and pass on its controls. ⛔ NEVER bumped, for the same reason. Pinned by its pinned- tag's digest.
   MAI997_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:pinned-bee5bddff49d@sha256:bee5bddff49d91a8acec978b85f93541fd91dcf8eccc4d7d8caa326d61e635d0
+  # The same for 0013: the last build before it (production's image until then), which the bounce check must FAIL on the
+  # returned part's type and encoding, and pass on its controls. ⛔ NEVER bumped, for the same reason. Pinned by the tag
+  # that names that digest: production ran MAI-997's branch build, not the release tag's.
+  MAI1127_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:branch-a88e016@sha256:dabddb17455449a4eabc0578ee1ecaddda166b93cadc27355cc001dad7c10e5b
 
 jobs:
   build:
@@ -166,32 +173,19 @@ jobs:
           echo "${tag} already names ${digest}, built from ${rev}; nothing that goes into the image changed, so it is not re-pushed"
           echo publish=false >> "$GITHUB_OUTPUT"
 
-      - name: Pin rust-s3 to the PR commit, and prove nothing else moved
+      # The R2 DELETE fix is upstream's own now: rust-s3 0.38.0 from crates.io, which Stalwart's lock names. If a later
+      # release moves rust-s3, this fails, and whether the new version still signs DELETE correctly is checked then.
+      - name: rust-s3 is the release carrying the R2 DELETE fix, and the checkout is upstream's, untouched
         working-directory: stalwart
         run: |
           set -eu
-          printf '\n[patch.crates-io]\nrust-s3 = { git = "%s", rev = "%s" }\n' "$RUSTS3_GIT" "$RUSTS3_REV" >> Cargo.toml
-          # ⛔ Edit rust-s3's lock entry by hand, NEVER `cargo update -p rust-s3`: that re-resolves and
-          # rewires unrelated edges (measured at v0.16.24: quinn's socket2 0.6.5 -> 0.5.10, and a
-          # thiserror 2 -> 1), so the build would differ from upstream in more than the fix.
-          python3 - "$RUSTS3_GIT" "$RUSTS3_REV" <<'PY'
-          import re, sys
-          git, rev = sys.argv[1], sys.argv[2]
+          got=$(python3 -c '
+          import re
           s = open("Cargo.lock").read()
-          pat = re.compile(r'(\[\[package\]\]\nname = "rust-s3"\nversion = "0\.37\.2"\n)source = "registry\+https://github\.com/rust-lang/crates\.io-index"\nchecksum = "[0-9a-f]+"\n')
-          new, n = pat.subn(lambda m: f'{m.group(1)}source = "git+{git}?rev={rev}#{rev}"\n', s)
-          assert n == 1, f"expected exactly one rust-s3 0.37.2 registry entry, found {n}"
-          open("Cargo.lock", "w").write(new)
-          PY
-          echo "::group::git diff"; git diff; echo "::endgroup::"
-          # The EXACT change set: two files, and in Cargo.lock only rust-s3's source and checksum.
-          [ "$(git diff --name-only | sort | tr '\n' ' ')" = "Cargo.lock Cargo.toml " ] || { echo "::error::unexpected files changed"; exit 1; }
-          got=$(git diff -U0 Cargo.lock | grep -E '^[-+][^-+]' | sed -E 's/^(-checksum = ).*/\1<sum>/')
-          want=$(printf '%s\n' '-source = "registry+https://github.com/rust-lang/crates.io-index"' '-checksum = <sum>' "+source = \"git+${RUSTS3_GIT}?rev=${RUSTS3_REV}#${RUSTS3_REV}\"")
-          [ "$got" = "$want" ] || { echo "::error::Cargo.lock changed beyond rust-s3's source"; echo "$got"; exit 1; }
-          # And cargo accepts it as-is, so the Docker build will not re-resolve anything.
-          cargo metadata --locked --format-version 1 >/dev/null
-          [ "$(git diff --numstat Cargo.lock | cut -f1,2)" = "$(printf '1\t2')" ] || { echo "::error::cargo rewrote Cargo.lock"; exit 1; }
+          print(" ".join(f"{v}|{src}" for v, src in re.findall(r"\[\[package\]\]\nname = \"rust-s3\"\nversion = \"([^\"]+)\"\nsource = \"([^\"]+)\"", s)))')
+          [ "$got" = "${RUSTS3_VERSION}|registry+https://github.com/rust-lang/crates.io-index" ] \
+            || { echo "::error::Cargo.lock's rust-s3 is '${got}', not ${RUSTS3_VERSION} from crates.io"; exit 1; }
+          [ -z "$(git status --porcelain)" ] || { echo "::error::the checkout is not upstream's commit as tagged"; git status --porcelain; exit 1; }
 
       - name: Apply the tenant-scoped sharing patch, and prove it changed only its own files
         working-directory: stalwart
@@ -199,7 +193,7 @@ jobs:
           set -eu
           P=../patch/patches/0002-tenant-scoped-sharing.patch
           git apply --check "$P" && git apply "$P"
-          want="Cargo.lock Cargo.toml crates/imap/src/op/acl.rs crates/jmap/src/addressbook/set.rs crates/jmap/src/api/acl.rs crates/jmap/src/calendar/set.rs crates/jmap/src/file/copy.rs crates/jmap/src/file/set.rs crates/jmap/src/mailbox/set.rs "
+          want="crates/imap/src/op/acl.rs crates/jmap/src/addressbook/set.rs crates/jmap/src/api/acl.rs crates/jmap/src/calendar/set.rs crates/jmap/src/file/copy.rs crates/jmap/src/file/set.rs crates/jmap/src/mailbox/set.rs "
           got=$(git diff --name-only | sort | tr '\n' ' ')
           [ "$got" = "$want" ] || { echo "::error::changed files: $got"; exit 1; }
           # The source change is the patch, byte for byte (index lines aside).
@@ -214,9 +208,9 @@ jobs:
           set -eu
           P=../patch/patches/0003-tenant-scoped-dav-acl.patch
           git apply --check "$P" && git apply "$P"
-          # Unstaged: rust-s3's two files (never staged) and 0003's one, nothing else.
+          # Unstaged: 0003's one file, nothing else.
           got=$(git diff --name-only | sort | tr '\n' ' ')
-          [ "$got" = "Cargo.lock Cargo.toml crates/dav/src/common/acl.rs " ] \
+          [ "$got" = "crates/dav/src/common/acl.rs " ] \
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
@@ -232,7 +226,7 @@ jobs:
           # Its one new file is untracked until marked, and the diff below must see it.
           git add -N -- crates/common/src/file_scan.rs
           got=$(git diff --name-only | sort | tr '\n' ' ')
-          [ "$got" = "Cargo.lock Cargo.toml crates/common/src/file_scan.rs crates/common/src/lib.rs crates/dav/src/file/update.rs crates/jmap/src/file/copy.rs crates/jmap/src/file/set.rs " ] \
+          [ "$got" = "crates/common/src/file_scan.rs crates/common/src/lib.rs crates/dav/src/file/update.rs crates/jmap/src/file/copy.rs crates/jmap/src/file/set.rs " ] \
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
@@ -246,7 +240,7 @@ jobs:
           P=../patch/patches/0005-mail-written-into-a-mailbox-scanned.patch
           git apply --check "$P" && git apply "$P"
           got=$(git diff --name-only | sort | tr '\n' ' ')
-          [ "$got" = "Cargo.lock Cargo.toml crates/email/src/message/ingest.rs crates/imap/src/op/append.rs crates/jmap/src/email/set.rs " ] \
+          [ "$got" = "crates/email/src/message/ingest.rs crates/imap/src/op/append.rs crates/jmap/src/email/set.rs " ] \
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
@@ -260,7 +254,7 @@ jobs:
           P=../patch/patches/0006-expired-ban-replaced.patch
           git apply --check "$P" && git apply "$P"
           got=$(git diff --name-only | sort | tr '\n' ' ')
-          [ "$got" = "Cargo.lock Cargo.toml crates/common/src/cache/reload.rs crates/common/src/network/security.rs " ] \
+          [ "$got" = "crates/common/src/cache/reload.rs crates/common/src/network/security.rs " ] \
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
@@ -274,7 +268,7 @@ jobs:
           P=../patch/patches/0007-account-writes-within-the-callers-grant.patch
           git apply --check "$P" && git apply "$P"
           got=$(git diff --name-only | sort | tr '\n' ' ')
-          [ "$got" = "Cargo.lock Cargo.toml crates/jmap/src/registry/mapping/principal.rs crates/jmap/src/registry/set.rs " ] \
+          [ "$got" = "crates/jmap/src/registry/mapping/principal.rs crates/jmap/src/registry/set.rs " ] \
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
@@ -288,7 +282,7 @@ jobs:
           P=../patch/patches/0008-admin-verbs-without-impersonate.patch
           git apply --check "$P" && git apply "$P"
           got=$(git diff --name-only | sort | tr '\n' ' ')
-          [ "$got" = "Cargo.lock Cargo.toml crates/common/src/auth/permissions.rs crates/jmap/src/api/request.rs crates/jmap/src/blob/download.rs " ] \
+          [ "$got" = "crates/common/src/auth/permissions.rs crates/jmap/src/api/request.rs crates/jmap/src/blob/download.rs " ] \
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
@@ -303,7 +297,7 @@ jobs:
           git apply --check "$P" && git apply "$P"
           got=$(git diff --name-only | sort | tr '\n' ' ')
           T=resources/html-templates
-          [ "$got" = "Cargo.lock Cargo.toml crates/services/src/task_manager/alarm.rs crates/services/src/task_manager/imip.rs $T/calendar-alarm.html $T/calendar-alarm.html.min $T/calendar-invite.html $T/calendar-invite.html.min $T/calendar-rsvp.html $T/calendar-rsvp.html.min $T/calendar-rsvp.html.min.gz " ] \
+          [ "$got" = "crates/services/src/task_manager/alarm.rs crates/services/src/task_manager/imip.rs $T/calendar-alarm.html $T/calendar-alarm.html.min $T/calendar-invite.html $T/calendar-invite.html.min $T/calendar-rsvp.html $T/calendar-rsvp.html.min $T/calendar-rsvp.html.min.gz " ] \
             || { echo "::error::changed files: $got"; exit 1; }
           # Binary too: the RSVP page is served from its .min.gz.
           diff <(git diff --binary -- crates/ resources/ | grep -v '^index ') <(grep -v '^index ' "$P") \
@@ -323,7 +317,7 @@ jobs:
           # Its one new file is untracked until marked, and the diff below must see it.
           git add -N -- crates/utils/src/in_flight.rs
           got=$(git diff --name-only | sort | tr '\n' ' ')
-          [ "$got" = "Cargo.lock Cargo.toml crates/dav/src/request.rs crates/http-proto/Cargo.toml crates/http-proto/src/request.rs crates/http/src/request.rs crates/imap-proto/src/parser/mod.rs crates/imap-proto/src/receiver.rs crates/imap/src/core/client.rs crates/imap/src/op/append.rs crates/main/src/main.rs crates/smtp/src/core/mod.rs crates/smtp/src/inbound/session.rs crates/utils/src/in_flight.rs crates/utils/src/lib.rs " ] \
+          [ "$got" = "crates/dav/src/request.rs crates/http-proto/Cargo.toml crates/http-proto/src/request.rs crates/http/src/request.rs crates/imap-proto/src/parser/mod.rs crates/imap-proto/src/receiver.rs crates/imap/src/core/client.rs crates/imap/src/op/append.rs crates/main/src/main.rs crates/smtp/src/core/mod.rs crates/smtp/src/inbound/session.rs crates/utils/src/in_flight.rs crates/utils/src/lib.rs " ] \
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
@@ -337,7 +331,7 @@ jobs:
           P=../patch/patches/0011-spam-filter-analyses-a-bounded-start-of-each-text.patch
           git apply --check "$P" && git apply "$P"
           got=$(git diff --name-only | sort | tr '\n' ' ')
-          [ "$got" = "Cargo.lock Cargo.toml crates/spam-filter/src/analysis/init.rs " ] \
+          [ "$got" = "crates/spam-filter/src/analysis/init.rs " ] \
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
@@ -351,7 +345,21 @@ jobs:
           P=../patch/patches/0012-a-two-step-code-is-accepted-once.patch
           git apply --check "$P" && git apply "$P"
           got=$(git diff --name-only | sort | tr '\n' ' ')
-          [ "$got" = "Cargo.lock Cargo.toml crates/common/src/auth/authentication.rs crates/common/src/lib.rs crates/directory/src/core/secret.rs crates/jmap/src/registry/mapping/account.rs " ] \
+          [ "$got" = "crates/common/src/auth/authentication.rs crates/common/src/lib.rs crates/directory/src/core/secret.rs crates/jmap/src/registry/mapping/account.rs " ] \
+            || { echo "::error::changed files: $got"; exit 1; }
+          diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
+            || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
+          # Stage 0012, so the next step's diff under crates/ is 0013 alone.
+          git add -- crates/
+
+      - name: Apply the bounce returned-headers patch, and prove it changed only its own file
+        working-directory: stalwart
+        run: |
+          set -eu
+          P=../patch/patches/0013-bounces-return-headers-as-text-rfc822-headers.patch
+          git apply --check "$P" && git apply "$P"
+          got=$(git diff --name-only | sort | tr '\n' ' ')
+          [ "$got" = "crates/smtp/src/queue/dsn.rs " ] \
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
@@ -380,7 +388,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ env.STALWART_TAG }}-${{ env.VARIANT }}
-            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with rust-s3 PR 467 (R2 DeleteObject fix) tenant-scoped sharing (JMAP, IMAP, WebDAV), scanned, capped file writes, expired bans replaced, account writes within the caller's grant, admin verbs without impersonate, no logo on calendar mail, and a server-wide cap on large uploads and messages, and a bounded spam-filter text analysis, and a two-step code accepted once
+            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with tenant-scoped sharing (JMAP, IMAP, WebDAV), scanned, capped file writes, expired bans replaced, account writes within the caller's grant, admin verbs without impersonate, no logo on calendar mail, and a server-wide cap on large uploads and messages, and a bounded spam-filter text analysis, and a two-step code accepted once, and bounces returning the original's headers as text/rfc822-headers
             org.opencontainers.image.licenses=AGPL-3.0-only
           cache-from: type=gha
           # Only main writes the cache: a pull request reads main's, and a Rust build cache written per
@@ -395,6 +403,21 @@ jobs:
           ref="${IMAGE}:${STALWART_TAG}-${VARIANT}"
           docker run --rm "$ref" --help | head -1
           docker run --rm --entrypoint getcap "$ref" /usr/local/bin/stalwart
+
+      # Since v0.16.26 upstream's release builds require an x86-64-v2 CPU and refuse to start without one (.cargo/config.toml
+      # sets target-cpu=x86-64-v2, and main.rs then compiles in a start-up check). Stalwart's Dockerfile sets RUSTFLAGS,
+      # which overrides that config, so this build is baseline x86-64 and runs on any x86-64 VM. Prove it on the binary:
+      # the check's message is absent here and present in upstream's own image, which shows the grep can find it.
+      - name: The built image starts on any x86-64 CPU (no x86-64-v2 start-up check compiled in)
+        run: |
+          set -eu
+          msg='This build of Stalwart requires an x86-64-v2 compatible CPU'
+          has() { docker run --rm --entrypoint grep "$1" -c -a -F "$msg" /usr/local/bin/stalwart || true; }
+          up=$(has "docker.io/stalwartlabs/stalwart:${STALWART_TAG}")
+          [ "${up:-0}" -ge 1 ] || { echo "::error::control: upstream's ${STALWART_TAG} image should carry the check, the grep found '${up}'"; exit 1; }
+          ours=$(has "${IMAGE}:${STALWART_TAG}-${VARIANT}")
+          [ "${ours:-0}" = 0 ] || { echo "::error::the built image carries the x86-64-v2 start-up check"; exit 1; }
+          echo "upstream's image carries the check (${up}); this build does not"
 
       - name: Sharing never crosses tenants (end to end, the built image)
         run: bash patch/scripts/e2e-tenant-sharing.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
@@ -471,6 +494,19 @@ jobs:
             'PASS [valkey] every control passes' \
             'PASS [valkey] control: the in-memory store is Valkey'
 
+      - name: A bounce returns the original's headers as text/rfc822-headers, byte for byte, 7bit or 8bit (end to end, the built image)
+        run: bash patch/scripts/e2e-dsn-headers.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
+
+      - name: The same check FAILS on the last image before 0013, on the part's type and encoding, and its controls PASS there
+        run: |
+          bash patch/scripts/previous-must-fail.sh "${MAI1127_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-dsn-headers.sh \
+            'FAIL the ascii bounce returns the headers as text/rfc822-headers, not message/rfc822' \
+            'FAIL the ascii bounce returns every header byte for byte, in 7bit' \
+            "PASS control: the ascii bounce's third part carries the original's Message-ID" \
+            'FAIL the utf8 bounce returns the headers as text/rfc822-headers, not message/rfc822' \
+            'FAIL the utf8 bounce returns every header byte for byte, in 8bit' \
+            "PASS control: the utf8 bounce's third part carries the original's Message-ID"
+
       # ⛔ The release tag is pushed only from main (a push, or a dispatch on main). A dispatch from any
       # other branch pushes the same tested image under branch-<short sha> alone, never the release tag,
       # so a lane can pin it by digest before merge. A pull request (ref refs/pull/N/merge) never logs in
@@ -505,5 +541,5 @@ jobs:
             echo "- tag: \`${tag}\` (from \`${GITHUB_REF}\` @ \`${GITHUB_SHA}\`)"
             echo "- digest: \`${digest#*@}\`"
             echo "- stalwart: \`${STALWART_TAG}\` @ \`${STALWART_SHA}\`"
-            echo "- rust-s3: \`${RUSTS3_REV}\` (PR #467)"
+            echo "- rust-s3: \`${RUSTS3_VERSION}\` (crates.io)"
           } >> "$GITHUB_STEP_SUMMARY"

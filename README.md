@@ -1,11 +1,13 @@
 # stalwart-r2-patch
 
 [Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **twelve**
-changes: it can delete blobs from **Cloudflare R2**, **sharing never crosses tenants**, stored files
+changes: **sharing never crosses tenants**, stored files
 and mail written into a mailbox are **scanned**, a ban that expired is **enforced again**, a narrow
 key **cannot take over an Admin**, an operator can run **admin verbs on a mailbox without reading
 its mail**, calendar mail carries **no Stalwart logo**, a burst of large uploads or messages is **refused, not an OOM**, the spam filter reads a
-**bounded start** of each message's text, and a two-step code is **accepted once**.
+**bounded start** of each message's text, a two-step code is **accepted once**, and a bounce returns the original's
+headers **as `text/rfc822-headers`**. The first change, deleting blobs from **Cloudflare R2**, is upstream's own since
+v0.16.26 (below).
 
 ## The problem
 
@@ -15,21 +17,30 @@ R2 validates SigV4 strictly, rebuilds a different canonical request, and rejects
 `403 SignatureDoesNotMatch`. Deleted mail then stays in the bucket forever.
 
 - rust-s3 issue: [#466](https://github.com/durch/rust-s3/issues/466)
-- rust-s3 fix, open: [#467](https://github.com/durch/rust-s3/pull/467) (+10 lines, one file)
+- rust-s3 fix: [#467](https://github.com/durch/rust-s3/pull/467) (+10 lines, one file), closed as covered by `6c97cb9`, released in 0.38.0
 - Stalwart issue: [#3185](https://github.com/stalwartlabs/stalwart/issues/3185)
 
 Reproduced on Stalwart v0.16.24 against R2, and the fix confirmed: a client built exactly like
 Stalwart's (`Region::Custom`, path-style) got `403 SignatureDoesNotMatch` with rust-s3 0.37.2 and
 `204` (object gone) with the PR commit.
 
-## The change
+## The change, now upstream's
 
-[`build.yml`](.github/workflows/build.yml) checks out Stalwart at the release **commit**, appends
-one `[patch.crates-io]` entry pointing `rust-s3` at the PR commit, and builds with Stalwart's own
-`Dockerfile` and feature set. The workflow fails unless only `Cargo.toml` and `Cargo.lock` changed,
-`rust-s3` is still version 0.37.2, and no other package moved.
+Up to v0.16.25, [`build.yml`](.github/workflows/build.yml) appended one `[patch.crates-io]` entry pointing `rust-s3`
+at the PR commit (tags `…-rusts3-505aded-…`). rust-s3 closed the PR as covered by its own fix,
+[`6c97cb9`](https://github.com/durch/rust-s3/commit/6c97cb99aa49fe49ecda0c39787b896bf21a6de0) (no generated
+`Content-Length` or `Content-Type` is signed on any bodyless request; DELETE and ranged GET verified against R2), released
+in rust-s3 0.38.0, and Stalwart v0.16.26 moved to 0.38.0. So the build no longer touches `Cargo.toml` or `Cargo.lock`:
+it fails unless the lock names `rust-s3` 0.38.0 from crates.io and the checkout is the release commit, untouched. A
+release that moves rust-s3 again fails that step, and whether the new version still signs DELETE correctly is checked
+then.
 
-Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded`. Pin it by digest.
+⚠️ v0.16.26 also made upstream's own release builds require an x86-64-v2 CPU (`.cargo/config.toml` sets
+`target-cpu=x86-64-v2`, and `main.rs` then compiles in a check that refuses to start without it). This build uses
+Stalwart's `Dockerfile`, whose `RUSTFLAGS` override that config, so it stays baseline x86-64 and starts on any x86-64
+VM. The build checks it on the binary: the check's message is absent from this image and present in upstream's.
+
+Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-<VARIANT>`. Pin it by digest.
 
 ## The second change: sharing stays inside a tenant
 
@@ -42,9 +53,9 @@ everything to the caller's tenant; these two paths did not. This is the open
 
 [`patches/0002-tenant-scoped-sharing.patch`](patches/0002-tenant-scoped-sharing.patch) applies the
 same tenant filter to the grantee in both paths. A grantee outside the tenant is refused exactly
-as an account that does not exist, so it confirms nothing. The workflow applies it after the
-rust-s3 step and fails unless the changed files are exactly rust-s3's two plus the patch's seven,
-and the source diff is the patch, byte for byte.
+as an account that does not exist, so it confirms nothing. The workflow applies it to the release
+commit and fails unless the changed files are exactly the patch's seven, and the source diff is the
+patch, byte for byte.
 
 [`scripts/e2e-tenant-sharing.sh`](scripts/e2e-tenant-sharing.sh) runs the built image (pushed only after every check passes) with two
 tenants and asserts both directions: across tenants, JMAP and IMAP sharing is refused (the IMAP
@@ -318,7 +329,29 @@ code carried by a change refused for a too-short password all still work, and IM
 alone while an app password signs in. Against the last image before it (`MAI997_BUG_REFERENCE_IMAGE`) the three reuse
 checks FAIL and the controls pass (measured), and the build requires both.
 
-Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1-textcap1-totponce1`.
+## The thirteenth change: a bounce returns the original's headers as `text/rfc822-headers`
+
+A bounce (DSN) returns the original message's headers only, never its body, but upstream labels them `message/rfc822`
+and lets mail-builder pick the encoding: quoted-printable whenever a header line is longer than 77 characters, which most
+mail has. A relay that parses a `message/rfc822` part as a whole message refuses that. Amazon SES did, through real SES
+(MainThrive MAI-1036): 554 *"Unbalanced quoted string"* for upstream's shape (a soft line break fell inside a quoted
+boundary), and 554 *"Missing start boundary"* for the same headers in 7bit, since a header-only message whose
+Content-Type names a multipart has no body and no boundary. It accepted `text/rfc822-headers` in 7bit, and every
+header arrived byte for byte.
+
+[`patches/0013-bounces-return-headers-as-text-rfc822-headers.patch`](patches/0013-bounces-return-headers-as-text-rfc822-headers.patch)
+sends RFC 6522's `text/rfc822-headers` instead: 7bit, or 8bit when a header carries raw UTF-8, with CRLF line endings,
+so the headers arrive as written. A line past SMTP's 998 octets (a header that long is itself out of spec) is left to
+mail-builder to encode. The first two parts, and which headers are returned (up to 4 KiB), are upstream's.
+[`scripts/e2e-dsn-headers.sh`](scripts/e2e-dsn-headers.sh) bounces two real messages: they are submitted to an
+outside domain whose MX, a stub on an internal network found through a DNS stub, refuses the recipient with 550. One is
+ASCII, with a header line past 77 characters and a multipart Content-Type; the other has a raw UTF-8 Subject. The
+script checks that each bounce's third part is `text/rfc822-headers`, in 7bit and 8bit respectively, and holds the
+original's headers byte for byte. Against production's image before it (MAI-997's branch build) all four checks FAIL
+(`message/rfc822`, quoted-printable), while its controls, that the bounce arrives and its third part carries the
+original's Message-ID once decoded, pass (measured). The build requires both.
+
+Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1-textcap1-totponce1-dsnhdrs1`.
 
 ## Builds, tags and testing a change before it merges
 
@@ -353,9 +386,9 @@ gh workflow run protect-digest.yml -R Bill-Scheffer/stalwart-r2-patch -f digest=
 
 ## When this goes away
 
-Each change goes away on its own: rust-s3 when a Stalwart release ships a `rust-s3` with the fix,
-the sharing patch when upstream scopes sharing to the tenant (reported upstream). When both are
-upstream, use the upstream image again and archive this repository.
+Each change goes away on its own: rust-s3 did, when Stalwart v0.16.26 shipped `rust-s3` 0.38.0 with the fix; the
+sharing patch goes when upstream scopes sharing to the tenant (reported upstream). When every change is upstream, use
+the upstream image again and archive this repository.
 
 ## Licence
 
