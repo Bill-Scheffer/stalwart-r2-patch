@@ -104,11 +104,12 @@ ident=r1(ORG,["Identity/set",{"accountId":ACC,"create":{"i":{"name":"Org","email
 LONG="X-Long: "+"-".join(f"word{i}" for i in range(30))
 LONGLINE="X-Very-Long: "+"y"*1000
 LONECR="X-Odd: a lone\rCR"
+BODY=('Content-Type: multipart/alternative; boundary="=_e2e"\r\n\r\n'
+      +'--=_e2e\r\nContent-Type: text/plain; charset="utf-8"\r\n\r\nhello\r\n--=_e2e--\r\n')
 def original(tag,subject,extra=LONG):
     return ("From: Org <org@one.test>\r\nTo: <nobody@two.test>\r\n"+f"Subject: {subject}\r\n"
             +"Date: Tue, 21 Oct 2026 12:00:00 +0000\r\n"+f"Message-ID: <e2e-dsn-{tag}@one.test>\r\n"
-            +extra+"\r\nMIME-Version: 1.0\r\n"+'Content-Type: multipart/alternative; boundary="=_e2e"\r\n\r\n'
-            +'--=_e2e\r\nContent-Type: text/plain; charset="utf-8"\r\n\r\nhello\r\n--=_e2e--\r\n').encode()
+            +extra+"\r\nMIME-Version: 1.0\r\n"+BODY).encode()
 SENT={"ascii":original("ascii","an outside recipient that does not exist"),"utf8":original("utf8","Grüße, ein Empfänger, den es nicht gibt"),
       "longline":original("longline","a header line past 998 octets",LONGLINE),"lonecr":original("lonecr","a lone CR",LONECR)}
 # Three more, whose identifying headers come after the first 4096 bytes, where upstream's read stopped (MAI-1131).
@@ -167,16 +168,22 @@ def gmail():
         +fold("X-Received","by 2002:a05:600c:3b15:b0:471:15c0:9e4b with SMTP id 5b1f17b1804b1-47117f92e2fmr6372845e9.27.1792616886742;"
               " Tue, 21 Oct 2026 14:08:06 -0700 (PDT)")
         +identifying("gmail","a full-size Gmail original"))
-def body(): return ('Content-Type: multipart/alternative; boundary="=_e2e"\r\n\r\n'
-                    +'--=_e2e\r\nContent-Type: text/plain; charset="utf-8"\r\n\r\nhello\r\n--=_e2e--\r\n')
-SENT["gmail"]=(gmail()+body()).encode()
+SENT["gmail"]=(gmail()+BODY).encode()
 SENT["big"]=(trace("big")+"".join(f"X-Pad-{i:02d}: "+"p"*90+"\r\n" for i in range(50))
-             +identifying("big","more than 4 KiB of headers before this one")+body()).encode()
+             +identifying("big","more than 4 KiB of headers before this one")+BODY).encode()
 PAD=lambda i: f"X-Pad-{i:04d}: "+"z"*900
-SENT["huge"]=(identifying("huge","headers past the 64 KiB cap")+"".join(PAD(i)+"\r\n" for i in range(80))+body()).encode()
-for tag in ("gmail","big"):
+SENT["huge"]=(identifying("huge","headers past the 64 KiB cap")+"".join(PAD(i)+"\r\n" for i in range(80))+BODY).encode()
+DEEP=("gmail","big")
+IDS=(b"From",b"Subject",b"Message-ID")
+def header_line(headers,name): return re.search(rb"^"+name+rb":.*$",headers,re.M)
+# "latin1" carries a header byte that is not UTF-8, which upstream turned into an EMPTY part (String::from_utf8, or nothing).
+# 0014 replaces the byte and returns the rest. An empty part carries no id to match its bounce by, so it goes to its own
+# recipient, which the bounce's delivery-status names.
+SENT["latin1"]=original("latin1","a header byte that is not UTF-8","X-Legacy: cafe").replace(b"X-Legacy: cafe",b"X-Legacy: caf\xe9")
+RCPT=lambda tag: f"nobody-{tag}@two.test" if tag=="latin1" else "nobody@two.test"
+for tag in DEEP:
     hb=SENT[tag].split(b"\r\n\r\n",1)[0]
-    check(hb.index(b"Message-ID:")>4096 and hb.index(b"From:")>4096 and hb.index(b"Subject:")>4096,
+    check(all(header_line(hb,n).start()>4096 for n in IDS),
           f"setup: the {tag} original's From, Subject and Message-ID start past byte 4096 of its headers", len(hb))
 for tag,raw in SENT.items():
     _,b=req(f"/jmap/upload/{ACC}/",ORG,raw,"message/rfc822")
@@ -184,17 +191,18 @@ for tag,raw in SENT.items():
     r=r1(ORG,["Email/import",{"accountId":ACC,"emails":{"e":{"blobId":blob,"mailboxIds":{drafts:True},"keywords":{"$draft":True}}}},"e"])[1]
     eid=(r.get("created") or {}).get("e",{}).get("id")
     r=r1(ORG,["EmailSubmission/set",{"accountId":ACC,"create":{"s":{"identityId":ident,"emailId":eid,
-        "envelope":{"mailFrom":{"email":"org@one.test"},"rcptTo":[{"email":"nobody@two.test"}]}}}},"s"])[1]
-    check("s" in (r.get("created") or {}), f"setup: the {tag} original is submitted to nobody@two.test", r.get("notCreated",""))
+        "envelope":{"mailFrom":{"email":"org@one.test"},"rcptTo":[{"email":RCPT(tag)}]}}}},"s"])[1]
+    check("s" in (r.get("created") or {}), f"setup: the {tag} original is submitted to {RCPT(tag)}", r.get("notCreated",""))
 def bounces():
     found={}
     for i in r1(ORG,["Email/query",{"accountId":ACC},"q"])[1].get("ids",[]):
         g=r1(ORG,["Email/get",{"accountId":ACC,"ids":[i],"properties":["blobId"]},"g"])[1]["list"][0]
         raw=req(f"/jmap/download/{ACC}/{g['blobId']}/m",ORG)[1]
         if b"multipart/report" not in raw.split(b"\r\n\r\n",1)[0]: continue
+        flat=raw.replace(b"=\r\n",b"")
         for tag in SENT:
-            flat=raw.replace(b"=\r\n",b"")
-            if f"e2e-dsn-{tag}@one.test".encode() in flat or f"trace-{tag}-id".encode() in flat: found[tag]=raw
+            ids=(f"e2e-dsn-{tag}@one.test",f"trace-{tag}-id")+((RCPT(tag),) if tag=="latin1" else ())
+            if any(i.encode() in flat for i in ids): found[tag]=raw
     return found
 got={}
 for _ in range(36):
@@ -220,11 +228,14 @@ for tag,sent in SENT.items():
     # A control: whatever the encoding, the part carries the original's Message-ID once decoded (upstream's too: the email
     # package does not decode a message/* part, so its quoted-printable is decoded here).
     decoded=quopri.decodestring(body) if part.get_content_maintype()=="message" else (part.get_payload(decode=True) or b"")
-    if tag in ("gmail","big"):
+    if tag in DEEP:
         # The control for these two is the trace id, which is in the first 4096 bytes on any image.
         check(f"trace-{tag}-id".encode() in decoded, f"control: the {tag} bounce's third part starts with the original's first header")
-        ids=[re.search(rb"^"+n+rb":.*$",headers,re.M).group(0).rstrip(b"\r") for n in (b"From",b"Subject",b"Message-ID")]
+        ids=[header_line(headers,n).group(0).rstrip(b"\r") for n in IDS]
         check(all(i in decoded for i in ids), f"the {tag} bounce returns the original's From, Subject and Message-ID", len(decoded))
+    elif tag=="latin1":
+        # Upstream empties this part, so the control is the bounce's report naming this original's own recipient.
+        check(RCPT(tag).encode() in raw, f"control: the {tag} bounce reports its own recipient")
     else:
         check(f"<e2e-dsn-{tag}@one.test>".encode() in decoded, f"control: the {tag} bounce's third part carries the original's Message-ID")
     check(ctype=="text/rfc822-headers", f"the {tag} bounce returns the headers as text/rfc822-headers, not message/rfc822", ctype)
@@ -236,6 +247,10 @@ for tag,sent in SENT.items():
         whole=re.fullmatch(rb"X-Pad-\d{4}: z{900}",last) is not None
         check(cte=="7bit" and 60*1024<len(body)<=64*1024 and body.endswith(b"\r\n") and whole,
               "the huge bounce returns its headers up to the 64 KiB cap, cut at a whole line", f"{cte} {len(body)} B, last line {last[:24]!r}")
+    elif tag=="latin1":
+        ids=[header_line(headers,n).group(0).rstrip(b"\r") for n in IDS]
+        check(cte=="8bit" and all(i in body for i in ids) and b"X-Legacy: caf\xef\xbf\xbd\r\n" in body,
+              "the latin1 bounce returns its headers, the byte that is not UTF-8 replaced, in 8bit", f"{cte} {len(body)} B")
     elif tag=="lonecr":
         paired=body.count(b"\r")==body.count(b"\r\n")==body.count(b"\n")
         check(cte=="7bit" and paired and b"X-Odd: a lone\r\nCR\r\n" in body, "the lonecr bounce ends a lone CR as a line: every CR and LF in its 7bit part is a CRLF", cte)

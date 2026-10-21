@@ -6,7 +6,7 @@ and mail written into a mailbox are **scanned**, a ban that expired is **enforce
 key **cannot take over an Admin**, an operator can run **admin verbs on a mailbox without reading
 its mail**, calendar mail carries **no Stalwart logo**, a burst of large uploads or messages is **refused, not an OOM**, the spam filter reads a
 **bounded start** of each message's text, a two-step code is **accepted once**, and a bounce returns the original's
-headers **as `text/rfc822-headers`**, **up to 64 KiB** of them. The first change, deleting blobs from **Cloudflare R2**, is upstream's own since
+headers **as `text/rfc822-headers`**, **up to 64 KiB** of them, none dropped for a byte that is not UTF-8. The first change, deleting blobs from **Cloudflare R2**, is upstream's own since
 v0.16.26 (below).
 
 ## The problem
@@ -367,16 +367,21 @@ MAI-1127/MAI-1131).
 [`patches/0014-bounces-return-the-whole-header-block.patch`](patches/0014-bounces-return-the-whole-header-block.patch)
 raises the read to 64 KiB. Upstream already stops at the blank line that ends the header block, so a bounce returns the
 whole block, and only that. 64 KiB is over ten times the Gmail block (5.6 KB in the e2e, 6167 B for the whole real
-message) and still bounds what a pathological message makes one bounce read and return; a block past it is cut at its
-last whole line, as upstream cut at 4 KiB. Nothing else changes.
-[`scripts/e2e-dsn-headers.sh`](scripts/e2e-dsn-headers.sh) bounces three more messages: `gmail`, with the real message's
+message) and still bounds what a pathological message makes one bounce scan and return; a block past it is cut at its
+last whole line, as upstream cut at 4 KiB. (It bounds no I/O: `get_blob` fetches the whole blob whatever the range, as
+it did at 4 KiB.) The same patch replaces a header byte that is not UTF-8 (U+FFFD): upstream turned the whole part into
+an empty string, measured on `-dsnhdrs1` (2 bytes), and a 64 KiB block is likelier to carry one than 4 KiB.
+Nothing else changes.
+[`scripts/e2e-dsn-headers.sh`](scripts/e2e-dsn-headers.sh) bounces four more messages: `gmail`, with the real message's
 headers in its order and sizes (trace headers, `Received`, `ARC-Seal`, `ARC-Message-Signature`,
 `ARC-Authentication-Results`, `DKIM-Signature`, `X-Google-DKIM-Signature`, and the rest; random signatures, the test's
-own addresses); `big`, with 5 KiB of plain headers; and `huge`, whose 72 KiB of headers pass the cap. The first two
+own addresses); `big`, with 5 KiB of plain headers; `huge`, whose 72 KiB of headers pass the cap; and `latin1`, with
+a raw 0xE9 in a header, sent to its own recipient so its bounce is found even when the part is empty. The first two
 put their `From`, `Subject` and `Message-ID` past byte 4096 (asserted), and each bounce must return them, and every
-header byte for byte; `huge`'s part must stop between 60 and 64 KiB on a whole line. Against production's image before
-it (`MAI1131_BUG_REFERENCE_IMAGE`) those five checks FAIL, with `gmail`'s part cut at 4026 bytes, while their controls
-and the thirteenth change's checks pass (measured). The build requires both.
+header byte for byte; `huge`'s part must stop between 60 and 64 KiB on a whole line; `latin1`'s must return its
+identifying headers in 8bit with the byte replaced. Against production's image before it (`MAI1131_BUG_REFERENCE_IMAGE`)
+those six checks FAIL, with `gmail`'s part cut at 4026 bytes and `latin1`'s empty, while their controls and the
+thirteenth change's checks pass (measured). The build requires both.
 
 Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1-textcap1-totponce1-dsnhdrs1-dsnfull1`.
 

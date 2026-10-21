@@ -48,7 +48,8 @@
 #    whole message and refused Stalwart's header-only one (554, measured through real SES, MainThrive MAI-1036).
 # 14. patches/0014-bounces-return-the-whole-header-block.patch: a bounce returns the original's header block up to 64 KiB,
 #    not 4 KiB. A real Gmail message's trace, ARC and DKIM headers filled upstream's 4096 bytes before its From, Subject and
-#    Message-ID, and that bounce went to Gmail's Spam (measured in production, MainThrive MAI-1127/MAI-1131).
+#    Message-ID, and that bounce went to Gmail's Spam (measured in production, MainThrive MAI-1127/MAI-1131). A header byte
+#    that is not UTF-8 is replaced, where upstream returned nothing at all.
 # Everything else is upstream: the tag's source, its Dockerfile, its features.
 # The release tag is pushed only from main; a dispatch from another branch pushes branch-<short sha>
 # instead, and a pull request runs every step but the registry login and the push (MAI-1019). A release tag is
@@ -408,7 +409,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ env.STALWART_TAG }}-${{ env.VARIANT }}
-            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with tenant-scoped sharing (JMAP, IMAP, WebDAV), scanned, capped file writes, expired bans replaced, account writes within the caller's grant, admin verbs without impersonate, no logo on calendar mail, and a server-wide cap on large uploads and messages, and a bounded spam-filter text analysis, and a two-step code accepted once, and bounces returning the original's headers as text/rfc822-headers, up to 64 KiB
+            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with tenant-scoped sharing (JMAP, IMAP, WebDAV), scanned, capped file writes, expired bans replaced, account writes within the caller's grant, admin verbs without impersonate, no logo on calendar mail, and a server-wide cap on large uploads and messages, and a bounded spam-filter text analysis, and a two-step code accepted once, and bounces returning the original's headers as text/rfc822-headers, up to 64 KiB, a byte that is not UTF-8 replaced
             org.opencontainers.image.licenses=AGPL-3.0-only
           cache-from: type=gha
           # Only main writes the cache: a pull request reads main's, and a Rust build cache written per
@@ -533,7 +534,7 @@ jobs:
             'FAIL the lonecr bounce ends a lone CR as a line: every CR and LF in its 7bit part is a CRLF' \
             "PASS control: the lonecr bounce's third part carries the original's Message-ID"
 
-      - name: The same check FAILS on the last image before 0014, on the headers past 4 KiB, and its controls PASS there
+      - name: The same check FAILS on the last image before 0014, on the headers past 4 KiB and a byte that is not UTF-8, and its controls PASS there
         run: |
           bash patch/scripts/previous-must-fail.sh "${MAI1131_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-dsn-headers.sh \
             "PASS setup: the gmail original's From, Subject and Message-ID start past byte 4096 of its headers" \
@@ -546,6 +547,8 @@ jobs:
             'FAIL the big bounce returns every header byte for byte, in 7bit' \
             "PASS control: the huge bounce's third part carries the original's Message-ID" \
             'FAIL the huge bounce returns its headers up to the 64 KiB cap, cut at a whole line' \
+            "PASS control: the latin1 bounce reports its own recipient" \
+            'FAIL the latin1 bounce returns its headers, the byte that is not UTF-8 replaced, in 8bit' \
             'PASS the ascii bounce returns every header byte for byte, in 7bit' \
             'PASS the lonecr bounce ends a lone CR as a line: every CR and LF in its 7bit part is a CRLF'
 
