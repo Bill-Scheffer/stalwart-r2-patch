@@ -8,7 +8,7 @@
 # refuses the bounce: 554 "Unbalanced quoted string" for that shape, 554 "Missing start boundary" for the same headers in
 # 7bit, when they name a multipart. It accepts text/rfc822-headers in 7bit (measured through real SES, MainThrive
 # MAI-1036). Patch 0013 sends that, and 0014 reads up to 64 KiB of headers, not 4096 bytes (MAI-1131). Here a real
-# bounce: org submits seven messages to an outside domain whose MX (a stub
+# bounce: org submits eight messages to an outside domain whose MX (a stub
 # on an internal network, found through a DNS stub) refuses the recipient with 550, and Stalwart bounces each to org.
 set -euo pipefail
 IMG=${1:?usage: $0 <stalwart image>}
@@ -112,7 +112,7 @@ def original(tag,subject,extra=LONG):
             +extra+"\r\nMIME-Version: 1.0\r\n"+BODY).encode()
 SENT={"ascii":original("ascii","an outside recipient that does not exist"),"utf8":original("utf8","Grüße, ein Empfänger, den es nicht gibt"),
       "longline":original("longline","a header line past 998 octets",LONGLINE),"lonecr":original("lonecr","a lone CR",LONECR)}
-# Three more, whose identifying headers come after the first 4096 bytes, where upstream's read stopped (MAI-1131).
+# Three more for the 4096-byte read upstream stopped at (MAI-1131); "latin1", below, is the fourth.
 # "gmail" is the shape of the real message that bounced to Spam (MainThrive MAI-1127 step 4, 6167 B): our own trace headers,
 # then Gmail's Received, ARC and DKIM blocks, then From, Subject and Message-ID. Same headers, order and sizes; the
 # signatures are random and the addresses are this test's. "big" is 5 KiB of plain headers before them. "huge" is past
@@ -243,9 +243,11 @@ for tag,sent in SENT.items():
         check(cte in ("quoted-printable","base64") and b"y"*1000 in decoded, "the longline bounce leaves a line past 998 octets to mail-builder's encoding, and decodes to it", cte)
     elif tag=="huge":
         # Cut at the cap, on a whole line: 60 KiB < part <= 64 KiB, ending in CRLF after a whole pad line.
-        last=body.rstrip(b"\r\n").rsplit(b"\r\n",1)[-1]
-        whole=re.fullmatch(rb"X-Pad-\d{4}: z{900}",last) is not None
-        check(cte=="7bit" and 60*1024<len(body)<=64*1024 and body.endswith(b"\r\n") and whole,
+        # The block without the CRLFs that end it and precede the boundary; with its own final CRLF it fits the cap.
+        block=body.rstrip(b"\r\n")
+        whole=re.fullmatch(rb"X-Pad-\d{4}: z{900}",block.rsplit(b"\r\n",1)[-1]) is not None
+        last=block.rsplit(b"\r\n",1)[-1]
+        check(cte=="7bit" and 60*1024<len(block)+2<=64*1024 and whole,
               "the huge bounce returns its headers up to the 64 KiB cap, cut at a whole line", f"{cte} {len(body)} B, last line {last[:24]!r}")
     elif tag=="latin1":
         ids=[header_line(headers,n).group(0).rstrip(b"\r") for n in IDS]
