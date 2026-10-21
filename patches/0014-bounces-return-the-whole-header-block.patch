@@ -1,0 +1,17 @@
+diff --git a/crates/smtp/src/queue/dsn.rs b/crates/smtp/src/queue/dsn.rs
+index 33caed4..661d94b 100644
+--- a/crates/smtp/src/queue/dsn.rs
++++ b/crates/smtp/src/queue/dsn.rs
+@@ -147,7 +147,11 @@ impl SendDsn for Server {
+     }
+ }
+ 
+-const MAX_HEADER_SIZE: usize = 4096;
++// A bounce returns the original's header block, read to its blank line. 4096 bytes cut a real Gmail message before its
++// From, Subject and Message-ID: our own trace headers and Gmail's ARC and DKIM blocks come first and fill it (MainThrive
++// MAI-1131). 64 KiB is over ten times that block and still bounds what a pathological message makes us read and return;
++// a block past it is cut at its last whole line, as before.
++const MAX_HEADER_SIZE: usize = 64 * 1024;
+ 
+ // The DSN returns the original's headers only, which is RFC 6522's text/rfc822-headers. Sent as
+ // message/rfc822, a relay that parses the part as a message (Amazon SES) refuses the bounce: a

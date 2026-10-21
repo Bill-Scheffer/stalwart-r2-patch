@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# End-to-end: a bounce returns the original's headers as text/rfc822-headers, byte for byte, in 7bit (8bit for UTF-8).
+# End-to-end: a bounce returns the original's headers as text/rfc822-headers, byte for byte, in 7bit (8bit for UTF-8),
+# past the first 4096 bytes and up to a 64 KiB cap.
 # usage: e2e-dsn-headers.sh <stalwart image>
 #
 # Upstream returns the headers only, but labels them message/rfc822 and quoted-printable-encodes them whenever a header
 # line is longer than 77 characters, which most mail has. Amazon SES parses a message/rfc822 part as a whole message and
 # refuses the bounce: 554 "Unbalanced quoted string" for that shape, 554 "Missing start boundary" for the same headers in
 # 7bit, when they name a multipart. It accepts text/rfc822-headers in 7bit (measured through real SES, MainThrive
-# MAI-1036). Patch 0013 sends that. Here a real bounce: org submits two messages to an outside domain whose MX (a stub
+# MAI-1036). Patch 0013 sends that, and 0014 reads up to 64 KiB of headers, not 4096 bytes (MAI-1131). Here a real
+# bounce: org submits seven messages to an outside domain whose MX (a stub
 # on an internal network, found through a DNS stub) refuses the recipient with 550, and Stalwart bounces each to org.
 set -euo pipefail
 IMG=${1:?usage: $0 <stalwart image>}
@@ -70,7 +72,7 @@ docker run -d --name "$C" --network "$NET" --network-alias stalwart --hostname m
   -v "$W/etc:/etc/stalwart" -v "$W/data:/var/lib/stalwart" "$IMG" >/dev/null
 docker run -d --name "$K" --network "$NET" -e ADMIN="$ADMIN" python:3.12-alpine sleep 900 >/dev/null
 docker exec -i "$K" python3 - <<'PY'
-import base64,email,json,os,quopri,secrets,sys,time,urllib.request,urllib.error
+import base64,email,json,os,quopri,random,re,secrets,sys,time,urllib.request,urllib.error
 B="http://stalwart:8080"; fails=[]
 for _ in range(90):
     try: urllib.request.urlopen(B+"/healthz/ready",timeout=2); break
@@ -109,6 +111,73 @@ def original(tag,subject,extra=LONG):
             +'--=_e2e\r\nContent-Type: text/plain; charset="utf-8"\r\n\r\nhello\r\n--=_e2e--\r\n').encode()
 SENT={"ascii":original("ascii","an outside recipient that does not exist"),"utf8":original("utf8","Grüße, ein Empfänger, den es nicht gibt"),
       "longline":original("longline","a header line past 998 octets",LONGLINE),"lonecr":original("lonecr","a lone CR",LONECR)}
+# Three more, whose identifying headers come after the first 4096 bytes, where upstream's read stopped (MAI-1131).
+# "gmail" is the shape of the real message that bounced to Spam (MainThrive MAI-1127 step 4, 6167 B): our own trace headers,
+# then Gmail's Received, ARC and DKIM blocks, then From, Subject and Message-ID. Same headers, order and sizes; the
+# signatures are random and the addresses are this test's. "big" is 5 KiB of plain headers before them. "huge" is past
+# 0014's 64 KiB cap, so its identifying headers come first: its part must stop at the cap, on a whole line.
+# The first two cannot be matched to their bounce by Message-ID on an image that cuts it off, so their first header (our
+# Received) carries a trace id too.
+R=random.Random(1131)
+def b64(n): return base64.b64encode(R.randbytes(n)).decode()
+def fold(name,value):
+    out,line=[],name+":"
+    for word in value.split(" "):
+        if len(line)+1+len(word)>78 and line.strip() and not line.endswith(":"): out.append(line); line=" "
+        line+=(" " if line!=" " else "")+word
+    return "\r\n".join(out+[line])+"\r\n"
+def chunks(s,n=72): return " ".join(s[i:i+n] for i in range(0,len(s),n))
+def identifying(tag,subject):
+    return ("MIME-Version: 1.0\r\nFrom: Org <org@one.test>\r\nDate: Tue, 21 Oct 2026 21:08:06 +0000\r\n"
+            +fold("X-Gm-Features",b64(96))+f"Message-ID: <e2e-dsn-{tag}@one.test>\r\nSubject: {subject}\r\n"
+            +"To: <nobody@two.test>\r\n")
+def trace(tag):
+    return (fold("Received","from mail-wm1-f41.google.com (mail-wm1-f41.google.com [209.85.128.41]) by mail.mainthrive.com"
+                 f" (Stalwart) with ESMTPS id trace-{tag}-id; Tue, 21 Oct 2026 21:08:15 +0000")
+        +fold("Authentication-Results","mail.mainthrive.com; dkim=pass header.d=gmail.com header.s=20230601 header.b="+b64(6)
+              +"; spf=pass (mail.mainthrive.com: domain of sender@gmail.com designates 209.85.128.41 as permitted sender)"
+              " smtp.mailfrom=sender@gmail.com; dmarc=pass header.from=gmail.com policy.dmarc=none; arc=pass"
+              " (i=1, d=google.com, s=arc-20240605) header.d=google.com")
+        +fold("Received-SPF","pass (mail.mainthrive.com: domain of sender@gmail.com designates 209.85.128.41 as permitted"
+              " sender) receiver=mail.mainthrive.com; client-ip=209.85.128.41; envelope-from=\"sender@gmail.com\";"
+              " helo=mail-wm1-f41.google.com;")
+        +fold("X-Spam-Result",", ".join(f"{n} ({v})" for n,v in [("ARC_SIGNED","0.00"),("DKIM_ALLOW","-0.20"),
+              ("DMARC_POLICY_ALLOW","-0.20"),("SPF_ALLOW","-0.20"),("FREEMAIL_FROM","0.00"),("FREEMAIL_ENVFROM","0.00"),
+              ("RCVD_COUNT_ONE","0.00"),("RCVD_TLS_LAST","0.00"),("MIME_GOOD","-0.10"),("FROM_HAS_DN","0.00"),
+              ("TO_DN_NONE","0.00"),("RCPT_COUNT_ONE","0.00"),("ARC_ALLOW","-1.00"),("RCVD_VIA_SMTP_AUTH","0.00"),
+              ("DWL_DNSWL_NONE","0.00"),("TO_MATCH_ENVRCPT_ALL","0.00"),("FROM_EQ_ENVFROM","0.00"),("MID_RHS_MATCH_FROM","0.00")]))
+        +"X-Spam-Score: -1.9\r\nReturn-Path: <sender@gmail.com>\r\n")
+def gmail():
+    h=("to:subject:message-id:date:from:mime-version:from:to:cc:subject:date:message-id:reply-to")
+    return (trace("gmail")
+        +fold("Received","by mail-wm1-f41.google.com with SMTP id 5b1f17b1804b1-47117f92e32so41755e9.1 for"
+              " <test@pilot.mainthrive.com>; Tue, 21 Oct 2026 14:08:07 -0700 (PDT)")
+        +fold("ARC-Seal","i=1; a=rsa-sha256; t=1792616887; cv=none; d=google.com; s=arc-20240605; b="+chunks(b64(256)))
+        +fold("ARC-Message-Signature","i=1; a=rsa-sha256; c=relaxed/relaxed; d=google.com; s=arc-20240605;"
+              " h=to:subject:message-id:date:from:mime-version:dkim-signature; bh="+b64(32)+"; fh="+b64(32)+"; b="+chunks(b64(256)))
+        +fold("ARC-Authentication-Results","i=1; mx.google.com; dkim=pass header.i=@gmail.com header.s=20230601 header.b="
+              +b64(6)+"; spf=pass (google.com: domain of sender@gmail.com designates 209.85.220.41 as permitted sender)"
+              " smtp.mailfrom=sender@gmail.com; dmarc=pass (p=NONE sp=QUARANTINE dis=NONE) header.from=gmail.com;"
+              " dara=pass header.i=@pilot.mainthrive.com")
+        +fold("DKIM-Signature","v=1; a=rsa-sha256; c=relaxed/relaxed; d=gmail.com; s=20230601; t=1792616886;"
+              " x=1793221686; darn=pilot.mainthrive.com; h="+h+"; bh="+b64(32)+"; b="+chunks(b64(256)))
+        +fold("X-Google-DKIM-Signature","v=1; a=rsa-sha256; c=relaxed/relaxed; d=1e100.net; s=20230601; t=1792616886;"
+              " x=1793221686; h=x-gm-message-state:"+h+"; bh="+b64(32)+"; b="+chunks(b64(256)))
+        +fold("X-Gm-Message-State",b64(90))+fold("X-Gm-Gg",chunks(b64(420)))+fold("X-Google-Smtp-Source",b64(90))
+        +fold("X-Received","by 2002:a05:600c:3b15:b0:471:15c0:9e4b with SMTP id 5b1f17b1804b1-47117f92e2fmr6372845e9.27.1792616886742;"
+              " Tue, 21 Oct 2026 14:08:06 -0700 (PDT)")
+        +identifying("gmail","a full-size Gmail original"))
+def body(): return ('Content-Type: multipart/alternative; boundary="=_e2e"\r\n\r\n'
+                    +'--=_e2e\r\nContent-Type: text/plain; charset="utf-8"\r\n\r\nhello\r\n--=_e2e--\r\n')
+SENT["gmail"]=(gmail()+body()).encode()
+SENT["big"]=(trace("big")+"".join(f"X-Pad-{i:02d}: "+"p"*90+"\r\n" for i in range(50))
+             +identifying("big","more than 4 KiB of headers before this one")+body()).encode()
+PAD=lambda i: f"X-Pad-{i:04d}: "+"z"*900
+SENT["huge"]=(identifying("huge","headers past the 64 KiB cap")+"".join(PAD(i)+"\r\n" for i in range(80))+body()).encode()
+for tag in ("gmail","big"):
+    hb=SENT[tag].split(b"\r\n\r\n",1)[0]
+    check(hb.index(b"Message-ID:")>4096 and hb.index(b"From:")>4096 and hb.index(b"Subject:")>4096,
+          f"setup: the {tag} original's From, Subject and Message-ID start past byte 4096 of its headers", len(hb))
 for tag,raw in SENT.items():
     _,b=req(f"/jmap/upload/{ACC}/",ORG,raw,"message/rfc822")
     blob=json.loads(b)["blobId"]
@@ -124,7 +193,8 @@ def bounces():
         raw=req(f"/jmap/download/{ACC}/{g['blobId']}/m",ORG)[1]
         if b"multipart/report" not in raw.split(b"\r\n\r\n",1)[0]: continue
         for tag in SENT:
-            if f"e2e-dsn-{tag}@one.test".encode() in raw.replace(b"=\r\n",b""): found[tag]=raw
+            flat=raw.replace(b"=\r\n",b"")
+            if f"e2e-dsn-{tag}@one.test".encode() in flat or f"trace-{tag}-id".encode() in flat: found[tag]=raw
     return found
 got={}
 for _ in range(36):
@@ -150,10 +220,22 @@ for tag,sent in SENT.items():
     # A control: whatever the encoding, the part carries the original's Message-ID once decoded (upstream's too: the email
     # package does not decode a message/* part, so its quoted-printable is decoded here).
     decoded=quopri.decodestring(body) if part.get_content_maintype()=="message" else (part.get_payload(decode=True) or b"")
-    check(f"<e2e-dsn-{tag}@one.test>".encode() in decoded, f"control: the {tag} bounce's third part carries the original's Message-ID")
+    if tag in ("gmail","big"):
+        # The control for these two is the trace id, which is in the first 4096 bytes on any image.
+        check(f"trace-{tag}-id".encode() in decoded, f"control: the {tag} bounce's third part starts with the original's first header")
+        ids=[re.search(rb"^"+n+rb":.*$",headers,re.M).group(0).rstrip(b"\r") for n in (b"From",b"Subject",b"Message-ID")]
+        check(all(i in decoded for i in ids), f"the {tag} bounce returns the original's From, Subject and Message-ID", len(decoded))
+    else:
+        check(f"<e2e-dsn-{tag}@one.test>".encode() in decoded, f"control: the {tag} bounce's third part carries the original's Message-ID")
     check(ctype=="text/rfc822-headers", f"the {tag} bounce returns the headers as text/rfc822-headers, not message/rfc822", ctype)
     if tag=="longline":
         check(cte in ("quoted-printable","base64") and b"y"*1000 in decoded, "the longline bounce leaves a line past 998 octets to mail-builder's encoding, and decodes to it", cte)
+    elif tag=="huge":
+        # Cut at the cap, on a whole line: 60 KiB < part <= 64 KiB, ending in CRLF after a whole pad line.
+        last=body.rstrip(b"\r\n").rsplit(b"\r\n",1)[-1]
+        whole=re.fullmatch(rb"X-Pad-\d{4}: z{900}",last) is not None
+        check(cte=="7bit" and 60*1024<len(body)<=64*1024 and body.endswith(b"\r\n") and whole,
+              "the huge bounce returns its headers up to the 64 KiB cap, cut at a whole line", f"{cte} {len(body)} B, last line {last[:24]!r}")
     elif tag=="lonecr":
         paired=body.count(b"\r")==body.count(b"\r\n")==body.count(b"\n")
         check(cte=="7bit" and paired and b"X-Odd: a lone\r\nCR\r\n" in body, "the lonecr bounce ends a lone CR as a line: every CR and LF in its 7bit part is a CRLF", cte)
