@@ -395,7 +395,7 @@ account (MainThrive MAI-964's design record, § 3.2-3.3; MAI-1070).
 optional row at delivery, in the `spam-level` lookup namespace, keyed by the recipient account's id (its `x:Account` id,
 `b`, `c`, ...), whose value is the line `L`, 1 to 99. Right after the account is resolved, and before either reader of the
 percentage, it rescales the recipient's percentage `p` so that `L` maps to 50: `p < L` becomes `p × 50 / L`, `p ≥ L`
-becomes `50 + (p − L) × 50 / (100 − L)` (0 and 100 are kept). So everything that already reads the percentage agrees
+becomes `50 + (p − L) × 50 / (100 − L)` (0 stays 0 and 100 stays 100). So everything that already reads the percentage agrees
 with the account's level, with nothing else taught about it: delivery's `is_spam()` (the Junk folder and keyword),
 Sieve's `spamtest`, which webmail's own rules use to skip spam, contact and reply trust, and `X-Spam-Status`. No row is
 Normal, unchanged, so a server with no rows behaves as upstream. Only mail the spam filter scored has a percentage, and

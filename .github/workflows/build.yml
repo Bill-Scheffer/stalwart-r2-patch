@@ -582,12 +582,23 @@ jobs:
             "PASS setup: every low message scores from 4.0 to 5.0, between Strict's line and Normal's" \
             "PASS setup: every high message scores from 5.0 to 7.0, between Normal's line and Lenient's" \
             'FAIL Strict (40): the low message goes to Junk, Yes, and the folder rule does not run' \
-            'FAIL Lenient (70): the high message is filed by the rule, No, not Junk' \
-            'FAIL Strict (40) with no script: the low message goes to Junk, Yes' \
-            'FAIL Lenient (70) with no script: the high message stays in the Inbox, No, not Junk' \
+            'PASS control: Strict (40): the high message goes to Junk, Yes' \
             'PASS control: Normal (no row): the low message is filed by the rule, No' \
             'PASS control: Normal (no row): the high message goes to Junk, Yes' \
+            'PASS control: Lenient (70): the low message is filed by the rule, No' \
+            'FAIL Lenient (70): the high message is filed by the rule, No, not Junk' \
+            'FAIL Strict (40) with no script: the low message goes to Junk, Yes' \
+            'PASS control: Strict (40) with no script: the high message goes to Junk, Yes' \
+            'PASS control: Lenient (70) with no script: the low message stays in the Inbox, No' \
+            'FAIL Lenient (70) with no script: the high message stays in the Inbox, No, not Junk' \
+            'PASS a row that is not a line (0) delivers at Normal: the low message is filed by the rule, No' \
+            'PASS a row that is not a line (0) delivers at Normal: the high message goes to Junk, Yes' \
+            'PASS a row that is not a line (100) delivers at Normal: the low message is filed by the rule, No' \
+            'PASS a row that is not a line (100) delivers at Normal: the high message goes to Junk, Yes' \
+            'PASS a row that is not a line (strict) delivers at Normal: the low message is filed by the rule, No' \
+            'PASS a row that is not a line (strict) delivers at Normal: the high message goes to Junk, Yes' \
             'PASS with the lookup store unavailable, the message is delivered at once, not deferred' \
+            'PASS control: and at Normal: the low message is filed by the rule, No' \
             "PASS control: Stalwart's log records every delivery" \
             'FAIL the failed lookup is logged' \
             'FAIL a row that is not a line is logged'
