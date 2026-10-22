@@ -96,6 +96,8 @@ D=created(xset("Domain",create={"n":{"name":"one.test","dkimManagement":{"@type"
 # The pinned rules, in place of the release a server would download; Pyzor, a network lookup, off.
 xset("SpamPyzor",update={"singleton":{"enable":False,"host":"127.0.0.1"}})
 xset("SpamSettings",update={"singleton":{"spamFilterRulesUrl":f"http://{os.environ['RULES_AT']}/spam-filter-rules.json.gz"}})
+# The log on stdout, as production's plan sets it (stalwart-plan.yaml, Tracer): a fresh server logs nothing there.
+created(xset("Tracer",create={"n":{"@type":"Stdout","enable":True,"level":"info","ansi":False,"multiline":False,"buffered":False,"lossy":False}}))
 action("ReloadSettings")
 TASK=created(xset("Task",create={"n":{"@type":"SpamFilterMaintenance","maintenanceType":"updateRules"}}))
 for _ in range(120):
@@ -215,11 +217,19 @@ raise SystemExit(1 if fails else 0)
 PY
 rc=$?
 set -e
-# What the patch logs (Stalwart's own log, the container's stdout): the failed lookup, and the value that is not a line.
+# What the patch logs (Stalwart's own log, the container's stdout): the failed lookup, and the value that is not a line,
+# each an exact count: one message met the unreachable store, and three bad rows each met two messages.
 LOG=$(docker logs "$C" 2>&1)
 fails=0
-logcheck() { if grep -qF "$1" <<<"$LOG"; then echo "PASS $2"; else echo "FAIL $2"; fails=$((fails+1)); fi; }
-logcheck "Spam level lookup failed, delivering at Normal." "the failed lookup is logged"
-logcheck "Spam level is not a number from 1 to 99, delivering at Normal." "a row that is not a line is logged"
+logcount() { # <want> <label> <fixed text>...: the log lines carrying every text, counted
+  local want=$1 label=$2 lines=$LOG got; shift 2
+  for t in "$@"; do lines=$(grep -F -- "$t" <<<"$lines" || true); done
+  got=$(grep -c . <<<"$lines" || true)
+  if [ "$got" -eq "$want" ]; then echo "PASS $label"; else echo "FAIL $label"; echo "     got: $got line(s)"; fails=$((fails+1)); fi
+}
+# The 17 deliveries above, so a log that records nothing cannot read as "nothing was logged".
+logcount 17 "control: Stalwart's log records every delivery" "(message-ingest."
+logcount 1 "the failed lookup is logged" "Spam level lookup failed, delivering at Normal." "s40@one.test"
+logcount 6 "a row that is not a line is logged" "(store.data-corruption)" "Spam level is not a number from 1 to 99, delivering at Normal."
 [ "$rc" -eq 0 ] && [ "$fails" -eq 0 ] && { echo "all passed"; exit 0; }
 echo "failed (client exit $rc, $fails log check(s))"; exit 1

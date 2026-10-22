@@ -588,6 +588,7 @@ jobs:
             'PASS control: Normal (no row): the low message is filed by the rule, No' \
             'PASS control: Normal (no row): the high message goes to Junk, Yes' \
             'PASS with the lookup store unavailable, the message is delivered at once, not deferred' \
+            "PASS control: Stalwart's log records every delivery" \
             'FAIL the failed lookup is logged' \
             'FAIL a row that is not a line is logged'
 
