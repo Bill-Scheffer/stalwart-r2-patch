@@ -1,4 +1,4 @@
-# Builds Stalwart from its own release source with THIRTEEN changes, each pinned to its exact files:
+# Builds Stalwart from its own release source with FOURTEEN changes, each pinned to its exact files:
 # 1. (retired) rust-s3 used to be taken from the commit of rust-s3 PR #467, which stops DeleteObject signing
 #    headers it never sends; without it every blob DELETE against Cloudflare R2 failed with SignatureDoesNotMatch
 #    (rust-s3 #466, Stalwart #3185). rust-s3 0.38.0 carries the fix (6c97cb9) and Stalwart v0.16.26 moved to it,
@@ -50,6 +50,10 @@
 #    not 4 KiB. A real Gmail message's trace, ARC and DKIM headers filled upstream's 4096 bytes before its From, Subject and
 #    Message-ID, and that bounce went to Gmail's Spam (measured in production, MainThrive MAI-1127/MAI-1131). A header byte
 #    that is not UTF-8 is replaced, where upstream returned nothing at all.
+# 15. patches/0015-spam-level-moves-the-junk-line.patch: an account's spam level, one optional `spam-level` lookup row
+#    keyed by its id, moves where its mail turns to Junk by rescaling its spam percentage at delivery, so the line maps to
+#    50 for every reader (Junk, Sieve's spamtest, X-Spam-Status). Upstream has one global line (MainThrive MAI-1070). A
+#    lookup that fails, or a value that is not a line, delivers at Normal and is logged: never a deferral.
 # Everything else is upstream: the tag's source, its Dockerfile, its features.
 # The release tag is pushed only from main; a dispatch from another branch pushes branch-<short sha>
 # instead, and a pull request runs every step but the registry login and the push (MAI-1019). A release tag is
@@ -87,7 +91,7 @@ env:
   RUSTS3_VERSION: 0.38.0
   IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch
   # The tag after the Stalwart release: bump it with any change to what is built.
-  VARIANT: tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1-textcap1-totponce1-dsnhdrs1-dsnfull1
+  VARIANT: tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1-textcap1-totponce1-dsnhdrs1-dsnfull1-spamlevel1
   # A FIXED image that HAS the expired-ban bug (the last build before 0006), which the ban-expiry check must FAIL
   # on the bug's own line: that proves the check can fail. ⛔ NEVER bumped with releases: every build after 0006
   # lacks the bug and PASSES the check, so it could never be the reference. Pinned by tag AND digest, because a tag
@@ -112,6 +116,9 @@ env:
   # The same for 0014: the last build before it (production's image until then), which the bounce check must FAIL on the
   # headers past 4 KiB, and pass on its controls. ⛔ NEVER bumped, for the same reason. Pinned by its pinned- tag's digest.
   MAI1131_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:pinned-8343456bc29d@sha256:8343456bc29d04d0cf8f285d433f73a4a6228d2e5eee1f3119ff0ae14cbef3df
+  # The same for 0015: the last build before it (production's image until then), which reads no level, so the spam-level
+  # check must FAIL on Strict and Lenient and on what 0015 logs, and pass on Normal. ⛔ NEVER bumped, for the same reason.
+  MAI1070_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:pinned-782dcfbd03bb@sha256:782dcfbd03bbd9b75126f5ac25b8cb3a4d6541dfbe1ee5ff116fff15b272060e
 
 jobs:
   build:
@@ -384,6 +391,20 @@ jobs:
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
+          # Stage 0014, so the next step's diff under crates/ is 0015 alone.
+          git add -- crates/
+
+      - name: Apply the spam-level patch, and prove it changed only its own file
+        working-directory: stalwart
+        run: |
+          set -eu
+          P=../patch/patches/0015-spam-level-moves-the-junk-line.patch
+          git apply --check "$P" && git apply "$P"
+          got=$(git diff --name-only | sort | tr '\n' ' ')
+          [ "$got" = "crates/email/src/message/delivery.rs " ] \
+            || { echo "::error::changed files: $got"; exit 1; }
+          diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
+            || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
 
       - name: Swap, as Stalwart's own CI adds for its release build
         run: |
@@ -409,7 +430,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ env.STALWART_TAG }}-${{ env.VARIANT }}
-            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with tenant-scoped sharing (JMAP, IMAP, WebDAV), scanned, capped file writes, expired bans replaced, account writes within the caller's grant, admin verbs without impersonate, no logo on calendar mail, and a server-wide cap on large uploads and messages, and a bounded spam-filter text analysis, and a two-step code accepted once, and bounces returning the original's headers as text/rfc822-headers, up to 64 KiB, a byte that is not UTF-8 replaced
+            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with tenant-scoped sharing (JMAP, IMAP, WebDAV), scanned, capped file writes, expired bans replaced, account writes within the caller's grant, admin verbs without impersonate, no logo on calendar mail, and a server-wide cap on large uploads and messages, and a bounded spam-filter text analysis, and a two-step code accepted once, and bounces returning the original's headers as text/rfc822-headers, up to 64 KiB, a byte that is not UTF-8 replaced, and a spam level per account
             org.opencontainers.image.licenses=AGPL-3.0-only
           cache-from: type=gha
           # Only main writes the cache: a pull request reads main's, and a Rust build cache written per
@@ -551,6 +572,36 @@ jobs:
             'FAIL the latin1 bounce returns its headers, the byte that is not UTF-8 replaced, in 8bit' \
             'PASS the ascii bounce returns every header byte for byte, in 7bit' \
             'PASS the lonecr bounce ends a lone CR as a line: every CR and LF in its 7bit part is a CRLF'
+
+      - name: An account's spam level moves its Junk line, with a webmail rule and without one, and a level that cannot be read delivers at Normal (end to end, the built image)
+        run: bash patch/scripts/e2e-spam-level.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
+
+      - name: The same check FAILS on the last image before 0015, on Strict, Lenient and what 0015 logs, and Normal PASSES there
+        run: |
+          bash patch/scripts/previous-must-fail.sh "${MAI1070_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-spam-level.sh \
+            "PASS setup: every low message scores from 4.0 to 5.0, between Strict's line and Normal's" \
+            "PASS setup: every high message scores from 5.0 to 7.0, between Normal's line and Lenient's" \
+            'FAIL Strict (40): the low message goes to Junk, Yes, and the folder rule does not run' \
+            'PASS control: Strict (40): the high message goes to Junk, Yes' \
+            'PASS control: Normal (no row): the low message is filed by the rule, No' \
+            'PASS control: Normal (no row): the high message goes to Junk, Yes' \
+            'PASS control: Lenient (70): the low message is filed by the rule, No' \
+            'FAIL Lenient (70): the high message is filed by the rule, No, not Junk' \
+            'FAIL Strict (40) with no script: the low message goes to Junk, Yes' \
+            'PASS control: Strict (40) with no script: the high message goes to Junk, Yes' \
+            'PASS control: Lenient (70) with no script: the low message stays in the Inbox, No' \
+            'FAIL Lenient (70) with no script: the high message stays in the Inbox, No, not Junk' \
+            'PASS a row that is not a line (0) delivers at Normal: the low message is filed by the rule, No' \
+            'PASS a row that is not a line (0) delivers at Normal: the high message goes to Junk, Yes' \
+            'PASS a row that is not a line (100) delivers at Normal: the low message is filed by the rule, No' \
+            'PASS a row that is not a line (100) delivers at Normal: the high message goes to Junk, Yes' \
+            'PASS a row that is not a line (strict) delivers at Normal: the low message is filed by the rule, No' \
+            'PASS a row that is not a line (strict) delivers at Normal: the high message goes to Junk, Yes' \
+            'PASS with the lookup store unavailable, the message is delivered at once, not deferred' \
+            'PASS control: and at Normal: the low message is filed by the rule, No' \
+            "PASS control: Stalwart's log records every delivery" \
+            'FAIL the failed lookup is logged' \
+            'FAIL a row that is not a line is logged'
 
       # ⛔ The release tag is pushed only from main (a push, or a dispatch on main). A dispatch from any
       # other branch pushes the same tested image under branch-<short sha> alone, never the release tag,
