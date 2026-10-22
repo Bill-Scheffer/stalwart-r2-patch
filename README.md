@@ -1,12 +1,13 @@
 # stalwart-r2-patch
 
-[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **thirteen**
+[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **fourteen**
 changes: **sharing never crosses tenants**, stored files
 and mail written into a mailbox are **scanned**, a ban that expired is **enforced again**, a narrow
 key **cannot take over an Admin**, an operator can run **admin verbs on a mailbox without reading
 its mail**, calendar mail carries **no Stalwart logo**, a burst of large uploads or messages is **refused, not an OOM**, the spam filter reads a
 **bounded start** of each message's text, a two-step code is **accepted once**, and a bounce returns the original's
-headers **as `text/rfc822-headers`**, **up to 64 KiB** of them, none dropped for a byte that is not UTF-8. The first change, deleting blobs from **Cloudflare R2**, is upstream's own since
+headers **as `text/rfc822-headers`**, **up to 64 KiB** of them, none dropped for a byte that is not UTF-8, and each
+account has **its own spam level**. The first change, deleting blobs from **Cloudflare R2**, is upstream's own since
 v0.16.26 (below).
 
 ## The problem
@@ -383,7 +384,38 @@ identifying headers in 8bit with the byte replaced. Against production's image b
 those six checks FAIL, with `gmail`'s part cut at 4026 bytes and `latin1`'s empty, while their controls and the
 thirteenth change's checks pass (measured). The build requires both.
 
-Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1-textcap1-totponce1-dsnhdrs1-dsnfull1`.
+## The fifteenth change: an account's spam level moves its Junk line
+
+Upstream has one line for the whole server: a message is spam for a recipient when its per-recipient spam percentage
+is 50 or more (with the default thresholds, a score of 5.0), and nothing changes that per account. MainThrive's
+customers choose Strict, Normal or Lenient per business, domain or mailbox, and its API resolves that into one row per
+account (MainThrive MAI-964's design record, § 3.2-3.3; MAI-1070).
+
+[`patches/0015-spam-level-moves-the-junk-line.patch`](patches/0015-spam-level-moves-the-junk-line.patch) reads one
+optional row at delivery, in the `spam-level` lookup namespace, keyed by the recipient account's id (its `x:Account` id,
+`b`, `c`, ...), whose value is the line `L`, 1 to 99. Right after the account is resolved, and before either reader of the
+percentage, it rescales the recipient's percentage `p` so that `L` maps to 50: `p < L` becomes `p × 50 / L`, `p ≥ L`
+becomes `50 + (p − L) × 50 / (100 − L)` (0 and 100 are kept). So everything that already reads the percentage agrees
+with the account's level, with nothing else taught about it: delivery's `is_spam()` (the Junk folder and keyword),
+Sieve's `spamtest`, which webmail's own rules use to skip spam, contact and reply trust, and `X-Spam-Status`. No row is
+Normal, unchanged, so a server with no rows behaves as upstream. Only mail the spam filter scored has a percentage, and
+only that is looked up.
+
+⛔ **It never defers mail.** An error returned there would be a temporary failure. So a lookup that fails is logged
+(`Spam level lookup failed, delivering at Normal.`) and read as no row; a value that is not a whole number from 1 to 99 is
+logged (`Spam level is not a number from 1 to 99, delivering at Normal.`, a `store.data-corruption` event) and read as no
+row too. A namespace with no store is no row, silently: that is the ordinary state until a first row is written.
+
+[`scripts/e2e-spam-level.sh`](scripts/e2e-spam-level.sh) delivers two scored messages, `low` (4.20, no `Date`) and `high`
+(6.20, a subject in capitals), to accounts at 40, no row and 70, each with a webmail folder rule guarded as webmail guards
+it, and to accounts at 40 and 70 with no Sieve script: Strict sends `low` to Junk, Lenient keeps `high` out of it, and
+`X-Spam-Status` says the same. Rows of `0`, `100` and `strict` deliver at Normal and are logged. Then the namespace
+becomes a Redis store nobody listens on, and a message is still delivered at once, at Normal, the failure logged.
+Against production's image before it (`MAI1070_BUG_REFERENCE_IMAGE`) the four Strict and Lenient checks and the two log
+checks FAIL, while Normal, the bad rows and the unavailable store pass, since it reads no level at all (measured). The
+build requires both.
+
+Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1-textcap1-totponce1-dsnhdrs1-dsnfull1-spamlevel1`.
 
 ## Builds, tags and testing a change before it merges
 
