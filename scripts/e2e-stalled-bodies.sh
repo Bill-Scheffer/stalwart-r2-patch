@@ -32,7 +32,7 @@ docker run -d --name "$C" --network "$NET" --network-alias stalwart --hostname m
   -v "$W/etc:/etc/stalwart" -v "$W/data:/var/lib/stalwart" "$IMG" >/dev/null
 docker run -d --name "$K" --network "$NET" -e ADMIN="$ADMIN" python:3.12-alpine sleep 900 >/dev/null
 docker exec -i "$K" python3 - <<'PY'
-import base64,http.client,json,os,socket,ssl,sys,threading,time,urllib.request,urllib.error
+import base64,http.client,json,os,select,socket,ssl,sys,threading,time,urllib.request,urllib.error
 B="http://stalwart:8080"; fails=[]
 for _ in range(90):
     try: urllib.request.urlopen(B+"/healthz/ready",timeout=2); break
@@ -151,6 +151,16 @@ check(got.startswith("* BYE"), "a literal that stops partway is ended after 5 s,
 st=smtp(NAMES[8],97*MiB)
 check(st=="250", "and what it held comes back: a 97 MiB message is accepted", st)
 S3.c.close()
+# A literal that trickles is refused once it falls below 16 KiB/s past the grace: 64 KiB, then 1 KiB every 2 s.
+T=Imap(NAMES[9]); got=T.declare(b"d",6*MiB) if T.ok else "LOGIN failed"
+if got.startswith("+"):
+    T.c.sendall(b"A"*64*1024); sent=64*1024
+    for _ in range(8): time.sleep(2); T.c.sendall(b"A"*1024); sent+=1024
+    T.c.sendall(b"A"*(6*MiB-sent)+b"\r\n"); got=T.tagged(b"d")
+check(got.startswith("d NO [UNAVAILABLE]"), "a literal that trickles below 16 KiB/s after the 5 s grace is refused, read to its end", got)
+got=T.cmd(b"e",b"NOOP")
+check(got.startswith("e OK"), "and its session is still usable after the trickle", got)
+T.c.close()
 
 # --- HTTP: a body that sends nothing for 5 s is ended, and its slot goes back ----------------------------------
 def dav(n,size,name="f.bin"): return req(f"/dav/file/{n}%40one.test/{name}",AU[n],os.urandom(size),"application/octet-stream","PUT")
@@ -181,6 +191,21 @@ check(st==200, "and a JMAP upload", st)
 check([h.status for h in hs]==[408,408], "an HTTP body that sends nothing for longer than 5 s is ended", [(h.status,h.after) for h in hs])
 h=Stalled("POST",f"/jmap/upload/{jacct(NAMES[4])}/",NAMES[4]); h.start(); h.join()
 check(h.status==408, "a stalled JMAP upload is ended the same way", (h.status,h.after))
+# A body that trickles is ended once it falls below 16 KiB/s past the grace: just over 1 MiB, then 1 KiB every 2 s.
+def trickle(path,n):
+    c=socket.create_connection(("stalwart",8080),timeout=10)
+    c.sendall(f"PUT {path} HTTP/1.1\r\nHost: stalwart\r\nAuthorization: {AU[n]}\r\n"
+              f"Content-Type: application/octet-stream\r\nContent-Length: {14*MiB}\r\n\r\n".encode())
+    c.sendall(os.urandom(MiB+64*1024)); t=time.time()
+    try:
+        while time.time()-t<30:
+            if select.select([c],[],[],2)[0]: return c.recv(64).split(b"\r\n")[0].decode(errors="replace"),round(time.time()-t)
+            c.sendall(os.urandom(1024))
+        return "no answer",30
+    except OSError as e: return type(e).__name__,round(time.time()-t)
+    finally: c.close()
+got=trickle(f"/dav/file/{NAMES[6]}%40one.test/trickle.bin",NAMES[6])
+check(got[0].startswith("HTTP/1.1 408"), "an HTTP body that trickles below 16 KiB/s after the 5 s grace is ended with 408", got)
 # Idle, not total: a body that keeps sending, a piece every 3 s, is never ended.
 c=http.client.HTTPConnection("stalwart",8080,timeout=60)
 c.putrequest("PUT",f"/dav/file/{NAMES[5]}%40one.test/slow.bin"); c.putheader("Authorization",AU[NAMES[5]])

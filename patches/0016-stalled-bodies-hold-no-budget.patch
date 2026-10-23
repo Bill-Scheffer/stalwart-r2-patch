@@ -25,7 +25,7 @@ index aff9639..d65dab6 100644
  serde = { version = "1.0", features = ["derive"]}
  serde_json = "1.0"
 diff --git a/crates/http-proto/src/request.rs b/crates/http-proto/src/request.rs
-index ed1606e..bf31729 100644
+index ed1606e..1822362 100644
 --- a/crates/http-proto/src/request.rs
 +++ b/crates/http-proto/src/request.rs
 @@ -9,7 +9,7 @@ use std::{borrow::Cow, sync::Arc};
@@ -33,7 +33,7 @@ index ed1606e..bf31729 100644
  use http_body_util::BodyExt;
  
 -use utils::in_flight::{LARGE_UPLOAD, LARGE_UPLOADS, Slot};
-+use utils::in_flight::{LARGE_UPLOAD, LARGE_UPLOADS, Slot, body_idle_timeout};
++use utils::in_flight::{LARGE_UPLOAD, LARGE_UPLOADS, Slot, body_idle_timeout, too_slow};
  
  use crate::HttpRequest;
  
@@ -41,12 +41,17 @@ index ed1606e..bf31729 100644
      TooLarge,
      /// The large bodies the server holds are at their budget: retry later.
      Busy,
-+    /// The body sent nothing for `STALWART_BODY_IDLE_SECS`.
++    /// The body sent nothing for `STALWART_BODY_IDLE_SECS`, or held budget below `BODY_MIN_RATE`.
 +    TimedOut,
  }
  
  pub async fn fetch_body(
-@@ -47,7 +49,21 @@ pub async fn fetch_body_or_busy(
+@@ -44,10 +46,26 @@ pub async fn fetch_body_or_busy(
+     // This body's share of the budget once it is large. It rides in the request's extensions, so it is given
+     // back when the request is dropped, after the handler is done with the body, not when it has been read.
+     let mut slot: Option<Slot> = None;
++    // When the slot was taken, and how much had been read then: its rate is counted from there.
++    let mut held_since = (std::time::Instant::now(), 0);
      // Once refused as busy: how much has been read. The rest is read and none of it kept, so the client can
      // read the refusal; closing on an unread body resets the connection, and the client sees a network error.
      let mut busy: Option<usize> = None;
@@ -69,6 +74,26 @@ index ed1606e..bf31729 100644
          if let Some(data) = frame.data_ref() {
              if let Some(read) = &mut busy {
                  *read += data.len();
+@@ -60,9 +78,19 @@ pub async fn fetch_body_or_busy(
+                 let total = bytes.len() + data.len();
+                 if total > LARGE_UPLOAD {
+                     let granted = if let Some(slot) = slot.as_mut() {
++                        if too_slow(total - held_since.1, held_since.0) {
++                            trc::event!(
++                                Network(trc::NetworkEvent::Timeout),
++                                SpanId = session_id,
++                                Contents = "The request body is holding upload budget too slowly",
++                                Size = total,
++                            );
++                            return Err(BodyRefusal::TimedOut);
++                        }
+                         slot.grow_to(total)
+                     } else {
+                         slot = LARGE_UPLOADS.try_acquire(total);
++                        held_since = (std::time::Instant::now(), bytes.len());
+                         slot.is_some()
+                     };
+                     if !granted {
 diff --git a/crates/http/src/request.rs b/crates/http/src/request.rs
 index 1e3b79b..56d1b74 100644
 --- a/crates/http/src/request.rs
@@ -116,20 +141,30 @@ index 1e3b79b..56d1b74 100644
                          }
                      }
 diff --git a/crates/imap-proto/src/receiver.rs b/crates/imap-proto/src/receiver.rs
-index f2b95dc..5d4c828 100644
+index f2b95dc..5e26b7b 100644
 --- a/crates/imap-proto/src/receiver.rs
 +++ b/crates/imap-proto/src/receiver.rs
-@@ -84,6 +84,9 @@ pub struct Receiver<T: CommandParser> {
+@@ -7,7 +7,8 @@
+ use super::{ResponseCode, ResponseType};
+ use compact_str::{CompactString, format_compact};
+ use std::fmt::Display;
+-use utils::in_flight::{LARGE_MESSAGE, LARGE_MESSAGES, Slot};
++use std::time::Instant;
++use utils::in_flight::{LARGE_MESSAGE, LARGE_MESSAGES, Slot, too_slow};
+ 
+ #[derive(Debug, Clone)]
+ pub enum Error {
+@@ -84,6 +85,9 @@ pub struct Receiver<T: CommandParser> {
      /// Whether large literals are counted at all: set by the session once it is authenticated, so a client
      /// that has not logged in cannot hold a slot.
      pub count_messages: bool,
-+    /// The literal being read is a large message, counted as its bytes arrive (MAI-1078), and what `large` held
-+    /// before it.
-+    counting: Option<usize>,
++    /// The literal being read is a large message, counted as its bytes arrive (MAI-1078): what `large` held before
++    /// it, and when its first bytes arrived.
++    counting: Option<(usize, Option<Instant>)>,
  }
  
  const ARG_MAX_LEN: usize = 8000;
-@@ -128,6 +131,7 @@ impl<T: CommandParser> Receiver<T> {
+@@ -128,6 +132,7 @@ impl<T: CommandParser> Receiver<T> {
          self.current_request_size = 0;
          self.large = None;
          self.busy = false;
@@ -137,7 +172,7 @@ index f2b95dc..5d4c828 100644
          err
      }
  
-@@ -363,25 +367,23 @@ impl<T: CommandParser> Receiver<T> {
+@@ -363,25 +368,23 @@ impl<T: CommandParser> Receiver<T> {
                                      // The client waits for a go-ahead it will not get.
                                      return Err(self.busy_reset());
                                  }
@@ -159,7 +194,7 @@ index f2b95dc..5d4c828 100644
 +                                    if LARGE_MESSAGES.has_room(size as usize) {
 +                                        // A MULTIAPPEND's large literals share one slot, which grows by each.
 +                                        self.counting =
-+                                            Some(self.large.as_ref().map_or(0, Slot::bytes));
++                                            Some((self.large.as_ref().map_or(0, Slot::bytes), None));
 +                                    } else if !non_sync {
 +                                        return Err(self.busy_reset());
                                      } else {
@@ -173,27 +208,30 @@ index f2b95dc..5d4c828 100644
                                          // A non-sync literal is on its way already: read it and drop it.
                                          self.busy = true;
                                      }
-@@ -461,6 +463,38 @@ impl<T: CommandParser> Receiver<T> {
+@@ -461,6 +464,41 @@ impl<T: CommandParser> Receiver<T> {
                      }
                  }
                  State::LiteralData { remaining } => {
-+                    if let Some(before) = self.counting
-+                        && before + self.buf.len() >= self.large.as_ref().map_or(0, Slot::bytes)
++                    if let Some((before, since)) = &mut self.counting
++                        && *before + self.buf.len() >= self.large.as_ref().map_or(0, Slot::bytes)
 +                    {
-+                        // Counted as it arrives: the bytes of this read, up to the literal's end.
-+                        let total = before
++                        // Counted as it arrives: the bytes of this read, up to the literal's end. Once a read
++                        // at a time, so the rate is checked then too.
++                        let total = *before
 +                            + self.buf.len()
 +                            + (remaining as usize).min(bytes.as_slice().len() + 1);
-+                        let granted = if let Some(slot) = self.large.as_mut() {
-+                            slot.grow_to(total)
-+                        } else {
-+                            self.large = LARGE_MESSAGES.try_acquire(total);
-+                            self.large.is_some()
-+                        };
++                        let since = *since.get_or_insert_with(Instant::now);
++                        let granted = !too_slow(self.buf.len(), since)
++                            && if let Some(slot) = self.large.as_mut() {
++                                slot.grow_to(total)
++                            } else {
++                                self.large = LARGE_MESSAGES.try_acquire(total);
++                                self.large.is_some()
++                            };
 +                        if !granted {
-+                            // The client was told to send it: the rest is read and dropped, with what it held,
-+                            // and the request is refused at its end. A MULTIAPPEND's earlier literals go now too,
-+                            // since their share of the slot does.
++                            // Out of budget, or too slow: the client was told to send it, so the rest is read and
++                            // dropped, with what it held, and the request is refused at its end. A MULTIAPPEND's
++                            // earlier literals go now too, since their share of the slot does.
 +                            self.large = None;
 +                            self.request.tokens = Vec::new();
 +                            self.counting = None;
@@ -212,7 +250,7 @@ index f2b95dc..5d4c828 100644
                      // SAFETY: We checked the size before entering this state
                      self.buf.push_unchecked(ch);
  
-@@ -653,6 +687,7 @@ impl<T: CommandParser> Default for Receiver<T> {
+@@ -653,6 +691,7 @@ impl<T: CommandParser> Default for Receiver<T> {
              large: None,
              busy: false,
              count_messages: false,
@@ -237,7 +275,7 @@ index 3ba4948..a5e750c 100644
                      } else {
                          self.server.core.imap.timeout_unauth
 diff --git a/crates/utils/src/in_flight.rs b/crates/utils/src/in_flight.rs
-index cb2a2e4..7a0d99f 100644
+index cb2a2e4..08c4c3f 100644
 --- a/crates/utils/src/in_flight.rs
 +++ b/crates/utils/src/in_flight.rs
 @@ -12,9 +12,12 @@
@@ -252,11 +290,11 @@ index cb2a2e4..7a0d99f 100644
 +        OnceLock,
 +        atomic::{AtomicUsize, Ordering},
 +    },
-+    time::Duration,
++    time::{Duration, Instant},
  };
  
  /// An HTTP request body past this size counts against `STALWART_MAX_LARGE_UPLOAD_MIB`.
-@@ -31,10 +34,32 @@ pub static LARGE_UPLOADS: Budget = Budget::new("STALWART_MAX_LARGE_UPLOAD_MIB");
+@@ -31,10 +34,45 @@ pub static LARGE_UPLOADS: Budget = Budget::new("STALWART_MAX_LARGE_UPLOAD_MIB");
  /// Messages arriving by SMTP DATA or BDAT, or by IMAP APPEND.
  pub static LARGE_MESSAGES: Budget = Budget::new("STALWART_MAX_LARGE_MESSAGE_MIB");
  
@@ -267,6 +305,19 @@ index cb2a2e4..7a0d99f 100644
      LARGE_UPLOADS.max();
      LARGE_MESSAGES.max();
 +    body_idle_timeout();
++}
++
++/// The least a body holding budget must average once past `body_idle_timeout()` of grace, so a client that sends a
++/// burst and then a trickle cannot hold its share at next to no bandwidth (Bill, MAI-1078). A genuine upload slower
++/// than this (0.13 Mbit/s) is refused and has to be retried.
++pub const BODY_MIN_RATE: u64 = 16 * 1024;
++
++/// Whether a body that has sent `bytes` since it began holding budget at `since` is below `BODY_MIN_RATE`.
++pub fn too_slow(bytes: usize, since: Instant) -> bool {
++    since
++        .elapsed()
++        .checked_sub(body_idle_timeout())
++        .is_some_and(|late| (bytes as u128) < BODY_MIN_RATE as u128 * late.as_millis() / 1000)
 +}
 +
 +/// How long a body holding budget may send nothing before it is ended (MAI-1078): an HTTP request body, which
@@ -290,7 +341,7 @@ index cb2a2e4..7a0d99f 100644
  }
  
  pub struct Budget {
-@@ -72,15 +97,24 @@ impl Budget {
+@@ -72,15 +110,24 @@ impl Budget {
          })
      }
  

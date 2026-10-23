@@ -58,8 +58,9 @@
 #    beyond the bytes it sent. An IMAP APPEND literal is counted as its bytes arrive, not at its declared {n} (one that
 #    would not fit now is still refused before "+"; one that runs out partway is read, dropped and answered NO
 #    [UNAVAILABLE]), and a body holding budget that sends nothing for STALWART_BODY_IDLE_SECS (60 unset) is ended: HTTP
-#    with 408, an IMAP literal with its session. 0010 held a declared literal's whole size until the IMAP timeout (30
-#    min), and upstream reads an HTTP body with no timeout (MainThrive MAI-1078).
+#    with 408, an IMAP literal with its session; one that trickles below 16 KiB/s past that grace is refused (HTTP 408,
+#    IMAP read, dropped and NO). 0010 held a declared literal's whole size until the IMAP timeout (30 min), and upstream
+#    reads an HTTP body with no timeout (MainThrive MAI-1078).
 # Everything else is upstream: the tag's source, its Dockerfile, its features.
 # The release tag is pushed only from main; a dispatch from another branch pushes branch-<short sha>
 # instead, and a pull request runs every step but the registry login and the push (MAI-1019). A release tag is
@@ -625,7 +626,7 @@ jobs:
             'FAIL the failed lookup is logged' \
             'FAIL a row that is not a line is logged'
 
-      - name: A client that stops sending holds no budget beyond what it sent, an IMAP literal refused partway leaves its session usable, and a body or literal idle 5 s is ended (end to end, the built image)
+      - name: A client that stops sending holds no budget beyond what it sent, an IMAP literal refused partway leaves its session usable, and a body or literal idle 5 s, or trickling below 16 KiB/s, is ended (end to end, the built image)
         run: bash patch/scripts/e2e-stalled-bodies.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
 
       # The controls are required too: they pass on -bodycap1, so the failures are the two holes and not a broken rig.
@@ -639,10 +640,13 @@ jobs:
             'PASS and its session is still usable' \
             'FAIL a literal that stops partway is ended after 5 s, with its session' \
             'FAIL and what it held comes back: a 97 MiB message is accepted' \
+            'FAIL a literal that trickles below 16 KiB/s after the 5 s grace is refused, read to its end' \
+            'PASS and its session is still usable after the trickle' \
             'PASS while two stalled uploads hold 26 MiB, a third is refused (the budget is held)' \
             'FAIL and its budget comes back: a following WebDAV upload is accepted' \
             'FAIL an HTTP body that sends nothing for longer than 5 s is ended' \
             'FAIL a stalled JMAP upload is ended the same way' \
+            'FAIL an HTTP body that trickles below 16 KiB/s after the 5 s grace is ended with 408' \
             'PASS a slow body that keeps sending (1 MiB every 3 s) is not ended'
 
       # ⛔ The release tag is pushed only from main (a push, or a dispatch on main). A dispatch from any

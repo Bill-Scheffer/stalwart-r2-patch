@@ -437,7 +437,14 @@ so that other customers' large messages or uploads got the retryable refusal whi
 - A body holding budget that sends nothing for **`STALWART_BODY_IDLE_SECS`** (60 when unset; a value that is not a
   positive whole number of seconds is logged at startup and read as 60) is ended, and what it held goes back: an HTTP
   request with `408`, an IMAP literal with its session (`* BYE`, as the session's own timeout does). The timeout is per
-  read, not for the whole body, so a slow upload that keeps sending is never ended. Every HTTP body read through
+  read, not for the whole body, so a slow upload that keeps sending is never ended.
+- A body that keeps sending but holds budget below **16 KiB/s** on average, once past that same grace, is refused the
+  same way: an HTTP request with `408`; an IMAP literal is read to its end and dropped, holding nothing, and answered
+  `NO [UNAVAILABLE]`. Without it, a burst and then a byte a minute held a share at next to no bandwidth. HTTP counts
+  the rate from when the body began holding budget (past 1 MiB), IMAP from the literal's first byte. ⚠️ **The trade:**
+  a genuine upload slower than 16 KiB/s (0.13 Mbit/s) is refused and has to be retried (Bill, MainThrive MAI-1078).
+  A fixed constant, `BODY_MIN_RATE`.
+- Every HTTP body read through
   `fetch_body` has it; the management API and form bodies, whose callers know only "too large", answer as for a body
   too large.
 
@@ -447,7 +454,8 @@ held by two SMTP messages, one of the stalled clients sends all but 4 MiB of its
 once the SMTP messages finish, a 97 MiB message is accepted while it is still short of its end and the other is still
 declared, so neither holds anything. Its literal is then answered `NO [UNAVAILABLE]`, and the same session's `NOOP` and
 retried `APPEND` succeed. A literal that sends 30 MiB and stops gets `* BYE` after 5 s, and a 97 MiB message is accepted
-before the client closes its side. Then two WebDAV `PUT`s stall at 13 MiB: a third upload is refused while they hold the budget, after 5 s a
+before the client closes its side. A literal that sends 64 KiB and then 1 KiB every 2 s is answered `NO [UNAVAILABLE]`
+once sent, and its session goes on; an HTTP body that does the same past 1 MiB gets `408`. Then two WebDAV `PUT`s stall at 13 MiB: a third upload is refused while they hold the budget, after 5 s a
 WebDAV and a JMAP upload are accepted while the stalled clients are still connected, both stalled requests get `408`,
 and so does a stalled JMAP upload, while a body sending 1 MiB every 3 s is stored. Against `-bodycap1`
 (`MAI1077_BUG_REFERENCE_IMAGE`) each hold FAILs and the controls pass; the build requires both.
