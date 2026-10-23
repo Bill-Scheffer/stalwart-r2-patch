@@ -425,25 +425,29 @@ so that other customers' large messages or uploads got the retryable refusal whi
   ~50 MiB of the message budget and four held a 200 MiB one.
 - **An HTTP body had no read timeout.** Upstream reads a request body with none, so a WebDAV `PUT` or JMAP upload that
   stopped sending kept its share of the upload budget for as long as it kept the connection open. SMTP's equivalent is
-  bounded by its own timeout.
+  bounded by its own timeout. An IMAP literal that stopped partway waited the session's (30 minutes).
 
 [`patches/0016-stalled-bodies-hold-no-budget.patch`](patches/0016-stalled-bodies-hold-no-budget.patch):
 
 - An `APPEND` literal past 5 MiB is counted as its bytes arrive, a read at a time, as `BDAT` already was. One that would
   not fit in the budget as it stands is still refused before `+`, as before, but nothing is held for it until it is
   sent. One that runs out of budget partway is dropped with what it held, the rest of it is read and dropped (the
-  client was told to send it), and the command is answered `NO [UNAVAILABLE]` at its end; the session goes on.
-- A request body that sends nothing for **`STALWART_HTTP_BODY_IDLE_SECS`** (60 when unset; a value that is not a whole
-  number of seconds is logged and read as 60) is ended with `408`, and what it held goes back. The timeout is per read,
-  not for the whole body, so a slow upload that keeps sending is never ended. Every body read through
+  client was told to send it), and the command is answered `NO [UNAVAILABLE]` at its end; the session goes on. A
+  `MULTIAPPEND`'s earlier literals are dropped with it, since their share goes too.
+- A body holding budget that sends nothing for **`STALWART_BODY_IDLE_SECS`** (60 when unset; a value that is not a
+  positive whole number of seconds is logged at startup and read as 60) is ended, and what it held goes back: an HTTP
+  request with `408`, an IMAP literal with its session (`* BYE`, as the session's own timeout does). The timeout is per
+  read, not for the whole body, so a slow upload that keeps sending is never ended. Every HTTP body read through
   `fetch_body` has it; the management API and form bodies, whose callers know only "too large", answer as for a body
   too large.
 
 [`scripts/e2e-stalled-bodies.sh`](scripts/e2e-stalled-bodies.sh) sets 30 MiB, 110 MiB and 5 s. Two clients declare
-48 MiB literals and send nothing, and a 52 MiB message and a 40 MiB `APPEND` are accepted meanwhile. With the budget
-then held by two 50 MiB SMTP messages, one of the stalled clients sends its literal: it is refused partway, read to its
-end, and the same session's `NOOP` and retried `APPEND` succeed; with the other still declared, a 97 MiB message is
-accepted. Then two WebDAV `PUT`s stall at 13 MiB: a third upload is refused while they hold the budget, after 5 s a
+48 MiB literals and send nothing, and a 52 MiB message and a 40 MiB `APPEND` are accepted meanwhile. With 80 MiB then
+held by two SMTP messages, one of the stalled clients sends all but 4 MiB of its literal and runs out at about 30 MiB;
+once the SMTP messages finish, a 97 MiB message is accepted while it is still short of its end and the other is still
+declared, so neither holds anything. Its literal is then answered `NO [UNAVAILABLE]`, and the same session's `NOOP` and
+retried `APPEND` succeed. A literal that sends 30 MiB and stops gets `* BYE` after 5 s, and a 97 MiB message is accepted
+before the client closes its side. Then two WebDAV `PUT`s stall at 13 MiB: a third upload is refused while they hold the budget, after 5 s a
 WebDAV and a JMAP upload are accepted while the stalled clients are still connected, both stalled requests get `408`,
 and so does a stalled JMAP upload, while a body sending 1 MiB every 3 s is stored. Against `-bodycap1`
 (`MAI1077_BUG_REFERENCE_IMAGE`) each hold FAILs and the controls pass; the build requires both.

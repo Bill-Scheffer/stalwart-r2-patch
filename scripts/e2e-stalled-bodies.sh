@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end: a logged-in client that stops sending holds none of 0010's budgets beyond the bytes it sent, and an HTTP
-# body that sends nothing for STALWART_HTTP_BODY_IDLE_SECS is ended, with what it held given back.
+# body that sends nothing for STALWART_BODY_IDLE_SECS is ended, with what it held given back.
 # usage: e2e-stalled-bodies.sh <stalwart image>
 #
 # 0010 (-bodycap1) claimed message budget at an IMAP literal's {n}, before the server sent "+" and before any byte
@@ -8,12 +8,13 @@
 # IMAP's request limit is 50 MiB by default, so one client held up to ~50 MiB and four held production's 200 MiB.
 # Patch 0016 counts a literal's bytes as they arrive; one that would not fit now is still refused before "+", and one
 # that runs out of budget partway is read to its end and dropped, then answered NO [UNAVAILABLE], and the session
-# goes on. Here the message budget is 110 MiB: two clients declare 48 MiB literals and send nothing (96 MiB on
-# -bodycap1), and a 52 MiB message and a 40 MiB APPEND are accepted meanwhile.
+# goes on; one that stops partway is ended after STALWART_BODY_IDLE_SECS, as an HTTP body is, not IMAP's 30 minutes.
+# Here the message budget is 110 MiB: two clients declare 48 MiB literals and send nothing (96 MiB on -bodycap1), and
+# a 52 MiB message and a 40 MiB APPEND are accepted meanwhile.
 #
 # HTTP: upstream reads a body with no timeout, so an upload that stops sending held its share of the upload budget
 # for as long as the connection stayed open. 0016 ends a request whose body sends nothing for
-# STALWART_HTTP_BODY_IDLE_SECS (here 5) with 408, and its slot goes back. Here the upload budget is 30 MiB: two
+# STALWART_BODY_IDLE_SECS (here 5) with 408, and its slot goes back. Here the upload budget is 30 MiB: two
 # WebDAV PUTs stall at 13 MiB each, are ended, and a following upload is accepted; a slow body that keeps sending is
 # not ended. Against -bodycap1 the stalled-body checks FAIL (it has neither change).
 set -euo pipefail
@@ -27,7 +28,7 @@ ADMIN=$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | cut -c1-24)
 docker network create "$NET" >/dev/null
 docker run -d --name "$C" --network "$NET" --network-alias stalwart --hostname mail.one.test \
   -e STALWART_RECOVERY_ADMIN="admin:$ADMIN" -e STALWART_MAX_LARGE_UPLOAD_MIB=30 -e STALWART_MAX_LARGE_MESSAGE_MIB=110 \
-  -e STALWART_HTTP_BODY_IDLE_SECS=5 \
+  -e STALWART_BODY_IDLE_SECS=5 \
   -v "$W/etc:/etc/stalwart" -v "$W/data:/var/lib/stalwart" "$IMG" >/dev/null
 docker run -d --name "$K" --network "$NET" -e ADMIN="$ADMIN" python:3.12-alpine sleep 900 >/dev/null
 docker exec -i "$K" python3 - <<'PY'
@@ -91,12 +92,12 @@ def smtp(n,size):
     if st=="ok": s.c.sendall(eml(size)); st=s.cmd(b".\r\n")
     s.close(); return st
 class HeldMessage(threading.Thread):
-    # An SMTP message of 52 MiB that sends 50 MiB of it, then waits for `go` before the rest.
+    # An SMTP message of 42 MiB that sends 40 MiB of it, then waits for `go` before the rest.
     def __init__(self,n,go): super().__init__(); self.n=n; self.go=go; self.code=None; self.sent=threading.Event()
     def run(self):
         s=Smtp(); st=s.begin(self.n)
         if st!="ok": self.code=st; self.sent.set(); return
-        m=eml(52*MiB); s.c.sendall(m[:50*MiB]); self.sent.set(); self.go.wait(); s.c.sendall(m[50*MiB:]); self.code=s.cmd(b".\r\n"); s.close()
+        m=eml(42*MiB); s.c.sendall(m[:40*MiB]); self.sent.set(); self.go.wait(); s.c.sendall(m[40*MiB:]); self.code=s.cmd(b".\r\n"); s.close()
 class Imap:
     def __init__(self,n):
         self.c=ssl._create_unverified_context().wrap_socket(socket.create_connection(("stalwart",993),timeout=120))
@@ -122,22 +123,34 @@ st=smtp(NAMES[2],52*MiB)
 check(st=="250", "while two 48 MiB sync literals are declared and send nothing, a 52 MiB message is accepted", st)
 i=Imap(NAMES[3]); got=i.append(b"b",40*MiB) if i.ok else "LOGIN failed"; i.c.close()
 check(got.startswith("b OK"), "and a 40 MiB IMAP APPEND", got)
-# Now fill the budget, then let one stalled client send its literal: it runs out partway.
+# Hold 80 of the 110 MiB, then let one stalled client send most of its literal: it runs out at about 30 MiB.
 go=threading.Event(); held=[HeldMessage(NAMES[4],go),HeldMessage(NAMES[5],go)]; [h.start() for h in held]
-[h.sent.wait() for h in held]; time.sleep(3)   # both messages are at 50 MiB on the server: 100 of the 110 MiB held
+[h.sent.wait() for h in held]; time.sleep(3)   # both messages are at 40 MiB on the server
 S1=stalled[0]
-S1.c.sendall(b"A"*LIT+b"\r\n"); got=S1.tagged(b"s")
+S1.c.sendall(b"A"*(LIT-4*MiB)); time.sleep(3)
+go.set(); [h.join() for h in held]
+check([h.code for h in held]==["250","250"], "the two held messages are accepted", [h.code for h in held])
+# S1 is 4 MiB short of its literal's end and S2 is still declared: if either held anything, ~100 MiB would not fit.
+st=smtp(NAMES[6],97*MiB)
+check(st=="250", "the literal refused partway gave back what it held at once, and the one still declared holds nothing: a 97 MiB message is accepted", st)
+S1.c.sendall(b"A"*4*MiB+b"\r\n"); got=S1.tagged(b"s")
 check(got.startswith("s NO [UNAVAILABLE]"), "a stalled literal sent later, while the budget is full, is refused partway and read to its end", got)
 got=S1.cmd(b"t",b"NOOP")
 check(got.startswith("t OK"), "and its session is still usable", got)
-go.set(); [h.join() for h in held]
-check([h.code for h in held]==["250","250"], "the two held messages are accepted", [h.code for h in held])
-# The second stalled client is still open with its literal declared: the whole budget must be free.
-st=smtp(NAMES[6],97*MiB)
-check(st=="250", "the refused literal gave back what it held, and the one still declared holds nothing: a 97 MiB message is accepted", st)
 got=S1.append(b"u",LIT-MiB)
 check(got.startswith("u OK"), "the refused APPEND is stored on retry, in the same session", got)
 [s.c.close() for s in stalled]
+# A literal that stops partway holds what it sent only for the idle timeout, as an HTTP body does, not IMAP's 30 min.
+S3=Imap(NAMES[7]); got=S3.declare(b"s",LIT) if S3.ok else "LOGIN failed"
+if got.startswith("+"):
+    S3.c.sendall(b"A"*30*MiB); S3.c.settimeout(15)
+    try: got=S3.f.readline().strip().decode(errors="replace")[:60]
+    except OSError as e: got=type(e).__name__
+check(got.startswith("* BYE"), "a literal that stops partway is ended after 5 s, with its session", got)
+# Still open from this side, so only the server can have let go.
+st=smtp(NAMES[8],97*MiB)
+check(st=="250", "and what it held comes back: a 97 MiB message is accepted", st)
+S3.c.close()
 
 # --- HTTP: a body that sends nothing for 5 s is ended, and its slot goes back ----------------------------------
 def dav(n,size,name="f.bin"): return req(f"/dav/file/{n}%40one.test/{name}",AU[n],os.urandom(size),"application/octet-stream","PUT")

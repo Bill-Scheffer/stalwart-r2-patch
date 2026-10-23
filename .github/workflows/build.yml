@@ -57,9 +57,9 @@
 # 16. patches/0016-stalled-bodies-hold-no-budget.patch: a logged-in client that stops sending holds none of 0010's budgets
 #    beyond the bytes it sent. An IMAP APPEND literal is counted as its bytes arrive, not at its declared {n} (one that
 #    would not fit now is still refused before "+"; one that runs out partway is read, dropped and answered NO
-#    [UNAVAILABLE]), and an HTTP body that sends nothing for STALWART_HTTP_BODY_IDLE_SECS (60 unset) is ended with 408.
-#    0010 held a declared literal's whole size until the IMAP timeout, and upstream reads a body with no timeout
-#    (MainThrive MAI-1078).
+#    [UNAVAILABLE]), and a body holding budget that sends nothing for STALWART_BODY_IDLE_SECS (60 unset) is ended: HTTP
+#    with 408, an IMAP literal with its session. 0010 held a declared literal's whole size until the IMAP timeout (30
+#    min), and upstream reads an HTTP body with no timeout (MainThrive MAI-1078).
 # Everything else is upstream: the tag's source, its Dockerfile, its features.
 # The release tag is pushed only from main; a dispatch from another branch pushes branch-<short sha>
 # instead, and a pull request runs every step but the registry login and the push (MAI-1019). A release tag is
@@ -423,7 +423,7 @@ jobs:
           P=../patch/patches/0016-stalled-bodies-hold-no-budget.patch
           git apply --check "$P" && git apply "$P"
           got=$(git diff --name-only | sort | tr '\n' ' ')
-          [ "$got" = "crates/dav/src/request.rs crates/http-proto/Cargo.toml crates/http-proto/src/request.rs crates/http/src/request.rs crates/imap-proto/src/receiver.rs crates/utils/src/in_flight.rs " ] \
+          [ "$got" = "crates/dav/src/request.rs crates/http-proto/Cargo.toml crates/http-proto/src/request.rs crates/http/src/request.rs crates/imap-proto/src/receiver.rs crates/imap/src/core/session.rs crates/utils/src/in_flight.rs " ] \
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
@@ -625,7 +625,7 @@ jobs:
             'FAIL the failed lookup is logged' \
             'FAIL a row that is not a line is logged'
 
-      - name: A client that stops sending holds no budget beyond what it sent, an IMAP literal refused partway leaves its session usable, and a body idle 5 s is ended (end to end, the built image)
+      - name: A client that stops sending holds no budget beyond what it sent, an IMAP literal refused partway leaves its session usable, and a body or literal idle 5 s is ended (end to end, the built image)
         run: bash patch/scripts/e2e-stalled-bodies.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
 
       # The controls are required too: they pass on -bodycap1, so the failures are the two holes and not a broken rig.
@@ -634,9 +634,11 @@ jobs:
           bash patch/scripts/previous-must-fail.sh "${MAI1077_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-stalled-bodies.sh \
             'PASS two clients each declare a 48 MiB sync literal and are told to send it' \
             'FAIL while two 48 MiB sync literals are declared and send nothing, a 52 MiB message is accepted' \
+            'FAIL the literal refused partway gave back what it held at once, and the one still declared holds nothing: a 97 MiB message is accepted' \
             'FAIL a stalled literal sent later, while the budget is full, is refused partway and read to its end' \
             'PASS and its session is still usable' \
-            'FAIL the refused literal gave back what it held, and the one still declared holds nothing: a 97 MiB message is accepted' \
+            'FAIL a literal that stops partway is ended after 5 s, with its session' \
+            'FAIL and what it held comes back: a 97 MiB message is accepted' \
             'PASS while two stalled uploads hold 26 MiB, a third is refused (the budget is held)' \
             'FAIL and its budget comes back: a following WebDAV upload is accepted' \
             'FAIL an HTTP body that sends nothing for longer than 5 s is ended' \

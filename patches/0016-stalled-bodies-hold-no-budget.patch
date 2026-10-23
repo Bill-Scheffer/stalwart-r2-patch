@@ -25,7 +25,7 @@ index aff9639..d65dab6 100644
  serde = { version = "1.0", features = ["derive"]}
  serde_json = "1.0"
 diff --git a/crates/http-proto/src/request.rs b/crates/http-proto/src/request.rs
-index ed1606e..aa91b1a 100644
+index ed1606e..bf31729 100644
 --- a/crates/http-proto/src/request.rs
 +++ b/crates/http-proto/src/request.rs
 @@ -9,7 +9,7 @@ use std::{borrow::Cow, sync::Arc};
@@ -41,7 +41,7 @@ index ed1606e..aa91b1a 100644
      TooLarge,
      /// The large bodies the server holds are at their budget: retry later.
      Busy,
-+    /// The body sent nothing for `STALWART_HTTP_BODY_IDLE_SECS`.
++    /// The body sent nothing for `STALWART_BODY_IDLE_SECS`.
 +    TimedOut,
  }
  
@@ -116,7 +116,7 @@ index 1e3b79b..56d1b74 100644
                          }
                      }
 diff --git a/crates/imap-proto/src/receiver.rs b/crates/imap-proto/src/receiver.rs
-index f2b95dc..43283d0 100644
+index f2b95dc..5d4c828 100644
 --- a/crates/imap-proto/src/receiver.rs
 +++ b/crates/imap-proto/src/receiver.rs
 @@ -84,6 +84,9 @@ pub struct Receiver<T: CommandParser> {
@@ -173,7 +173,7 @@ index f2b95dc..43283d0 100644
                                          // A non-sync literal is on its way already: read it and drop it.
                                          self.busy = true;
                                      }
-@@ -461,6 +463,36 @@ impl<T: CommandParser> Receiver<T> {
+@@ -461,6 +463,38 @@ impl<T: CommandParser> Receiver<T> {
                      }
                  }
                  State::LiteralData { remaining } => {
@@ -192,8 +192,10 @@ index f2b95dc..43283d0 100644
 +                        };
 +                        if !granted {
 +                            // The client was told to send it: the rest is read and dropped, with what it held,
-+                            // and the request is refused at its end.
++                            // and the request is refused at its end. A MULTIAPPEND's earlier literals go now too,
++                            // since their share of the slot does.
 +                            self.large = None;
++                            self.request.tokens = Vec::new();
 +                            self.counting = None;
 +                            self.busy = true;
 +                            self.buf = ArgumentBuffer::default();
@@ -210,7 +212,7 @@ index f2b95dc..43283d0 100644
                      // SAFETY: We checked the size before entering this state
                      self.buf.push_unchecked(ch);
  
-@@ -653,6 +685,7 @@ impl<T: CommandParser> Default for Receiver<T> {
+@@ -653,6 +687,7 @@ impl<T: CommandParser> Default for Receiver<T> {
              large: None,
              busy: false,
              count_messages: false,
@@ -218,8 +220,24 @@ index f2b95dc..43283d0 100644
          }
      }
  }
+diff --git a/crates/imap/src/core/session.rs b/crates/imap/src/core/session.rs
+index 3ba4948..a5e750c 100644
+--- a/crates/imap/src/core/session.rs
++++ b/crates/imap/src/core/session.rs
+@@ -52,7 +52,10 @@ impl<T: SessionStream> Session<T> {
+         loop {
+             tokio::select! {
+                 result = tokio::time::timeout(
+-                    if !matches!(self.state, State::NotAuthenticated {..}) {
++                    if self.receiver.large.is_some() {
++                        // A literal holding message budget may stall no longer than an HTTP body (MAI-1078).
++                        utils::in_flight::body_idle_timeout()
++                    } else if !matches!(self.state, State::NotAuthenticated {..}) {
+                         self.server.core.imap.timeout_auth
+                     } else {
+                         self.server.core.imap.timeout_unauth
 diff --git a/crates/utils/src/in_flight.rs b/crates/utils/src/in_flight.rs
-index cb2a2e4..ad1da10 100644
+index cb2a2e4..7a0d99f 100644
 --- a/crates/utils/src/in_flight.rs
 +++ b/crates/utils/src/in_flight.rs
 @@ -12,9 +12,12 @@
@@ -251,18 +269,18 @@ index cb2a2e4..ad1da10 100644
 +    body_idle_timeout();
 +}
 +
-+/// How long an HTTP request body may send nothing before the request is ended (MAI-1078): upstream reads a body with
-+/// no timeout, so a client that stops sending held what it had of `STALWART_MAX_LARGE_UPLOAD_MIB` for as long as it
-+/// kept the connection open. `STALWART_HTTP_BODY_IDLE_SECS`, 60 when unset or unreadable.
++/// How long a body holding budget may send nothing before it is ended (MAI-1078): an HTTP request body, which
++/// upstream reads with no timeout, and an IMAP literal, which waited the session's 30 minutes. Until then it holds what
++/// it has of its budget. `STALWART_BODY_IDLE_SECS`, 60 when unset or unreadable.
 +pub fn body_idle_timeout() -> Duration {
 +    static TIMEOUT: OnceLock<Duration> = OnceLock::new();
-+    const VAR: &str = "STALWART_HTTP_BODY_IDLE_SECS";
++    const VAR: &str = "STALWART_BODY_IDLE_SECS";
 +    *TIMEOUT.get_or_init(|| {
 +        Duration::from_secs(match std::env::var(VAR) {
 +            Ok(v) => match v.trim().parse::<u64>() {
 +                Ok(secs) if secs > 0 => secs,
 +                _ => {
-+                    eprintln!("ERROR {VAR}={v:?} is not a whole number of seconds: using 60");
++                    eprintln!("ERROR {VAR}={v:?} is not a positive whole number of seconds: using 60");
 +                    60
 +                }
 +            },
