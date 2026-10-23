@@ -1,4 +1,4 @@
-# Builds Stalwart from its own release source with FOURTEEN changes, each pinned to its exact files:
+# Builds Stalwart from its own release source with FIFTEEN changes, each pinned to its exact files:
 # 1. (retired) rust-s3 used to be taken from the commit of rust-s3 PR #467, which stops DeleteObject signing
 #    headers it never sends; without it every blob DELETE against Cloudflare R2 failed with SignatureDoesNotMatch
 #    (rust-s3 #466, Stalwart #3185). rust-s3 0.38.0 carries the fix (6c97cb9) and Stalwart v0.16.26 moved to it,
@@ -54,6 +54,12 @@
 #    keyed by its id, moves where its mail turns to Junk by rescaling its spam percentage at delivery, so the line maps to
 #    50 for every reader (Junk, Sieve's spamtest, X-Spam-Status). Upstream has one global line (MainThrive MAI-1070). A
 #    lookup that fails, or a value that is not a line, delivers at Normal and is logged: never a deferral.
+# 16. patches/0016-stalled-bodies-hold-no-budget.patch: a logged-in client that stops sending holds none of 0010's budgets
+#    beyond the bytes it sent. An IMAP APPEND literal is counted as its bytes arrive, not at its declared {n} (one that
+#    would not fit now is still refused before "+"; one that runs out partway is read, dropped and answered NO
+#    [UNAVAILABLE]), and an HTTP body that sends nothing for STALWART_HTTP_BODY_IDLE_SECS (60 unset) is ended with 408.
+#    0010 held a declared literal's whole size until the IMAP timeout, and upstream reads a body with no timeout
+#    (MainThrive MAI-1078).
 # Everything else is upstream: the tag's source, its Dockerfile, its features.
 # The release tag is pushed only from main; a dispatch from another branch pushes branch-<short sha>
 # instead, and a pull request runs every step but the registry login and the push (MAI-1019). A release tag is
@@ -91,7 +97,7 @@ env:
   RUSTS3_VERSION: 0.38.0
   IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch
   # The tag after the Stalwart release: bump it with any change to what is built.
-  VARIANT: tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1-textcap1-totponce1-dsnhdrs1-dsnfull1-spamlevel1
+  VARIANT: tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1-textcap1-totponce1-dsnhdrs1-dsnfull1-spamlevel1-stall1
   # A FIXED image that HAS the expired-ban bug (the last build before 0006), which the ban-expiry check must FAIL
   # on the bug's own line: that proves the check can fail. ⛔ NEVER bumped with releases: every build after 0006
   # lacks the bug and PASSES the check, so it could never be the reference. Pinned by tag AND digest, because a tag
@@ -119,6 +125,8 @@ env:
   # The same for 0015: the last build before it (production's image until then), which reads no level, so the spam-level
   # check must FAIL on Strict and Lenient and on what 0015 logs, and pass on Normal. ⛔ NEVER bumped, for the same reason.
   MAI1070_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:pinned-782dcfbd03bb@sha256:782dcfbd03bbd9b75126f5ac25b8cb3a4d6541dfbe1ee5ff116fff15b272060e
+  # 0016's check FAILS on MAI1077_BUG_REFERENCE_IMAGE (-bodycap1, the build that introduced the two holes; every build
+  # since carries them unchanged until 0016), so it needs no reference of its own.
 
 jobs:
   build:
@@ -405,6 +413,20 @@ jobs:
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
+          # Stage 0015, so the next step's diff under crates/ is 0016 alone.
+          git add -- crates/
+
+      - name: Apply the stalled-body patch, and prove it changed only its own files
+        working-directory: stalwart
+        run: |
+          set -eu
+          P=../patch/patches/0016-stalled-bodies-hold-no-budget.patch
+          git apply --check "$P" && git apply "$P"
+          got=$(git diff --name-only | sort | tr '\n' ' ')
+          [ "$got" = "crates/dav/src/request.rs crates/http-proto/Cargo.toml crates/http-proto/src/request.rs crates/http/src/request.rs crates/imap-proto/src/receiver.rs crates/utils/src/in_flight.rs " ] \
+            || { echo "::error::changed files: $got"; exit 1; }
+          diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
+            || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
 
       - name: Swap, as Stalwart's own CI adds for its release build
         run: |
@@ -602,6 +624,24 @@ jobs:
             "PASS control: Stalwart's log records every delivery" \
             'FAIL the failed lookup is logged' \
             'FAIL a row that is not a line is logged'
+
+      - name: A client that stops sending holds no budget beyond what it sent, an IMAP literal refused partway leaves its session usable, and a body idle 5 s is ended (end to end, the built image)
+        run: bash patch/scripts/e2e-stalled-bodies.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
+
+      # The controls are required too: they pass on -bodycap1, so the failures are the two holes and not a broken rig.
+      - name: The same check FAILS on -bodycap1, on each hold, and its controls PASS there
+        run: |
+          bash patch/scripts/previous-must-fail.sh "${MAI1077_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-stalled-bodies.sh \
+            'PASS two clients each declare a 48 MiB sync literal and are told to send it' \
+            'FAIL while two 48 MiB sync literals are declared and send nothing, a 52 MiB message is accepted' \
+            'FAIL a stalled literal sent later, while the budget is full, is refused partway and read to its end' \
+            'PASS and its session is still usable' \
+            'FAIL the refused literal gave back what it held, and the one still declared holds nothing: a 97 MiB message is accepted' \
+            'PASS while two stalled uploads hold 26 MiB, a third is refused (the budget is held)' \
+            'FAIL and its budget comes back: a following WebDAV upload is accepted' \
+            'FAIL an HTTP body that sends nothing for longer than 5 s is ended' \
+            'FAIL a stalled JMAP upload is ended the same way' \
+            'PASS a slow body that keeps sending (1 MiB every 3 s) is not ended'
 
       # ⛔ The release tag is pushed only from main (a push, or a dispatch on main). A dispatch from any
       # other branch pushes the same tested image under branch-<short sha> alone, never the release tag,

@@ -236,8 +236,8 @@ so a count would bound nothing:
 Unset, a budget is no bound (upstream's behaviour), and the server says so on stderr at startup, as it does for a
 value that is not a whole number of MiB; a budget below the largest body allowed refuses that body always. The
 inbound spam filter cost ~30–40 times a `text/plain` body (an attachment ~6), which these budgets do not count: the
-eleventh change bounds it. A synchronizing IMAP literal reserves its declared size when it is announced (a logged-in
-client only).
+eleventh change bounds it. A synchronizing IMAP literal reserved its declared size when it was announced, and an HTTP
+body had no read timeout: the sixteenth change closes both.
 [`scripts/e2e-upload-cap.sh`](scripts/e2e-upload-cap.sh) sets 30 MiB and 110 MiB. It holds two 14 MiB uploads open at
 13 MiB and checks that a third of 8 MiB, by WebDAV `PUT` and by JMAP upload from other accounts, is refused while a
 small file is stored, that both store on retry once the held uploads finish, that a 25 MiB body alone still meets its
@@ -415,7 +415,40 @@ Against production's image before it (`MAI1070_BUG_REFERENCE_IMAGE`) the four St
 checks FAIL, while Normal, the bad rows and the unavailable store pass, since it reads no level at all (measured). The
 build requires both.
 
-Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1-textcap1-totponce1-dsnhdrs1-dsnfull1-spamlevel1`.
+## The sixteenth change: a client that stops sending holds none of the budgets
+
+The tenth change left two ways for a logged-in client to hold part of a server-wide budget without sending the bytes,
+so that other customers' large messages or uploads got the retryable refusal while it waited (MainThrive MAI-1078):
+
+- **An IMAP literal claimed its declared size at `{n}`**, before the server sent `+` and before any byte arrived, and
+  held it until the IMAP timeout (30 minutes). IMAP's request limit is 50 MiB by default, so one client held up to
+  ~50 MiB of the message budget and four held a 200 MiB one.
+- **An HTTP body had no read timeout.** Upstream reads a request body with none, so a WebDAV `PUT` or JMAP upload that
+  stopped sending kept its share of the upload budget for as long as it kept the connection open. SMTP's equivalent is
+  bounded by its own timeout.
+
+[`patches/0016-stalled-bodies-hold-no-budget.patch`](patches/0016-stalled-bodies-hold-no-budget.patch):
+
+- An `APPEND` literal past 5 MiB is counted as its bytes arrive, a read at a time, as `BDAT` already was. One that would
+  not fit in the budget as it stands is still refused before `+`, as before, but nothing is held for it until it is
+  sent. One that runs out of budget partway is dropped with what it held, the rest of it is read and dropped (the
+  client was told to send it), and the command is answered `NO [UNAVAILABLE]` at its end; the session goes on.
+- A request body that sends nothing for **`STALWART_HTTP_BODY_IDLE_SECS`** (60 when unset; a value that is not a whole
+  number of seconds is logged and read as 60) is ended with `408`, and what it held goes back. The timeout is per read,
+  not for the whole body, so a slow upload that keeps sending is never ended. Every body read through
+  `fetch_body` has it; the management API and form bodies, whose callers know only "too large", answer as for a body
+  too large.
+
+[`scripts/e2e-stalled-bodies.sh`](scripts/e2e-stalled-bodies.sh) sets 30 MiB, 110 MiB and 5 s. Two clients declare
+48 MiB literals and send nothing, and a 52 MiB message and a 40 MiB `APPEND` are accepted meanwhile. With the budget
+then held by two 50 MiB SMTP messages, one of the stalled clients sends its literal: it is refused partway, read to its
+end, and the same session's `NOOP` and retried `APPEND` succeed; with the other still declared, a 97 MiB message is
+accepted. Then two WebDAV `PUT`s stall at 13 MiB: a third upload is refused while they hold the budget, after 5 s a
+WebDAV and a JMAP upload are accepted while the stalled clients are still connected, both stalled requests get `408`,
+and so does a stalled JMAP upload, while a body sending 1 MiB every 3 s is stored. Against `-bodycap1`
+(`MAI1077_BUG_REFERENCE_IMAGE`) each hold FAILs and the controls pass; the build requires both.
+
+Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1-textcap1-totponce1-dsnhdrs1-dsnfull1-spamlevel1-stall1`.
 
 ## Builds, tags and testing a change before it merges
 

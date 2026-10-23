@@ -1,0 +1,263 @@
+diff --git a/crates/dav/src/request.rs b/crates/dav/src/request.rs
+index 08bf8d4..1e86deb 100644
+--- a/crates/dav/src/request.rs
++++ b/crates/dav/src/request.rs
+@@ -622,6 +622,9 @@ impl DavRequestHandler for Server {
+                     return HttpResponse::new(StatusCode::TOO_MANY_REQUESTS)
+                         .with_header(header::RETRY_AFTER, "5");
+                 }
++                Err(BodyRefusal::TimedOut) => {
++                    return HttpResponse::new(StatusCode::REQUEST_TIMEOUT);
++                }
+                 Err(BodyRefusal::TooLarge) => {
+                     trc::event!(
+                         Limit(trc::LimitEvent::SizeRequest),
+diff --git a/crates/http-proto/Cargo.toml b/crates/http-proto/Cargo.toml
+index aff9639..d65dab6 100644
+--- a/crates/http-proto/Cargo.toml
++++ b/crates/http-proto/Cargo.toml
+@@ -7,6 +7,7 @@ edition = "2024"
+ common = { path = "../common" }
+ trc = { path = "../trc" }
+ utils = { path = "../utils" }
++tokio = { version = "1.53", features = ["time"] }
+ registry = { path = "../registry" }
+ serde = { version = "1.0", features = ["derive"]}
+ serde_json = "1.0"
+diff --git a/crates/http-proto/src/request.rs b/crates/http-proto/src/request.rs
+index ed1606e..4bd1963 100644
+--- a/crates/http-proto/src/request.rs
++++ b/crates/http-proto/src/request.rs
+@@ -4,7 +4,11 @@
+  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+  */
+ 
+-use std::{borrow::Cow, sync::Arc};
++use std::{
++    borrow::Cow,
++    sync::{Arc, OnceLock},
++    time::Duration,
++};
+ 
+ use compact_str::ToCompactString;
+ use http_body_util::BodyExt;
+@@ -25,6 +29,28 @@ pub enum BodyRefusal {
+     TooLarge,
+     /// The large bodies the server holds are at their budget: retry later.
+     Busy,
++    /// The body sent nothing for `STALWART_HTTP_BODY_IDLE_SECS`.
++    TimedOut,
++}
++
++/// How long a request body may send nothing before the request is ended (MAI-1078): upstream reads a body with no
++/// timeout, so a client that stops sending holds what it has of `STALWART_MAX_LARGE_UPLOAD_MIB` for as long as it
++/// keeps the connection open. `STALWART_HTTP_BODY_IDLE_SECS`, 60 when unset.
++fn body_idle_timeout() -> Duration {
++    static TIMEOUT: OnceLock<Duration> = OnceLock::new();
++    const VAR: &str = "STALWART_HTTP_BODY_IDLE_SECS";
++    *TIMEOUT.get_or_init(|| {
++        Duration::from_secs(match std::env::var(VAR) {
++            Ok(v) => match v.trim().parse::<u64>() {
++                Ok(secs) if secs > 0 => secs,
++                _ => {
++                    eprintln!("ERROR {VAR}={v:?} is not a whole number of seconds: using 60");
++                    60
++                }
++            },
++            Err(_) => 60,
++        })
++    })
+ }
+ 
+ pub async fn fetch_body(
+@@ -47,7 +73,21 @@ pub async fn fetch_body_or_busy(
+     // Once refused as busy: how much has been read. The rest is read and none of it kept, so the client can
+     // read the refusal; closing on an unread body resets the connection, and the client sees a network error.
+     let mut busy: Option<usize> = None;
+-    while let Some(Ok(frame)) = req.frame().await {
++    loop {
++        let frame = match tokio::time::timeout(body_idle_timeout(), req.frame()).await {
++            Ok(Some(Ok(frame))) => frame,
++            Ok(_) => break,
++            Err(_) => {
++                // Dropped with the request: what it held goes back now.
++                trc::event!(
++                    Network(trc::NetworkEvent::Timeout),
++                    SpanId = session_id,
++                    Contents = "The request body sent nothing for too long",
++                    Size = busy.unwrap_or(bytes.len()),
++                );
++                return Err(BodyRefusal::TimedOut);
++            }
++        };
+         if let Some(data) = frame.data_ref() {
+             if let Some(read) = &mut busy {
+                 *read += data.len();
+diff --git a/crates/http/src/request.rs b/crates/http/src/request.rs
+index 1e3b79b..56d1b74 100644
+--- a/crates/http/src/request.rs
++++ b/crates/http/src/request.rs
+@@ -123,7 +123,7 @@ impl ParseHttp for Server {
+                             }
+                         }
+ 
+-                        let bytes = fetch_body_or_busy(
++                        let bytes = match fetch_body_or_busy(
+                             &mut req,
+                             if !access_token.has_permission(Permission::UnlimitedUploads) {
+                                 self.core.jmap.upload_max_size
+@@ -133,10 +133,18 @@ impl ParseHttp for Server {
+                             session.session_id,
+                         )
+                         .await
+-                        .map_err(|refusal| match refusal {
+-                            BodyRefusal::TooLarge => trc::LimitEvent::SizeRequest.into_err(),
+-                            BodyRefusal::Busy => trc::LimitEvent::TooManyRequests.into_err(),
+-                        })?;
++                        {
++                            Ok(bytes) => bytes,
++                            Err(BodyRefusal::TooLarge) => {
++                                return Err(trc::LimitEvent::SizeRequest.into_err());
++                            }
++                            Err(BodyRefusal::Busy) => {
++                                return Err(trc::LimitEvent::TooManyRequests.into_err());
++                            }
++                            Err(BodyRefusal::TimedOut) => {
++                                return Ok(HttpResponse::new(StatusCode::REQUEST_TIMEOUT));
++                            }
++                        };
+ 
+                         return Ok(self
+                             .handle_jmap_request(
+@@ -215,6 +223,9 @@ impl ParseHttp for Server {
+                                 Err(BodyRefusal::Busy) => {
+                                     Err(trc::LimitEvent::TooManyRequests.into_err())
+                                 }
++                                Err(BodyRefusal::TimedOut) => {
++                                    Ok(HttpResponse::new(StatusCode::REQUEST_TIMEOUT))
++                                }
+                             };
+                         }
+                     }
+diff --git a/crates/imap-proto/src/receiver.rs b/crates/imap-proto/src/receiver.rs
+index f2b95dc..43283d0 100644
+--- a/crates/imap-proto/src/receiver.rs
++++ b/crates/imap-proto/src/receiver.rs
+@@ -84,6 +84,9 @@ pub struct Receiver<T: CommandParser> {
+     /// Whether large literals are counted at all: set by the session once it is authenticated, so a client
+     /// that has not logged in cannot hold a slot.
+     pub count_messages: bool,
++    /// The literal being read is a large message, counted as its bytes arrive (MAI-1078), and what `large` held
++    /// before it.
++    counting: Option<usize>,
+ }
+ 
+ const ARG_MAX_LEN: usize = 8000;
+@@ -128,6 +131,7 @@ impl<T: CommandParser> Receiver<T> {
+         self.current_request_size = 0;
+         self.large = None;
+         self.busy = false;
++        self.counting = None;
+         err
+     }
+ 
+@@ -363,25 +367,23 @@ impl<T: CommandParser> Receiver<T> {
+                                     // The client waits for a go-ahead it will not get.
+                                     return Err(self.busy_reset());
+                                 }
++                                self.counting = None;
+                                 if !oversize
+                                     && !self.busy
+                                     && size as usize > LARGE_MESSAGE
+                                     && self.count_messages
+                                     && self.request.command.counts_as_message()
+                                 {
+-                                    // A MULTIAPPEND's large literals share one slot, which grows by each.
+-                                    let total =
+-                                        self.large.as_ref().map_or(0, Slot::bytes) + size as usize;
+-                                    let granted = if let Some(slot) = self.large.as_mut() {
+-                                        slot.grow_to(total)
++                                    // Nothing is held for a size that is only declared: a client that sends
++                                    // nothing would hold it. But one that would not fit now is refused before
++                                    // it is sent.
++                                    if LARGE_MESSAGES.has_room(size as usize) {
++                                        // A MULTIAPPEND's large literals share one slot, which grows by each.
++                                        self.counting =
++                                            Some(self.large.as_ref().map_or(0, Slot::bytes));
++                                    } else if !non_sync {
++                                        return Err(self.busy_reset());
+                                     } else {
+-                                        self.large = LARGE_MESSAGES.try_acquire(total);
+-                                        self.large.is_some()
+-                                    };
+-                                    if !granted {
+-                                        if !non_sync {
+-                                            return Err(self.busy_reset());
+-                                        }
+                                         // A non-sync literal is on its way already: read it and drop it.
+                                         self.busy = true;
+                                     }
+@@ -461,6 +463,36 @@ impl<T: CommandParser> Receiver<T> {
+                     }
+                 }
+                 State::LiteralData { remaining } => {
++                    if let Some(before) = self.counting
++                        && before + self.buf.len() >= self.large.as_ref().map_or(0, Slot::bytes)
++                    {
++                        // Counted as it arrives: the bytes of this read, up to the literal's end.
++                        let total = before
++                            + self.buf.len()
++                            + (remaining as usize).min(bytes.as_slice().len() + 1);
++                        let granted = if let Some(slot) = self.large.as_mut() {
++                            slot.grow_to(total)
++                        } else {
++                            self.large = LARGE_MESSAGES.try_acquire(total);
++                            self.large.is_some()
++                        };
++                        if !granted {
++                            // The client was told to send it: the rest is read and dropped, with what it held,
++                            // and the request is refused at its end.
++                            self.large = None;
++                            self.counting = None;
++                            self.busy = true;
++                            self.buf = ArgumentBuffer::default();
++                            self.state = if remaining > 1 {
++                                State::LiteralDiscard {
++                                    remaining: remaining - 1,
++                                }
++                            } else {
++                                State::Argument { last_ch: b' ' }
++                            };
++                            continue;
++                        }
++                    }
+                     // SAFETY: We checked the size before entering this state
+                     self.buf.push_unchecked(ch);
+ 
+@@ -653,6 +685,7 @@ impl<T: CommandParser> Default for Receiver<T> {
+             large: None,
+             busy: false,
+             count_messages: false,
++            counting: None,
+         }
+     }
+ }
+diff --git a/crates/utils/src/in_flight.rs b/crates/utils/src/in_flight.rs
+index cb2a2e4..49ff441 100644
+--- a/crates/utils/src/in_flight.rs
++++ b/crates/utils/src/in_flight.rs
+@@ -81,6 +81,14 @@ impl Budget {
+             .is_ok()
+     }
+ 
++    /// Whether `bytes` more would fit now. Nothing is held: the caller takes them as they arrive.
++    pub fn has_room(&self, bytes: usize) -> bool {
++        self.used
++            .load(Ordering::SeqCst)
++            .checked_add(bytes)
++            .is_some_and(|total| total <= self.max())
++    }
++
+     /// A slot holding `bytes` of the budget, or `None` when they would take it past its limit.
+     pub fn try_acquire(&'static self, bytes: usize) -> Option<Slot> {
+         // `then`, not `then_some`: a slot built eagerly and dropped on a refusal would give back bytes it never took.
