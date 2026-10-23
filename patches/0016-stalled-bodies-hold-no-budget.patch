@@ -141,7 +141,7 @@ index 1e3b79b..56d1b74 100644
                          }
                      }
 diff --git a/crates/imap-proto/src/receiver.rs b/crates/imap-proto/src/receiver.rs
-index f2b95dc..48d71f9 100644
+index f2b95dc..e9da356 100644
 --- a/crates/imap-proto/src/receiver.rs
 +++ b/crates/imap-proto/src/receiver.rs
 @@ -7,7 +7,8 @@
@@ -251,7 +251,15 @@ index f2b95dc..48d71f9 100644
                                          // A non-sync literal is on its way already: read it and drop it.
                                          self.busy = true;
                                      }
-@@ -461,6 +496,35 @@ impl<T: CommandParser> Receiver<T> {
+@@ -423,6 +458,7 @@ impl<T: CommandParser> Receiver<T> {
+                 State::LiteralSeek { size, non_sync } => {
+                     if ch == b'\n' {
+                         if non_sync
++                            && size > 0
+                             && (self.busy
+                                 || self.current_request_size + size as usize
+                                     > self.max_request_size)
+@@ -461,6 +497,35 @@ impl<T: CommandParser> Receiver<T> {
                      }
                  }
                  State::LiteralData { remaining } => {
@@ -287,7 +295,7 @@ index f2b95dc..48d71f9 100644
                      // SAFETY: We checked the size before entering this state
                      self.buf.push_unchecked(ch);
  
-@@ -653,6 +717,8 @@ impl<T: CommandParser> Default for Receiver<T> {
+@@ -653,6 +718,8 @@ impl<T: CommandParser> Default for Receiver<T> {
              large: None,
              busy: false,
              count_messages: false,
