@@ -141,7 +141,7 @@ index 1e3b79b..56d1b74 100644
                          }
                      }
 diff --git a/crates/imap-proto/src/receiver.rs b/crates/imap-proto/src/receiver.rs
-index f2b95dc..4464798 100644
+index f2b95dc..48d71f9 100644
 --- a/crates/imap-proto/src/receiver.rs
 +++ b/crates/imap-proto/src/receiver.rs
 @@ -7,7 +7,8 @@
@@ -154,19 +154,20 @@ index f2b95dc..4464798 100644
  
  #[derive(Debug, Clone)]
  pub enum Error {
-@@ -84,6 +85,11 @@ pub struct Receiver<T: CommandParser> {
+@@ -84,6 +85,12 @@ pub struct Receiver<T: CommandParser> {
      /// Whether large literals are counted at all: set by the session once it is authenticated, so a client
      /// that has not logged in cannot hold a slot.
      pub count_messages: bool,
 +    /// The literal being read is a large message, counted as its bytes arrive (MAI-1078), and what `large` held
 +    /// before it.
 +    counting: Option<usize>,
-+    /// When `large` was taken: from then the request must keep up `BODY_MIN_RATE`.
-+    large_since: Option<Instant>,
++    /// When `large` was taken, and how much of the request had arrived then: from then the request must keep up
++    /// `BODY_MIN_RATE` on all it sends, its small literals too.
++    large_since: Option<(Instant, usize)>,
  }
  
  const ARG_MAX_LEN: usize = 8000;
-@@ -127,10 +133,23 @@ impl<T: CommandParser> Receiver<T> {
+@@ -127,10 +134,23 @@ impl<T: CommandParser> Receiver<T> {
          self.state = self.start_state;
          self.current_request_size = 0;
          self.large = None;
@@ -190,7 +191,7 @@ index f2b95dc..4464798 100644
      /// The server holds as many large messages as it may: a temporary refusal, so the client can retry.
      fn busy_reset(&mut self) -> Error {
          let tag = std::mem::take(&mut self.request.tag);
-@@ -176,6 +195,23 @@ impl<T: CommandParser> Receiver<T> {
+@@ -176,6 +196,23 @@ impl<T: CommandParser> Receiver<T> {
      }
  
      pub fn parse(&mut self, bytes: &mut std::slice::Iter<'_, u8>) -> Result<Request<T>, Error> {
@@ -198,8 +199,8 @@ index f2b95dc..4464798 100644
 +        // its literals too, while the rest of its line trickles in (MAI-1078).
 +        if self.large.is_none() {
 +            self.large_since = None;
-+        } else if let Some(since) = self.large_since
-+            && too_slow(self.large.as_ref().map_or(0, Slot::bytes), since)
++        } else if let Some((since, before)) = self.large_since
++            && too_slow((self.current_request_size + self.buf.len()).saturating_sub(before), since)
 +        {
 +            self.drop_large();
 +            match self.state {
@@ -214,7 +215,7 @@ index f2b95dc..4464798 100644
          #[allow(clippy::while_let_on_iterator)]
          while let Some(&ch) = bytes.next() {
              match self.state {
-@@ -363,25 +399,23 @@ impl<T: CommandParser> Receiver<T> {
+@@ -363,25 +400,23 @@ impl<T: CommandParser> Receiver<T> {
                                      // The client waits for a go-ahead it will not get.
                                      return Err(self.busy_reset());
                                  }
@@ -250,7 +251,7 @@ index f2b95dc..4464798 100644
                                          // A non-sync literal is on its way already: read it and drop it.
                                          self.busy = true;
                                      }
-@@ -461,6 +495,34 @@ impl<T: CommandParser> Receiver<T> {
+@@ -461,6 +496,35 @@ impl<T: CommandParser> Receiver<T> {
                      }
                  }
                  State::LiteralData { remaining } => {
@@ -265,7 +266,8 @@ index f2b95dc..4464798 100644
 +                            slot.grow_to(total)
 +                        } else {
 +                            self.large = LARGE_MESSAGES.try_acquire(total);
-+                            self.large_since = Some(Instant::now());
++                            self.large_since =
++                                Some((Instant::now(), self.current_request_size + self.buf.len()));
 +                            self.large.is_some()
 +                        };
 +                        if !granted {
@@ -285,7 +287,7 @@ index f2b95dc..4464798 100644
                      // SAFETY: We checked the size before entering this state
                      self.buf.push_unchecked(ch);
  
-@@ -653,6 +715,8 @@ impl<T: CommandParser> Default for Receiver<T> {
+@@ -653,6 +717,8 @@ impl<T: CommandParser> Default for Receiver<T> {
              large: None,
              busy: false,
              count_messages: false,
