@@ -141,7 +141,7 @@ index 1e3b79b..56d1b74 100644
                          }
                      }
 diff --git a/crates/imap-proto/src/receiver.rs b/crates/imap-proto/src/receiver.rs
-index f2b95dc..5e26b7b 100644
+index f2b95dc..4464798 100644
 --- a/crates/imap-proto/src/receiver.rs
 +++ b/crates/imap-proto/src/receiver.rs
 @@ -7,7 +7,8 @@
@@ -154,25 +154,67 @@ index f2b95dc..5e26b7b 100644
  
  #[derive(Debug, Clone)]
  pub enum Error {
-@@ -84,6 +85,9 @@ pub struct Receiver<T: CommandParser> {
+@@ -84,6 +85,11 @@ pub struct Receiver<T: CommandParser> {
      /// Whether large literals are counted at all: set by the session once it is authenticated, so a client
      /// that has not logged in cannot hold a slot.
      pub count_messages: bool,
-+    /// The literal being read is a large message, counted as its bytes arrive (MAI-1078): what `large` held before
-+    /// it, and when its first bytes arrived.
-+    counting: Option<(usize, Option<Instant>)>,
++    /// The literal being read is a large message, counted as its bytes arrive (MAI-1078), and what `large` held
++    /// before it.
++    counting: Option<usize>,
++    /// When `large` was taken: from then the request must keep up `BODY_MIN_RATE`.
++    large_since: Option<Instant>,
  }
  
  const ARG_MAX_LEN: usize = 8000;
-@@ -128,6 +132,7 @@ impl<T: CommandParser> Receiver<T> {
+@@ -127,10 +133,23 @@ impl<T: CommandParser> Receiver<T> {
+         self.state = self.start_state;
          self.current_request_size = 0;
          self.large = None;
++        self.large_since = None;
          self.busy = false;
 +        self.counting = None;
          err
      }
  
-@@ -363,25 +368,23 @@ impl<T: CommandParser> Receiver<T> {
++    /// Gives back the request's message budget and drops its literals, the earlier ones of a MULTIAPPEND too: the rest
++    /// of it is read, none of it kept, and it is refused at its end.
++    fn drop_large(&mut self) {
++        self.large = None;
++        self.large_since = None;
++        self.counting = None;
++        self.busy = true;
++        self.request.tokens = Vec::new();
++        self.buf = ArgumentBuffer::default();
++    }
++
+     /// The server holds as many large messages as it may: a temporary refusal, so the client can retry.
+     fn busy_reset(&mut self) -> Error {
+         let tag = std::mem::take(&mut self.request.tag);
+@@ -176,6 +195,23 @@ impl<T: CommandParser> Receiver<T> {
+     }
+ 
+     pub fn parse(&mut self, bytes: &mut std::slice::Iter<'_, u8>) -> Result<Request<T>, Error> {
++        // A request holding message budget keeps up `BODY_MIN_RATE` over the whole of it, checked at every read: after
++        // its literals too, while the rest of its line trickles in (MAI-1078).
++        if self.large.is_none() {
++            self.large_since = None;
++        } else if let Some(since) = self.large_since
++            && too_slow(self.large.as_ref().map_or(0, Slot::bytes), since)
++        {
++            self.drop_large();
++            match self.state {
++                State::LiteralData { remaining } => self.state = State::LiteralDiscard { remaining },
++                // The client waits for a go-ahead it will not get.
++                State::LiteralSeek {
++                    non_sync: false, ..
++                } => return Err(self.busy_reset()),
++                _ => (),
++            }
++        }
+         #[allow(clippy::while_let_on_iterator)]
+         while let Some(&ch) = bytes.next() {
+             match self.state {
+@@ -363,25 +399,23 @@ impl<T: CommandParser> Receiver<T> {
                                      // The client waits for a go-ahead it will not get.
                                      return Err(self.busy_reset());
                                  }
@@ -194,7 +236,7 @@ index f2b95dc..5e26b7b 100644
 +                                    if LARGE_MESSAGES.has_room(size as usize) {
 +                                        // A MULTIAPPEND's large literals share one slot, which grows by each.
 +                                        self.counting =
-+                                            Some((self.large.as_ref().map_or(0, Slot::bytes), None));
++                                            Some(self.large.as_ref().map_or(0, Slot::bytes));
 +                                    } else if !non_sync {
 +                                        return Err(self.busy_reset());
                                      } else {
@@ -208,35 +250,28 @@ index f2b95dc..5e26b7b 100644
                                          // A non-sync literal is on its way already: read it and drop it.
                                          self.busy = true;
                                      }
-@@ -461,6 +464,41 @@ impl<T: CommandParser> Receiver<T> {
+@@ -461,6 +495,34 @@ impl<T: CommandParser> Receiver<T> {
                      }
                  }
                  State::LiteralData { remaining } => {
-+                    if let Some((before, since)) = &mut self.counting
-+                        && *before + self.buf.len() >= self.large.as_ref().map_or(0, Slot::bytes)
++                    if let Some(before) = self.counting
++                        && before + self.buf.len() >= self.large.as_ref().map_or(0, Slot::bytes)
 +                    {
-+                        // Counted as it arrives: the bytes of this read, up to the literal's end. Once a read
-+                        // at a time, so the rate is checked then too.
-+                        let total = *before
++                        // Counted as it arrives: the bytes of this read, up to the literal's end.
++                        let total = before
 +                            + self.buf.len()
 +                            + (remaining as usize).min(bytes.as_slice().len() + 1);
-+                        let since = *since.get_or_insert_with(Instant::now);
-+                        let granted = !too_slow(self.buf.len(), since)
-+                            && if let Some(slot) = self.large.as_mut() {
-+                                slot.grow_to(total)
-+                            } else {
-+                                self.large = LARGE_MESSAGES.try_acquire(total);
-+                                self.large.is_some()
-+                            };
++                        let granted = if let Some(slot) = self.large.as_mut() {
++                            slot.grow_to(total)
++                        } else {
++                            self.large = LARGE_MESSAGES.try_acquire(total);
++                            self.large_since = Some(Instant::now());
++                            self.large.is_some()
++                        };
 +                        if !granted {
-+                            // Out of budget, or too slow: the client was told to send it, so the rest is read and
-+                            // dropped, with what it held, and the request is refused at its end. A MULTIAPPEND's
-+                            // earlier literals go now too, since their share of the slot does.
-+                            self.large = None;
-+                            self.request.tokens = Vec::new();
-+                            self.counting = None;
-+                            self.busy = true;
-+                            self.buf = ArgumentBuffer::default();
++                            // The client was told to send it: the rest is read and dropped, with what it held, and
++                            // the request is refused at its end.
++                            self.drop_large();
 +                            self.state = if remaining > 1 {
 +                                State::LiteralDiscard {
 +                                    remaining: remaining - 1,
@@ -250,11 +285,12 @@ index f2b95dc..5e26b7b 100644
                      // SAFETY: We checked the size before entering this state
                      self.buf.push_unchecked(ch);
  
-@@ -653,6 +691,7 @@ impl<T: CommandParser> Default for Receiver<T> {
+@@ -653,6 +715,8 @@ impl<T: CommandParser> Default for Receiver<T> {
              large: None,
              busy: false,
              count_messages: false,
 +            counting: None,
++            large_since: None,
          }
      }
  }

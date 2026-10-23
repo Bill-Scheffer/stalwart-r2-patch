@@ -441,7 +441,9 @@ so that other customers' large messages or uploads got the retryable refusal whi
 - A body that keeps sending but holds budget below **16 KiB/s** on average, once past that same grace, is refused the
   same way: an HTTP request with `408`; an IMAP literal is read to its end and dropped, holding nothing, and answered
   `NO [UNAVAILABLE]`. Without it, a burst and then a byte a minute held a share at next to no bandwidth. HTTP counts
-  the rate from when the body began holding budget (past 1 MiB), IMAP from the literal's first byte. ⚠️ **The trade:**
+  the rate from when the body began holding budget (past 1 MiB); IMAP from the request's first counted byte, over all
+  its literals, at every read until its line ends (so a literal sent in full and then a trickle of the rest of its line
+  is held no longer). ⚠️ **The trade:**
   a genuine upload slower than 16 KiB/s (0.13 Mbit/s) is refused and has to be retried (Bill, MainThrive MAI-1078).
   A fixed constant, `BODY_MIN_RATE`.
 - Every HTTP body read through

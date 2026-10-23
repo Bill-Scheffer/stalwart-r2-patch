@@ -205,7 +205,8 @@ def trickle(path,n):
     except OSError as e: return type(e).__name__,round(time.time()-t)
     finally: c.close()
 got=trickle(f"/dav/file/{NAMES[6]}%40one.test/trickle.bin",NAMES[6])
-check(got[0].startswith("HTTP/1.1 408"), "an HTTP body that trickles below 16 KiB/s after the 5 s grace is ended with 408", got)
+# Not before ~9 s (5 s of grace, then 64 KiB of credit at 16 KiB/s): sooner would be the idle timeout, not the floor.
+check(got[0].startswith("HTTP/1.1 408") and got[1]>=8, "an HTTP body that trickles below 16 KiB/s after the 5 s grace is ended with 408", got)
 # Idle, not total: a body that keeps sending, a piece every 3 s, is never ended.
 c=http.client.HTTPConnection("stalwart",8080,timeout=60)
 c.putrequest("PUT",f"/dav/file/{NAMES[5]}%40one.test/slow.bin"); c.putheader("Authorization",AU[NAMES[5]])
