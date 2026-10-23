@@ -126,7 +126,7 @@ check(got.startswith("b OK"), "and a 40 MiB IMAP APPEND", got)
 go=threading.Event(); held=[HeldMessage(NAMES[4],go),HeldMessage(NAMES[5],go)]; [h.start() for h in held]
 [h.sent.wait() for h in held]; time.sleep(3)   # both messages are at 50 MiB on the server: 100 of the 110 MiB held
 S1=stalled[0]
-S1.c.sendall((eml(LIT)+b"A"*LIT)[:LIT]+b"\r\n"); got=S1.tagged(b"s")
+S1.c.sendall(b"A"*LIT+b"\r\n"); got=S1.tagged(b"s")
 check(got.startswith("s NO [UNAVAILABLE]"), "a stalled literal sent later, while the budget is full, is refused partway and read to its end", got)
 got=S1.cmd(b"t",b"NOOP")
 check(got.startswith("t OK"), "and its session is still usable", got)

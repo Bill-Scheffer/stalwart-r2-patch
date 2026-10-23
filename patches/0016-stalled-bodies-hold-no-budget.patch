@@ -25,52 +25,28 @@ index aff9639..d65dab6 100644
  serde = { version = "1.0", features = ["derive"]}
  serde_json = "1.0"
 diff --git a/crates/http-proto/src/request.rs b/crates/http-proto/src/request.rs
-index ed1606e..4bd1963 100644
+index ed1606e..aa91b1a 100644
 --- a/crates/http-proto/src/request.rs
 +++ b/crates/http-proto/src/request.rs
-@@ -4,7 +4,11 @@
-  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
-  */
- 
--use std::{borrow::Cow, sync::Arc};
-+use std::{
-+    borrow::Cow,
-+    sync::{Arc, OnceLock},
-+    time::Duration,
-+};
- 
+@@ -9,7 +9,7 @@ use std::{borrow::Cow, sync::Arc};
  use compact_str::ToCompactString;
  use http_body_util::BodyExt;
-@@ -25,6 +29,28 @@ pub enum BodyRefusal {
+ 
+-use utils::in_flight::{LARGE_UPLOAD, LARGE_UPLOADS, Slot};
++use utils::in_flight::{LARGE_UPLOAD, LARGE_UPLOADS, Slot, body_idle_timeout};
+ 
+ use crate::HttpRequest;
+ 
+@@ -25,6 +25,8 @@ pub enum BodyRefusal {
      TooLarge,
      /// The large bodies the server holds are at their budget: retry later.
      Busy,
 +    /// The body sent nothing for `STALWART_HTTP_BODY_IDLE_SECS`.
 +    TimedOut,
-+}
-+
-+/// How long a request body may send nothing before the request is ended (MAI-1078): upstream reads a body with no
-+/// timeout, so a client that stops sending holds what it has of `STALWART_MAX_LARGE_UPLOAD_MIB` for as long as it
-+/// keeps the connection open. `STALWART_HTTP_BODY_IDLE_SECS`, 60 when unset.
-+fn body_idle_timeout() -> Duration {
-+    static TIMEOUT: OnceLock<Duration> = OnceLock::new();
-+    const VAR: &str = "STALWART_HTTP_BODY_IDLE_SECS";
-+    *TIMEOUT.get_or_init(|| {
-+        Duration::from_secs(match std::env::var(VAR) {
-+            Ok(v) => match v.trim().parse::<u64>() {
-+                Ok(secs) if secs > 0 => secs,
-+                _ => {
-+                    eprintln!("ERROR {VAR}={v:?} is not a whole number of seconds: using 60");
-+                    60
-+                }
-+            },
-+            Err(_) => 60,
-+        })
-+    })
  }
  
  pub async fn fetch_body(
-@@ -47,7 +73,21 @@ pub async fn fetch_body_or_busy(
+@@ -47,7 +49,21 @@ pub async fn fetch_body_or_busy(
      // Once refused as busy: how much has been read. The rest is read and none of it kept, so the client can
      // read the refusal; closing on an unread body resets the connection, and the client sees a network error.
      let mut busy: Option<usize> = None;
@@ -243,19 +219,81 @@ index f2b95dc..43283d0 100644
      }
  }
 diff --git a/crates/utils/src/in_flight.rs b/crates/utils/src/in_flight.rs
-index cb2a2e4..49ff441 100644
+index cb2a2e4..ad1da10 100644
 --- a/crates/utils/src/in_flight.rs
 +++ b/crates/utils/src/in_flight.rs
-@@ -81,6 +81,14 @@ impl Budget {
+@@ -12,9 +12,12 @@
+ //! (upstream's behaviour). Not `common::network::limiter`: `imap-proto` cannot depend on `common`, and that
+ //! limiter's load-then-add can let two callers past the limit.
+ 
+-use std::sync::{
+-    OnceLock,
+-    atomic::{AtomicUsize, Ordering},
++use std::{
++    sync::{
++        OnceLock,
++        atomic::{AtomicUsize, Ordering},
++    },
++    time::Duration,
+ };
+ 
+ /// An HTTP request body past this size counts against `STALWART_MAX_LARGE_UPLOAD_MIB`.
+@@ -31,10 +34,32 @@ pub static LARGE_UPLOADS: Budget = Budget::new("STALWART_MAX_LARGE_UPLOAD_MIB");
+ /// Messages arriving by SMTP DATA or BDAT, or by IMAP APPEND.
+ pub static LARGE_MESSAGES: Budget = Budget::new("STALWART_MAX_LARGE_MESSAGE_MIB");
+ 
+-/// Reads both budgets at startup, so one that is unset or unreadable is logged then, not at the first large body.
++/// Reads both budgets and the body timeout at startup, so one that is unset or unreadable is logged then, not at the
++/// first large body.
+ pub fn init() {
+     LARGE_UPLOADS.max();
+     LARGE_MESSAGES.max();
++    body_idle_timeout();
++}
++
++/// How long an HTTP request body may send nothing before the request is ended (MAI-1078): upstream reads a body with
++/// no timeout, so a client that stops sending held what it had of `STALWART_MAX_LARGE_UPLOAD_MIB` for as long as it
++/// kept the connection open. `STALWART_HTTP_BODY_IDLE_SECS`, 60 when unset or unreadable.
++pub fn body_idle_timeout() -> Duration {
++    static TIMEOUT: OnceLock<Duration> = OnceLock::new();
++    const VAR: &str = "STALWART_HTTP_BODY_IDLE_SECS";
++    *TIMEOUT.get_or_init(|| {
++        Duration::from_secs(match std::env::var(VAR) {
++            Ok(v) => match v.trim().parse::<u64>() {
++                Ok(secs) if secs > 0 => secs,
++                _ => {
++                    eprintln!("ERROR {VAR}={v:?} is not a whole number of seconds: using 60");
++                    60
++                }
++            },
++            Err(_) => 60,
++        })
++    })
+ }
+ 
+ pub struct Budget {
+@@ -72,15 +97,24 @@ impl Budget {
+         })
+     }
+ 
++    /// What `used` becomes with `bytes` more, if that is within the limit.
++    fn fits(&self, used: usize, bytes: usize) -> Option<usize> {
++        used.checked_add(bytes).filter(|&total| total <= self.max())
++    }
++
+     fn take(&self, bytes: usize) -> bool {
+-        let max = self.max();
+         self.used
+             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+-                used.checked_add(bytes).filter(|&total| total <= max)
++                self.fits(used, bytes)
+             })
              .is_ok()
      }
  
 +    /// Whether `bytes` more would fit now. Nothing is held: the caller takes them as they arrive.
 +    pub fn has_room(&self, bytes: usize) -> bool {
-+        self.used
-+            .load(Ordering::SeqCst)
-+            .checked_add(bytes)
-+            .is_some_and(|total| total <= self.max())
++        self.fits(self.used.load(Ordering::SeqCst), bytes).is_some()
 +    }
 +
      /// A slot holding `bytes` of the budget, or `None` when they would take it past its limit.
