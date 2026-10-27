@@ -165,13 +165,21 @@ lets exactly these pass for a caller that is not an owner, when it holds the met
 | edit a script | the caller uploads to **its own** account, then `SieveScript/validate` and `SieveScript/set update` on the target. Nothing opens the target's own uploads |
 | out-of-office | `VacationResponse/get`, `VacationResponse/set` |
 | sender identities | `Identity/get`, `Identity/set` |
-| issue an app password | `x:AppPassword/set` **create only**, within the caller's grants (`Inherit` stays refused; at sign-in a `Replace` list is intersected with the mailbox's own permissions, so it never exceeds the mailbox) |
+| issue an app password | `x:AppPassword/set` **create**, within the caller's grants (`Inherit` stays refused; at sign-in a `Replace` list is intersected with the mailbox's own permissions, so it never exceeds the mailbox) |
+| revoke an app password | `x:AppPassword/set` **destroy by id** (`-verbs2`, MAI-1018). Upstream's own destroy: it matches the credential's id, never its position, and refuses the password credential |
 
 No JMAP method or blob path that reads mail widens: `Email*`, `Mailbox*`, `Thread`, `SearchSnippet`, `EmailSubmission*`,
 `Blob/get`, `Blob/copy`, `Blob/lookup`, calendars, contacts and files keep upstream's check, and so do
-`x:AppPassword` get, update and destroy (revoking stays on `x:Account`, under 0007). An issued app password signs in to the mailbox over IMAP and reads all of its mail, past and future, as a
+`x:AppPassword` get and update. An issued app password signs in to the mailbox over IMAP and reads all of its mail, past and future, as a
 password reset does; a script set this way can `redirect` future mail. Neither is more than `sysAccountUpdate`
 already gives (it can set the mailbox's password), which is why the predicate requires it.
+**Why revoking moved here (`-verbs2`).** Until then a revoke went through `x:Account/set`, nulling
+`credentials/<key>`, and Stalwart renumbers those keys when one is removed. The caller had to read the key first, so
+two revokes on one mailbox at once could remove a third app password. A destroy names the credential's own id and
+is resolved inside the write, which asserts the account's stored revision: of two at once, one wins and the other gets
+`serverUnavailable` and retries. Measured on `-stall1` with a mailbox's own login, which upstream already lets
+destroy (PostgreSQL, 40 rounds: 13 of 80 lost the revision and none removed the bystander). It also reaches an API key
+the mailbox holds, which `sysAccountUpdate` could already remove through `x:Account`.
 Two upstream behaviours are left as they are: SCIM (Enterprise-only) deletes accounts on its own path, and a
 Sieve or out-of-office write is counted against the caller's tenant quota rather than the target's. Without an Enterprise licence a tenanted
 account cannot hold `sysAccountUpdate` at all (Stalwart caps tenanted accounts at the user set), so the
@@ -182,10 +190,13 @@ untenanted Admin owns a key with exactly the API's 264 permissions ([`e2e-admin-
 no `impersonate`). Every verb is allowed on a User and refused on an Admin and without
 `sysAccountUpdate`; mail stays refused (`Email/get`, `Email/query`, `Blob/get` and a download of a mail
 blob); the forward proof switches a mailbox's forward off and the next message stops reaching the
-forward's target; the import credential (`Replace {authenticate, imap…}` with `expiresAt`) opens IMAP;
+forward's target; the import credential (`Replace {authenticate, imap…}` with `expiresAt`) opens IMAP, and once
+revoked by id it no longer does; two concurrent revokes remove exactly their two passwords and never a third (five
+rounds), and destroy cannot remove the password credential;
 and accounts beyond the key's grant are refused while a User is still updated and destroyed; so is adding a User to a
 group beyond it, while a group within it is still joined and a member still removed. Against the last image before 0007 and 0008 it fails 29 checks
-(measured), and the build requires it to fail on both bugs' lines there.
+(measured), and the build requires it to fail on both bugs' lines there. Against the last image before `-verbs2`
+(`MAI1018_BUG_REFERENCE_IMAGE`, `-stall1`) the revoke rows fail and the issue and refusal rows pass; the build requires both.
 
 ## The ninth change: no Stalwart logo on calendar mail or the RSVP page
 
@@ -462,7 +473,7 @@ WebDAV and a JMAP upload are accepted while the stalled clients are still connec
 and so does a stalled JMAP upload, while a body sending 1 MiB every 3 s is stored. Against `-bodycap1`
 (`MAI1077_BUG_REFERENCE_IMAGE`) each hold FAILs and the controls pass; the build requires both.
 
-Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1-textcap1-totponce1-dsnhdrs1-dsnfull1-spamlevel1-stall1`.
+Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-tenantacl2-filescan3-banexpiry1-grant2-verbs2-nologo1-bodycap1-textcap1-totponce1-dsnhdrs1-dsnfull1-spamlevel1-stall1`.
 
 ## Builds, tags and testing a change before it merges
 

@@ -1,5 +1,5 @@
 diff --git a/crates/common/src/auth/permissions.rs b/crates/common/src/auth/permissions.rs
-index b02f11a..911acbd 100644
+index b02f11a..e0d8494 100644
 --- a/crates/common/src/auth/permissions.rs
 +++ b/crates/common/src/auth/permissions.rs
 @@ -145,6 +145,47 @@ impl Server {
@@ -8,7 +8,7 @@ index b02f11a..911acbd 100644
  
 +impl Server {
 +    /// MainThrive patch 0008: whether `access_token` may run one of the admin verbs on
-+    /// `account_id` (Sieve, out-of-office, identities, issuing an app password) without being
++    /// `account_id` (Sieve, out-of-office, identities, issuing or revoking an app password) without being
 +    /// one of its owners. Upstream allows only owners or `impersonate`, and `impersonate` also
 +    /// reads all mail. This needs `sysAccountUpdate`, the account inside the caller's tenant
 +    /// (any tenant for an untenanted caller), and the grant rule on the account as stored, so
@@ -51,7 +51,7 @@ index b02f11a..911acbd 100644
      pub fn can_grant_permissions(
          &self,
 diff --git a/crates/jmap/src/api/request.rs b/crates/jmap/src/api/request.rs
-index 8ccd544..d3372a8 100644
+index 8ccd544..c58c225 100644
 --- a/crates/jmap/src/api/request.rs
 +++ b/crates/jmap/src/api/request.rs
 @@ -47,6 +47,7 @@ use crate::{
@@ -128,10 +128,10 @@ index 8ccd544..d3372a8 100644
                  SetRequestMethod::Registry(mut req) => {
                      resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
 -                    access_token.assert_is_member(req.account_id)?;
-+                    // MainThrive patch 0008: issuing an app password, and only issuing one.
++                    // MainThrive patch 0008: issuing an app password, or revoking one by id
++                    // (MAI-1018). Never an update.
 +                    if method_name.obj.unwrap_registry() == ObjectType::AppPassword
 +                        && req.update.is_none()
-+                        && req.destroy.is_none()
 +                    {
 +                        assert_can_administer(self, access_token, req.account_id).await?;
 +                    } else {
@@ -155,8 +155,8 @@ index 8ccd544..d3372a8 100644
  
 +/// MainThrive patch 0008: `assert_is_member`, or an admin verb's caller that
 +/// `Server::can_administer_account` admits. Used only by the methods MainThrive lists, none of
-+/// which reads mail through JMAP: Identity, SieveScript, VacationResponse, and issuing an app
-+/// password. An issued app password signs in to the mailbox over IMAP and reads all of its mail,
++/// which reads mail through JMAP: Identity, SieveScript, VacationResponse, and issuing or
++/// revoking an app password. An issued app password signs in to the mailbox over IMAP and reads all of its mail,
 +/// past and future, as a password reset does; a Sieve redirect copies future mail. Both are within
 +/// what the `sysAccountUpdate` this requires already allows.
 +async fn assert_can_administer(

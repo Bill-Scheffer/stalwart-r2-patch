@@ -4,7 +4,7 @@
 #
 # Production-shaped: an untenanted Admin `mailadmin` owns an API key limited to exactly the API's
 # permission list (e2e-admin-verbs.perms, 264 permissions, no `impersonate`). 0007: account writes (and group joins) beyond the
-# key's grant are refused, ordinary ones still pass. 0008: Sieve, out-of-office, identity and app-password issue
+# key's grant are refused, ordinary ones still pass. 0008: Sieve, out-of-office, identity, and issuing and revoking an app password
 # pass on a customer's mailbox, and nothing here may read mail through JMAP or a blob download. (An issued app
 # password reads all of the mailbox's mail over IMAP, as a password reset does; a Sieve redirect copies future mail.)
 # Every allowed row has a refused twin.
@@ -23,7 +23,7 @@ docker run -d --name "$C" --network "$NET" --network-alias stalwart --hostname m
 docker run -d --name "$K" --network "$NET" -e ADMIN="$ADMIN" \
   -v "$HERE/e2e-admin-verbs.perms:/perms.txt:ro" python:3.12-alpine sleep 900 >/dev/null
 docker exec -i "$K" python3 - <<'PY'
-import base64,json,os,secrets,smtplib,ssl,sys,time,uuid,imaplib,urllib.request,urllib.error
+import base64,json,os,secrets,smtplib,ssl,sys,threading,time,uuid,imaplib,urllib.request,urllib.error
 B="http://stalwart:8080"; fails=[]
 for _ in range(90):
     try: urllib.request.urlopen(B+"/healthz/ready",timeout=2); break
@@ -248,8 +248,49 @@ r=r1(K,ap(ALICE,{"@type":"Inherit"})); check(r[0]=="x:AppPassword/set" and "gran
 for what,auth,acc in TARGETS:
     r=r1(auth,ap(acc,IMAPP)); check(refused(r), f"0008 x:AppPassword/set create: refused on {what}")
 if c:
-    r=r1(K,["x:AppPassword/set",{"accountId":ALICE,"destroy":[c["id"]]},"d"]); check(refused(r), "0008 x:AppPassword/set destroy on alice: still refused (only issuing passes)")
     r=r1(K,["x:AppPassword/get",{"accountId":ALICE},"g"]); check(refused(r), "0008 x:AppPassword/get on alice: still refused")
+# Revoking one by id (MAI-1018): the API used to null `credentials/<key>` instead, and Stalwart renumbers the keys
+# when one goes, so two revokes at once could remove a third password.
+def app_ids(i):
+    g=r1(ADM,["x:Account/get",{"accountId":A,"ids":[i],"properties":["credentials"]},"g"])
+    return {str(v.get("credentialId")) for v in g[1]["list"][0]["credentials"].values() if v["@type"]=="AppPassword"}
+def destroy_by_key(i,tries=3):
+    # A writer that loses Stalwart's revision check gets serverUnavailable and may retry; the API does the same.
+    for _ in range(tries):
+        r=r1(K,["x:AppPassword/set",{"accountId":ALICE,"destroy":[i]},"d"])
+        if not (r[0]=="error" and r[1].get("type")=="serverUnavailable"): return r
+    return r
+r=destroy_by_key(c["id"]) if c else ["none",{}]
+check(r[0]=="x:AppPassword/set" and c["id"] in (r[1].get("destroyed") or []), "0008 x:AppPassword/set destroy: the key revokes an app password on alice by id")
+r[0]=="x:AppPassword/set" or print("  ", json.dumps(r)[:200])
+if c:
+    M=imaplib.IMAP4_SSL("stalwart",993,ssl_context=ctx)
+    try: M.login("alice@one.test",c["secret"]); gone=False
+    except imaplib.IMAP4.error: gone=True
+    check(gone, "0008: the revoked app password no longer opens alice's IMAP")
+for what,auth,acc in TARGETS:
+    r=r1(auth,["x:AppPassword/set",{"accountId":acc,"destroy":["zz"]},"d"]); check(refused(r), f"0008 x:AppPassword/set destroy: refused on {what}")
+g=r1(ADM,["x:Account/get",{"accountId":A,"ids":[ID["alice"]],"properties":["credentials"]},"g"])
+PID=[str(v["credentialId"]) for v in g[1]["list"][0]["credentials"].values() if v["@type"]=="Password"][0]
+r=r1(K,["x:AppPassword/set",{"accountId":ALICE,"destroy":[PID]},"d"])
+check(r[0]=="x:AppPassword/set" and PID in (r[1].get("notDestroyed") or {}) and session(AL)[0]==200, f"0008: destroy cannot remove alice's password credential (upstream's rule) ({json.dumps(r)[:120]})")
+# A concurrent pair, each naming its own password, with a third beside them: exactly the two go, every round.
+r1(ADM,["x:Account/set",{"accountId":A,"update":{ID["alice"]:{"quotas":{"maxAppPasswords":50}}}},"u"])
+lost=0; missed=0
+for rnd in range(5):
+    three=[cc["id"] for cc in ((r1(K,ap(ALICE,IMAPP))[1].get("created") or {}).get("p") for _ in range(3)) if cc]
+    if len(three)<3: missed+=1; continue      # an image that cannot issue one (before 0008) fails this row
+    out={}
+    ts=[threading.Thread(target=lambda i=i: out.__setitem__(i,destroy_by_key(i))) for i in three[:2]]
+    [t.start() for t in ts]; [t.join() for t in ts]
+    left=app_ids(ID["alice"])
+    missed+=sum(1 for i in three[:2] if i in left or i not in (out[i][1].get("destroyed") or []))
+    lost+=three[2] not in left
+    destroy_by_key(three[2])
+check(missed==0 and lost==0, "0008: two concurrent revokes remove exactly the two named app passwords, five rounds")
+(missed or lost) and print(f"   missed={missed} third-lost={lost}")
+r=r1(K,["x:AppPassword/set",{"accountId":ALICE,"update":{"zz":{"description":"x"}}},"u"])
+check(refused(r), "0008: x:AppPassword/set update on alice is still refused (issue and revoke only)")
 # Only issuing an app password opened: an API key on alice, and a create carrying an update, stay walled.
 r=r1(K,["x:ApiKey/set",{"accountId":ALICE,"create":{"k":{"description":"x","permissions":{"@type":"Replace","permissions":{"authenticate":True}}}}},"k"])
 check(refused(r), "0008: x:ApiKey/set create on alice is still refused (only app passwords opened)")
