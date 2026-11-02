@@ -104,8 +104,10 @@ env:
   # The first rust-s3 release whose DeleteObject signs no header it never sends (6c97cb9, rust-s3 #466).
   RUSTS3_VERSION: 0.38.0
   IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch
-  # The tag after the Stalwart release: bump it with any change to what is built.
-  VARIANT: tenantacl2-filescan3-banexpiry1-grant2-verbs2-nologo1-bodycap1-textcap1-totponce1-dsnhdrs1-dsnfull1-spamlevel1-stall1-enrol1
+  # The tag after the Stalwart release: bump it with any change to what is built. p<last patch>-<build of that set>:
+  # a new patch resets it (p0018-1), any other change to what is built counts up (p0017-2). Until 0017 it listed every
+  # patch's own suffix, and with 0017's it reached 133 characters, past a Docker tag's 128 (MAI-1100).
+  VARIANT: p0017-1
   # A FIXED image that HAS the expired-ban bug (the last build before 0006), which the ban-expiry check must FAIL
   # on the bug's own line: that proves the check can fail. ⛔ NEVER bumped with releases: every build after 0006
   # lacks the bug and PASSES the check, so it could never be the reference. Pinned by tag AND digest, because a tag
@@ -184,6 +186,7 @@ jobs:
         run: |
           set -eu
           tag="${STALWART_TAG}-${VARIANT}"
+          [ "${#tag}" -le 128 ] || { echo "::error::${tag} is ${#tag} characters, past a Docker tag's 128: shorten VARIANT"; exit 1; }
           if ! have=$(docker buildx imagetools inspect "${IMAGE}:${tag}" --format '{{.Manifest.Digest}} {{index .Image.Config.Labels "org.opencontainers.image.revision"}}' 2>&1); then
             case "$have" in *": not found"*) ;; *) echo "::error::cannot read ${IMAGE}:${tag}: ${have}"; exit 1 ;; esac
             echo "${tag} is new: a main build publishes it"

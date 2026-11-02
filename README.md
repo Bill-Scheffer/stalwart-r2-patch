@@ -500,7 +500,9 @@ code it is on, and that code does not sign in again; replacing the secret while 
 image before it (`MAI1100_BUG_REFERENCE_IMAGE`, `-stall1`) the four enrolment checks FAIL and the controls and 0012's
 checks pass; the build requires both.
 
-Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-tenantacl2-filescan3-banexpiry1-grant2-verbs2-nologo1-bodycap1-textcap1-totponce1-dsnhdrs1-dsnfull1-spamlevel1-stall1-enrol1`.
+Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-p0017-1`. From 0017 the variant is `p<last patch>-<build of that
+set>`: the list of every patch's suffix it replaced (`…-spamlevel1-stall1`) would have been 133 characters with 0017's,
+past a Docker tag's 128.
 
 ## Builds, tags and testing a change before it merges
 
