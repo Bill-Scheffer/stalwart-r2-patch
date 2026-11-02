@@ -88,6 +88,7 @@ def totp(seed,t=None):
     k=base64.b32decode(seed); c=int((t or time.time())//30)
     h=hmac.new(k,struct.pack(">Q",c),hashlib.sha1).digest(); o=h[-1]&15
     return "%06d"%((struct.unpack(">I",h[o:o+4])[0]&0x7fffffff)%1000000)
+def new_seed(): return base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
 def fresh(seed):
     # The start of the next 30 s window: a code no earlier check has used.
     time.sleep(30-time.time()%30+1); return totp(seed)
@@ -107,7 +108,7 @@ def imap(user,secret):
     except imaplib.IMAP4.error: return "refused"
 
 # Two-step on, as webmail turns it on (Settings → Security).
-seed=base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
+seed=new_seed()
 url=f"otpauth://totp/E2E:{USER}?secret={seed}&issuer=E2E"
 assert pwset(basic(USER,pw),{"currentSecret":pw,"otpAuth":{"otpUrl":url,"otpCode":totp(seed)}})=="updated", "enrol"
 print(f"-- in-memory store: {STORE}")
@@ -164,20 +165,21 @@ def undo(sd):
     # Off again, as the account now is: on, with sd. Over a token session (a two-step account opens no Basic one).
     t=signin(pw,fresh(sd))
     return t is not None and pwset(t,{"currentSecret":pw,"otpAuth":{"otpUrl":None,"otpCode":fresh(sd)}})=="updated"
-s2=base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
-other=base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
+s2=new_seed(); other=new_seed()
 r=turn_on(s2,None)
 reuse(r=="A code from the new secret is required to turn on two-step sign-in.", "turning two-step on with no code is refused, and says why")
 if r=="updated": check(undo(s2), f"[{STORE}] setup: turned off again")
 r=turn_on(s2,totp(other))
 reuse(r=="The two-step code does not match the new secret.", "turning two-step on with a code from another secret is refused, and says why")
 if r=="updated": check(undo(s2), f"[{STORE}] setup: turned off again")
+# A fresh step, never marked: the turn-off above marked the one before it, and 0012's mark must not be what refuses
+# this code a second sign-in.
 c5=fresh(s2)
 check(turn_on(s2,c5)=="updated", f"[{STORE}] control: turning two-step on with a code from the new secret succeeds")
 reuse(signin(pw,c5) is None, "the code that turned two-step on does not sign in again")
 tok=signin(pw,fresh(s2))
 check(tok is not None, f"[{STORE}] control: the new secret's next code signs in")
-s3=base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
+s3=new_seed()
 r=pwset(tok,{"currentSecret":pw,"otpAuth":{"otpUrl":otpurl(s3),"otpCode":fresh(s2)}})
 reuse(r=="Two-step sign-in is already on. Turn it off, then on again with the new secret.", "replacing a secret that is on is refused, and says why")
 check(signin(pw,fresh(s3 if r=="updated" else s2)) is not None, f"[{STORE}] control: the account still signs in with the secret it holds")
