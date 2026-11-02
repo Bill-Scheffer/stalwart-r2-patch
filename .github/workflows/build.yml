@@ -63,6 +63,11 @@
 #    with 408, an IMAP literal with its session; one that trickles below 16 KiB/s past that grace is refused (HTTP 408,
 #    IMAP read, dropped and NO). 0010 held a declared literal's whole size until the IMAP timeout (30 min), and upstream
 #    reads an HTTP body with no timeout (MainThrive MAI-1078).
+# 17. patches/0017-turning-two-step-on-proves-the-new-secret.patch: turning two-step on (x:AccountPassword/set with a new
+#    otpUrl) needs a code from the NEW secret, and that code is then used, as 0012 marks a sign-in's. Upstream checks the
+#    code only against the old secret, and turning it on there is none, so a secret the user's authenticator never
+#    stored was enabled on the password alone and locked them out (MainThrive MAI-1100). Replacing a secret that is
+#    already on is refused: it would need a code from each, and a change carries one, so it goes off, then on again.
 # Everything else is upstream: the tag's source, its Dockerfile, its features.
 # The release tag is pushed only from main; a dispatch from another branch pushes branch-<short sha>
 # instead, and a pull request runs every step but the registry login and the push (MAI-1019). A release tag is
@@ -100,7 +105,7 @@ env:
   RUSTS3_VERSION: 0.38.0
   IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch
   # The tag after the Stalwart release: bump it with any change to what is built.
-  VARIANT: tenantacl2-filescan3-banexpiry1-grant2-verbs2-nologo1-bodycap1-textcap1-totponce1-dsnhdrs1-dsnfull1-spamlevel1-stall1
+  VARIANT: tenantacl2-filescan3-banexpiry1-grant2-verbs2-nologo1-bodycap1-textcap1-totponce1-dsnhdrs1-dsnfull1-spamlevel1-stall1-enrol1
   # A FIXED image that HAS the expired-ban bug (the last build before 0006), which the ban-expiry check must FAIL
   # on the bug's own line: that proves the check can fail. ⛔ NEVER bumped with releases: every build after 0006
   # lacks the bug and PASSES the check, so it could never be the reference. Pinned by tag AND digest, because a tag
@@ -132,6 +137,10 @@ env:
   # until then), on which the key's revoke is refused, so the admin-verbs check must FAIL on the revoke rows.
   # ⛔ NEVER bumped, for the same reason. Pinned by its pinned- tag's digest.
   MAI1018_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:pinned-cc7bd828cb08@sha256:cc7bd828cb08b2482ec4223a8f8b751047e6b68431bd19991b8d6f39f755e506
+  # The same for 0017: the last build before it (production's image until then), on which turning two-step on proves
+  # nothing about the new secret, so the enrolment checks must FAIL. ⛔ NEVER bumped, for the same reason. Pinned by its
+  # pinned- tag's digest.
+  MAI1100_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:pinned-d412c4cdf5e8@sha256:d412c4cdf5e8c4873aea88ef3b80578b91aca2ff76839de52bfb900420f4aca3
   # 0016's check FAILS on MAI1077_BUG_REFERENCE_IMAGE (-bodycap1, the build that introduced the two holes; every build
   # since carries them unchanged until 0016), so it needs no reference of its own.
 
@@ -434,6 +443,20 @@ jobs:
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
+          # Stage 0016, so the next step's diff under crates/ is 0017 alone.
+          git add -- crates/
+
+      - name: Apply the two-step enrolment patch, and prove it changed only its own files
+        working-directory: stalwart
+        run: |
+          set -eu
+          P=../patch/patches/0017-turning-two-step-on-proves-the-new-secret.patch
+          git apply --check "$P" && git apply "$P"
+          got=$(git diff --name-only | sort | tr '\n' ' ')
+          [ "$got" = "crates/directory/src/core/secret.rs crates/jmap/src/registry/mapping/account.rs " ] \
+            || { echo "::error::changed files: $got"; exit 1; }
+          diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
+            || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
 
       - name: Swap, as Stalwart's own CI adds for its release build
         run: |
@@ -459,7 +482,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ env.STALWART_TAG }}-${{ env.VARIANT }}
-            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with tenant-scoped sharing (JMAP, IMAP, WebDAV), scanned, capped file writes, expired bans replaced, account writes within the caller's grant, admin verbs without impersonate, no logo on calendar mail, and a server-wide cap on large uploads and messages, and a bounded spam-filter text analysis, and a two-step code accepted once, and bounces returning the original's headers as text/rfc822-headers, up to 64 KiB, a byte that is not UTF-8 replaced, and a spam level per account
+            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with tenant-scoped sharing (JMAP, IMAP, WebDAV), scanned, capped file writes, expired bans replaced, account writes within the caller's grant, admin verbs without impersonate, no logo on calendar mail, and a server-wide cap on large uploads and messages, and a bounded spam-filter text analysis, and a two-step code accepted once, and bounces returning the original's headers as text/rfc822-headers, up to 64 KiB, a byte that is not UTF-8 replaced, and a spam level per account, and turning two-step on proving the new secret
             org.opencontainers.image.licenses=AGPL-3.0-only
           cache-from: type=gha
           # Only main writes the cache: a pull request reads main's, and a Rust build cache written per
@@ -560,7 +583,7 @@ jobs:
             "FAIL a URL past the first 512 KiB of an HTML part's text is not analysed" \
             'PASS the control set scores as it did before the patch'
 
-      - name: A two-step code is accepted once, at sign-in and to confirm a change, with the in-memory store in the data store and in Valkey (end to end, the built image)
+      - name: A two-step code is accepted once, at sign-in and to confirm a change, and turning two-step on proves the new secret, with the in-memory store in the data store and in Valkey (end to end, the built image)
         run: bash patch/scripts/e2e-totp-replay.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
 
       - name: The same check FAILS on the last image before 0012, on each reuse in both stores, and its controls PASS there
@@ -573,6 +596,23 @@ jobs:
             'FAIL [valkey] the same code a second time, in the same window, is refused' \
             'FAIL [valkey] a code that confirmed a password change does not sign in again' \
             'FAIL [valkey] a code already used does not confirm a password change, and says why' \
+            'PASS [valkey] every control passes' \
+            'PASS [valkey] control: the in-memory store is Valkey'
+
+      - name: The same check FAILS on the last image before 0017, on each enrolment check in both stores, and its controls PASS there
+        run: |
+          bash patch/scripts/previous-must-fail.sh "${MAI1100_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-totp-replay.sh \
+            'FAIL [rocksdb] turning two-step on with no code is refused, and says why' \
+            'FAIL [rocksdb] turning two-step on with a code from another secret is refused, and says why' \
+            'FAIL [rocksdb] the code that turned two-step on does not sign in again' \
+            'FAIL [rocksdb] replacing a secret that is on is refused, and says why' \
+            'PASS [rocksdb] the same code a second time, in the same window, is refused' \
+            'PASS [rocksdb] every control passes' \
+            'FAIL [valkey] turning two-step on with no code is refused, and says why' \
+            'FAIL [valkey] turning two-step on with a code from another secret is refused, and says why' \
+            'FAIL [valkey] the code that turned two-step on does not sign in again' \
+            'FAIL [valkey] replacing a secret that is on is refused, and says why' \
+            'PASS [valkey] the same code a second time, in the same window, is refused' \
             'PASS [valkey] every control passes' \
             'PASS [valkey] control: the in-memory store is Valkey'
 
