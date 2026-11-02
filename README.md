@@ -1,13 +1,14 @@
 # stalwart-r2-patch
 
-[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **fourteen**
+[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **sixteen**
 changes: **sharing never crosses tenants**, stored files
 and mail written into a mailbox are **scanned**, a ban that expired is **enforced again**, a narrow
 key **cannot take over an Admin**, an operator can run **admin verbs on a mailbox without reading
 its mail**, calendar mail carries **no Stalwart logo**, a burst of large uploads or messages is **refused, not an OOM**, the spam filter reads a
 **bounded start** of each message's text, a two-step code is **accepted once**, and a bounce returns the original's
 headers **as `text/rfc822-headers`**, **up to 64 KiB** of them, none dropped for a byte that is not UTF-8, and each
-account has **its own spam level**. The first change, deleting blobs from **Cloudflare R2**, is upstream's own since
+account has **its own spam level**, a client that stops sending **holds no budget**, and turning two-step on
+**proves the new secret**. The first change, deleting blobs from **Cloudflare R2**, is upstream's own since
 v0.16.26 (below).
 
 ## The problem
@@ -327,9 +328,8 @@ one (logged with the reason `TOTP code already used`; it counts towards the auth
 with *"This two-step code was already used. Wait for the next one."* The mark is set atomically in both backends
 (Valkey `SET NX EX`; in the data store, an asserted write), so with the in-memory store in Valkey, as MainThrive runs
 it, two nodes cannot both accept one code. It expires when the step can no longer be accepted. A change checks the new
-password's strength before it marks the code, so a refused password does not spend it. What it does not cover: turning
-two-step ON proves no code against the new secret (upstream checks only the old one, and there is none), so nothing is
-marked then; and the mark is per account and step, not per secret, so a code from a secret enrolled within the same
+password's strength before it marks the code, so a refused password does not spend it. Turning two-step ON is the seventeenth
+change's (below). The mark is per account and step, not per secret, so a code from a secret enrolled within the same
 ~60 s as a code from the old one was used is refused once. With the in-memory store in the data store, 0012 adds
 nothing that deletes an expired mark (one small row per two-step sign-in; Valkey expires its own).
 ⚠️ A webmail that signs in again after a password change with the code the change was confirmed with is refused: it must
@@ -473,7 +473,36 @@ WebDAV and a JMAP upload are accepted while the stalled clients are still connec
 and so does a stalled JMAP upload, while a body sending 1 MiB every 3 s is stored. Against `-bodycap1`
 (`MAI1077_BUG_REFERENCE_IMAGE`) each hold FAILs and the controls pass; the build requires both.
 
-Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-tenantacl2-filescan3-banexpiry1-grant2-verbs2-nologo1-bodycap1-textcap1-totponce1-dsnhdrs1-dsnfull1-spamlevel1-stall1`.
+## The seventeenth change: turning two-step on proves the new secret
+
+Two-step sign-in is turned on with `x:AccountPassword/set`: the current password, the new `otpUrl`, and a code. Upstream
+checks the code only against the account's OLD `otpUrl`, and when two-step is being turned on there is none, so the
+password alone turned it on, with any code or none (measured on production's image, MainThrive MAI-1100). A secret the
+user's authenticator never stored (a mis-scanned QR code, a client that does not check the code first) then locked
+them out: every sign-in needs a code from it. MainThrive's webmail checks the code in the browser before it sends, so
+the failure needs another client, or a webmail change.
+
+[`patches/0017-turning-two-step-on-proves-the-new-secret.patch`](patches/0017-turning-two-step-on-proves-the-new-secret.patch):
+a change that sets a new `otpUrl` while two-step is off needs a code from that URL, checked as a sign-in's is (one step
+either side), and refused otherwise: *"A code from the new secret is required to turn on two-step sign-in."* with none,
+*"The two-step code does not match the new secret."* with a wrong one, and `invalidProperties` on `otpUrl` for a URL
+that does not parse. The code is then marked used, as 0012 marks a sign-in's, so it cannot also sign in. It is not
+refused when its step is already marked: 0012's mark is per account and step, and a mark from the secret just turned
+off does not make the new secret's code a reuse. Replacing a secret while two-step is ON is refused: *"Two-step sign-in
+is already on. Turn it off, then on again with the new secret."* It would need a code from each secret, and a change
+carries one; proving only the new one would let the password alone swap in someone else's authenticator, and proving
+only the old one is the lock-out this fixes. Turning it off (a code from the old secret) and a password change with it
+on are unchanged. The verifier is shared with sign-in (`verify_totp_code` in `secret.rs`), so the two cannot check a
+code differently.
+[`scripts/e2e-totp-replay.sh`](scripts/e2e-totp-replay.sh) adds, in both stores: turning two-step off with its code
+works; turning it on with no code, or with a code from another secret, is refused and says why; with the new secret's
+code it is on, and that code does not sign in again; replacing the secret while on is refused. Against production's
+image before it (`MAI1100_BUG_REFERENCE_IMAGE`, `-stall1`) the four enrolment checks FAIL and the controls and 0012's
+checks pass; the build requires both.
+
+Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-p0017-1`. From 0017 the variant is `p<last patch>-<build of that
+set>`: the list of every patch's suffix it replaced (`…-spamlevel1-stall1`) would have been 133 characters with 0017's,
+past a Docker tag's 128.
 
 ## Builds, tags and testing a change before it merges
 

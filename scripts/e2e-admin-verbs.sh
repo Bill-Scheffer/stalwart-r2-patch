@@ -23,7 +23,7 @@ docker run -d --name "$C" --network "$NET" --network-alias stalwart --hostname m
 docker run -d --name "$K" --network "$NET" -e ADMIN="$ADMIN" \
   -v "$HERE/e2e-admin-verbs.perms:/perms.txt:ro" python:3.12-alpine sleep 900 >/dev/null
 docker exec -i "$K" python3 - <<'PY'
-import base64,json,os,secrets,smtplib,ssl,sys,threading,time,uuid,imaplib,urllib.request,urllib.error
+import base64,hashlib,hmac,json,os,secrets,struct,smtplib,ssl,sys,threading,time,uuid,imaplib,urllib.request,urllib.error
 B="http://stalwart:8080"; fails=[]
 for _ in range(90):
     try: urllib.request.urlopen(B+"/healthz/ready",timeout=2); break
@@ -88,10 +88,13 @@ def own_script(auth,acc,name,text,active):
 FWD=own_script(AL,ALICE,"forward",'require ["copy"];\r\nredirect :copy "carol@one.test";\r\n',True)  # webmail's shape
 SPARE=own_script(AL,ALICE,"spare",'keep;\n',False)
 own_script(OA,OPS,"ops",'keep;\n',True)
-# opsadm enrols TOTP, as production's Admins do: a password alone no longer opens a session.
+# opsadm enrols TOTP, as production's Admins do: a password alone no longer opens a session. With the current code
+# from the new secret, as a client turns it on: from 0017 that code is required.
 sec=base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
+_h=hmac.new(base64.b32decode(sec),struct.pack(">Q",int(time.time()//30)),hashlib.sha1).digest()
+code="%06d"%((struct.unpack(">I",_h[_h[-1]&15:(_h[-1]&15)+4])[0]&0x7fffffff)%1000000)
 r1(OA,["x:AccountPassword/set",{"accountId":session(OA)[1]["primaryAccounts"]["urn:stalwart:jmap"],"update":{"singleton":{
-    "currentSecret":PW["opsadm"],"otpAuth":{"otpUrl":f"otpauth://totp/S:opsadm?secret={sec}&issuer=S"}}}},"u"])
+    "currentSecret":PW["opsadm"],"otpAuth":{"otpUrl":f"otpauth://totp/S:opsadm?secret={sec}&issuer=S","otpCode":code}}}},"u"])
 check(session(OA)[0]==402, "setup: opsadm's password alone no longer opens a session (TOTP enrolled)")
 
 ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# End-to-end: a two-step (TOTP) code is accepted once (patch 0012).
+# End-to-end: a two-step (TOTP) code is accepted once (patch 0012), and turning two-step on proves the new secret
+# (patch 0017).
 # usage: e2e-totp-replay.sh <stalwart image>
 #
 # Upstream checks the code against the account's otpauth URL and keeps no record of it, so the same six digits sign
@@ -8,6 +9,11 @@
 # two places: a sign-in through /api/auth (the OAuth login every two-step client uses) and the password / two-step
 # change (x:AccountPassword/set). IMAP, SMTP and JMAP Basic carry no code, so a two-step account cannot sign in there
 # with its password at all, only with an app password; the controls below hold that, on both images.
+#
+# 0017: turning two-step on is x:AccountPassword/set with a new otpUrl, and upstream checks the code only against the
+# OLD secret, which there is none of then: the password alone turned it on, with any code or none, so a secret the
+# user's authenticator never stored locked them out (MAI-1100, measured on production's image). Turning it off, and a
+# password change with it on, are the controls: both work as before.
 #
 # Every check runs twice: with the in-memory store in the data store (RocksDB), then with it in Valkey, as production
 # runs it (both nodes share it, and Valkey's SET NX is what makes the mark atomic across them).
@@ -28,7 +34,7 @@ docker run -d --name "$C" --network "$NET" --network-alias stalwart --hostname m
   -e STALWART_RECOVERY_ADMIN="admin:$ADMIN" \
   -v "$W/etc:/etc/stalwart" -v "$W/data:/var/lib/stalwart" "$IMG" >/dev/null
 cli() { docker run --rm --network "$NET" -e STALWART_URL=http://stalwart:8080 -e STALWART_USER=admin -e STALWART_PASSWORD="$ADMIN" "$CLI" --no-color "$@"; }
-docker run -d --name "$K" --network "$NET" -e ADMIN="$ADMIN" python:3.12-alpine sleep 900 >/dev/null
+docker run -d --name "$K" --network "$NET" -e ADMIN="$ADMIN" python:3.12-alpine sleep 3600 >/dev/null
 ready() {
 docker exec "$K" python3 -c "
 import time,urllib.request
@@ -53,7 +59,8 @@ import base64,hashlib,hmac,imaplib,json,os,secrets,ssl,struct,time,urllib.error,
 B="http://stalwart:8080"; USER=os.environ["USER"]; pw=os.environ["PW"]; STORE=os.environ["STORE"]
 fails=[]; reuse_fails=[]
 def check(ok,msg): print(("PASS " if ok else "FAIL ")+msg); ok or fails.append(msg)
-# The three reuse checks: each FAILS on the image before 0012, so they are tallied apart from the controls.
+# The three reuse checks: each FAILS on the image before 0012, and the enrolment checks on the image before 0017, so
+# they are tallied apart from the controls.
 def reuse(ok,msg):
     check(ok,f"[{STORE}] {msg}")
     ok or reuse_fails.append(msg)
@@ -81,6 +88,7 @@ def totp(seed,t=None):
     k=base64.b32decode(seed); c=int((t or time.time())//30)
     h=hmac.new(k,struct.pack(">Q",c),hashlib.sha1).digest(); o=h[-1]&15
     return "%06d"%((struct.unpack(">I",h[o:o+4])[0]&0x7fffffff)%1000000)
+def new_seed(): return base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
 def fresh(seed):
     # The start of the next 30 s window: a code no earlier check has used.
     time.sleep(30-time.time()%30+1); return totp(seed)
@@ -100,7 +108,7 @@ def imap(user,secret):
     except imaplib.IMAP4.error: return "refused"
 
 # Two-step on, as webmail turns it on (Settings → Security).
-seed=base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
+seed=new_seed()
 url=f"otpauth://totp/E2E:{USER}?secret={seed}&issuer=E2E"
 assert pwset(basic(USER,pw),{"currentSecret":pw,"otpAuth":{"otpUrl":url,"otpCode":totp(seed)}})=="updated", "enrol"
 print(f"-- in-memory store: {STORE}")
@@ -141,7 +149,42 @@ check(pwset(tok,{"currentSecret":pw,"secret":"short","otpAuth/otpCode":c4})!="up
 new=secrets.token_urlsafe(16)
 check(pwset(tok,{"currentSecret":pw,"secret":new,"otpAuth/otpCode":c4})=="updated",
       f"[{STORE}] the code that the refused change carried still confirms the next change")
-# Every check other than the three reuse checks: these must pass on BOTH images, or a reuse FAIL proves nothing.
+# 4. Turning two-step on proves the new secret (0017). First off, proven by the current secret's code (a control: it
+#    works on every image). Each attempt that an image without 0017 accepts is turned off again, so the next starts
+#    from off.
+tok=signin(new,fresh(seed)); pw=new
+check(tok is not None, f"[{STORE}] sign-in after the change")
+off=pwset(tok,{"currentSecret":pw,"otpAuth":{"otpUrl":None,"otpCode":fresh(seed)}})
+check(off=="updated", f"[{STORE}] control: two-step turns off, proven by a code from its secret ({off})")
+def otpurl(sd): return f"otpauth://totp/E2E:{USER}?secret={sd}&issuer=E2E"
+def turn_on(sd,code):
+    patch={"currentSecret":pw,"otpAuth":{"otpUrl":otpurl(sd)}}
+    if code is not None: patch["otpAuth"]["otpCode"]=code
+    return pwset(basic(USER,pw),patch)
+def undo(sd):
+    # Off again, as the account now is: on, with sd. Over a token session (a two-step account opens no Basic one).
+    t=signin(pw,fresh(sd))
+    return t is not None and pwset(t,{"currentSecret":pw,"otpAuth":{"otpUrl":None,"otpCode":fresh(sd)}})=="updated"
+s2=new_seed(); other=new_seed()
+r=turn_on(s2,None)
+reuse(r=="A code from the new secret is required to turn on two-step sign-in.", "turning two-step on with no code is refused, and says why")
+if r=="updated": check(undo(s2), f"[{STORE}] setup: turned off again")
+r=turn_on(s2,totp(other))
+reuse(r=="The two-step code does not match the new secret.", "turning two-step on with a code from another secret is refused, and says why")
+if r=="updated": check(undo(s2), f"[{STORE}] setup: turned off again")
+# A fresh step, never marked: the turn-off above marked the one before it, and 0012's mark must not be what refuses
+# this code a second sign-in.
+c5=fresh(s2)
+check(turn_on(s2,c5)=="updated", f"[{STORE}] control: turning two-step on with a code from the new secret succeeds")
+reuse(signin(pw,c5) is None, "the code that turned two-step on does not sign in again")
+tok=signin(pw,fresh(s2))
+check(tok is not None, f"[{STORE}] control: the new secret's next code signs in")
+s3=new_seed()
+r=pwset(tok,{"currentSecret":pw,"otpAuth":{"otpUrl":otpurl(s3),"otpCode":fresh(s2)}})
+reuse(r=="Two-step sign-in is already on. Turn it off, then on again with the new secret.", "replacing a secret that is on is refused, and says why")
+check(signin(pw,fresh(s3 if r=="updated" else s2)) is not None, f"[{STORE}] control: the account still signs in with the secret it holds")
+
+# Every check other than the reuse and enrolment checks: these must pass on BOTH images, or a FAIL proves nothing.
 controls_ok=len(fails)==len(reuse_fails)
 print(("PASS " if controls_ok else "FAIL ")+f"[{STORE}] every control passes")
 print(f"{len(fails)} failure(s)"); raise SystemExit(1 if fails else 0)
