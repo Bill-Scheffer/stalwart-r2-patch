@@ -107,6 +107,10 @@ env:
   STALWART_SHA: aa47d8ef7bfba7200d3293198ac2592747b20e73
   # The first rust-s3 release whose DeleteObject signs no header it never sends (6c97cb9, rust-s3 #466).
   RUSTS3_VERSION: 0.38.0
+  # The commit of opentelemetry-rust that this release's Cargo.lock names (the step that moves its source says why).
+  OTEL_SHA: ae66e97b140f70e477ab710686aafce665cc2f8b
+  # The builder's base image, the digest the last green build used (run 41544013312): upstream's Dockerfile names a floating tag.
+  CARGO_CHEF_DIGEST: sha256:f122e3c240d1c05668b07179cf6fa07647db2a79a110f4bb8a91d75f90d5b8e4
   IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch
   # The tag after the Stalwart release: bump it with any change to what is built. p<last patch>-<build of that set>:
   # a new patch resets it (p0018-1), any other change to what is built counts up (p0017-2). Until 0017 it listed every
@@ -235,6 +239,39 @@ jobs:
           [ "$got" = "${RUSTS3_VERSION}|registry+https://github.com/rust-lang/crates.io-index" ] \
             || { echo "::error::Cargo.lock's rust-s3 is '${got}', not ${RUSTS3_VERSION} from crates.io"; exit 1; }
           [ -z "$(git status --porcelain)" ] || { echo "::error::the checkout is not upstream's commit as tagged"; git status --porcelain; exit 1; }
+
+      # v0.16.27 names a fork that no longer exists (github.com/stalwartlabs/opentelemetry-rust answers 404; upstream's main has
+      # moved off it). Builds kept working only while the dependency layer stayed cached, and cargo-chef's floating base image
+      # moved, so a build then failed at `cargo chef cook` (MainThrive MAI-1072). The locked commit is still served by the
+      # network it was forked from, and a commit id names its content, so this changes where it comes from and nothing else: its
+      # tarball from there hashes to cc9d74ba..., as FreeBSD's mail/stalwart port recorded it from the fork. The count fails on
+      # a release that no longer names the fork or names another commit: drop or re-check this step then.
+      # The base image goes with it: upstream's Dockerfile builds on a floating tag, which is how the cached layer was lost and
+      # what would change the compiler under a security fix. It is pinned here to the digest of the last green build.
+      - name: opentelemetry-rust is the commit Stalwart's lock names, from where that commit still exists, and the builder's base is pinned
+        working-directory: stalwart
+        run: |
+          set -eu
+          GONE=github.com/stalwartlabs/opentelemetry-rust
+          HERE=github.com/open-telemetry/opentelemetry-rust
+          n=$(grep -c "git+https://$GONE#$OTEL_SHA" Cargo.lock || true)
+          [ "$n" = 6 ] || { echo "::error::Cargo.lock names $GONE at $OTEL_SHA $n time(s), not 6"; exit 1; }
+          sed -i "s#$GONE#$HERE#" Cargo.lock crates/common/Cargo.toml
+          got=$(git diff --name-only | sort | tr '\n' ' ')
+          [ "$got" = "Cargo.lock crates/common/Cargo.toml " ] || { echo "::error::changed files: $got"; exit 1; }
+          ! grep -q "$GONE" Cargo.lock crates/common/Cargo.toml || { echo "::error::$GONE is still named"; exit 1; }
+          [ "$(grep -c "git+https://$HERE#$OTEL_SHA" Cargo.lock)" = 6 ] || { echo "::error::the lock moved off $OTEL_SHA"; exit 1; }
+          # The commit itself, before a build that would only fail on it later: fetched by id, from there, and compared.
+          got=$(git init -q "$RUNNER_TEMP/otel" && git -C "$RUNNER_TEMP/otel" fetch -q --depth=1 "https://$HERE" "$OTEL_SHA" && git -C "$RUNNER_TEMP/otel" rev-parse FETCH_HEAD) \
+            || { echo "::error::$HERE no longer serves $OTEL_SHA"; exit 1; }
+          [ "$got" = "$OTEL_SHA" ] || { echo "::error::$HERE served $got, not $OTEL_SHA"; exit 1; }
+          n=$(grep -c "^FROM .*cargo-chef:latest-rust-slim-trixie AS chef$" Dockerfile || true)
+          [ "$n" = 1 ] || { echo "::error::the Dockerfile's cargo-chef FROM line is not the one this pins ($n match)"; exit 1; }
+          sed -i "s#cargo-chef:latest-rust-slim-trixie AS chef#cargo-chef:latest-rust-slim-trixie@$CARGO_CHEF_DIGEST AS chef#" Dockerfile
+          grep -qxF "FROM --platform=\$BUILDPLATFORM docker.io/lukemathwalker/cargo-chef:latest-rust-slim-trixie@$CARGO_CHEF_DIGEST AS chef" Dockerfile \
+            || { echo "::error::the base image was not pinned"; exit 1; }
+          # Stage them, so the next step's diff under crates/ is 0002 alone.
+          git add -- Cargo.lock crates/common/Cargo.toml Dockerfile
 
       - name: Apply the tenant-scoped sharing patch, and prove it changed only its own files
         working-directory: stalwart

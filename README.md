@@ -42,6 +42,15 @@ then.
 Stalwart's `Dockerfile`, whose `RUSTFLAGS` override that config, so it stays baseline x86-64 and starts on any x86-64
 VM. The build checks it on the binary: the check's message is absent from this image and present in upstream's.
 
+⚠️ v0.16.27's lock names a fork of `opentelemetry-rust` that upstream has since deleted (`stalwartlabs/opentelemetry-rust`, 404),
+so a build with no cached dependency layer cannot fetch it. The workflow takes the same locked commit (`ae66e97b`) from
+`open-telemetry/opentelemetry-rust`, whose network still serves it: the tarball from there hashes to `cc9d74ba…`, as FreeBSD's
+`mail/stalwart` port recorded it from the fork. It changes only where those bytes come from, and it fails on a release that no
+longer names that fork at that commit, when it should go. It also fetches that commit by id before the build and compares it.
+The builder's base, `cargo-chef:latest-rust-slim-trixie` in upstream's Dockerfile, floats, which is how the cached dependency
+layer was lost, so the workflow pins it to the digest of the last green build (`CARGO_CHEF_DIGEST`). Moving it is a deliberate
+change: bump `VARIANT`. The final stage's `debian:trixie-slim` still floats, so a build takes that base's current security fixes.
+
 Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-<VARIANT>`. Pin it by digest.
 
 ## The second change: sharing stays inside a tenant
