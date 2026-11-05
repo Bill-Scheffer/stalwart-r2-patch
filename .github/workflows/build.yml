@@ -1,4 +1,4 @@
-# Builds Stalwart from its own release source with FIFTEEN changes, each pinned to its exact files:
+# Builds Stalwart from its own release source with SEVENTEEN changes, each pinned to its exact files:
 # 1. (retired) rust-s3 used to be taken from the commit of rust-s3 PR #467, which stops DeleteObject signing
 #    headers it never sends; without it every blob DELETE against Cloudflare R2 failed with SignatureDoesNotMatch
 #    (rust-s3 #466, Stalwart #3185). rust-s3 0.38.0 carries the fix (6c97cb9) and Stalwart v0.16.26 moved to it,
@@ -68,6 +68,10 @@
 #    code only against the old secret, and turning it on there is none, so a secret the user's authenticator never
 #    stored was enabled on the password alone and locked them out (MainThrive MAI-1100). Replacing a secret that is
 #    already on is refused: it would need a code from each, and a change carries one, so it goes off, then on again.
+# 18. patches/0018-screening-verdict-at-delivery.patch: the MTA hook is passed the server's own headers (authentication results,
+#    spam score), which upstream leaves empty, and at delivery an account with a `spam-screen` lookup row takes a junk verdict
+#    in the topmost X-MainThrive-Screen as a percentage of 100, for mail the spam filter scored. Any other copy or value, or no
+#    row, changes nothing, and a failed lookup reads as no row and is logged: never a deferral (MainThrive MAI-1072).
 # Everything else is upstream: the tag's source, its Dockerfile, its features.
 # The release tag is pushed only from main; a dispatch from another branch pushes branch-<short sha>
 # instead, and a pull request runs every step but the registry login and the push (MAI-1019). A release tag is
@@ -107,7 +111,7 @@ env:
   # The tag after the Stalwart release: bump it with any change to what is built. p<last patch>-<build of that set>:
   # a new patch resets it (p0018-1), any other change to what is built counts up (p0017-2). Until 0017 it listed every
   # patch's own suffix, and with 0017's it reached 133 characters, past a Docker tag's 128 (MAI-1100).
-  VARIANT: p0017-1
+  VARIANT: p0018-1
   # A FIXED image that HAS the expired-ban bug (the last build before 0006), which the ban-expiry check must FAIL
   # on the bug's own line: that proves the check can fail. ⛔ NEVER bumped with releases: every build after 0006
   # lacks the bug and PASSES the check, so it could never be the reference. Pinned by tag AND digest, because a tag
@@ -143,6 +147,10 @@ env:
   # nothing about the new secret, so the enrolment checks must FAIL. ⛔ NEVER bumped, for the same reason. Pinned by its
   # pinned- tag's digest.
   MAI1100_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:pinned-d412c4cdf5e8@sha256:d412c4cdf5e8c4873aea88ef3b80578b91aca2ff76839de52bfb900420f4aca3
+  # The same for 0018: the last build before it (production's image until then), which passes the hook no server headers and
+  # reads no verdict, so the screening check must FAIL on both, and pass on everything a verdict must not do. ⛔ NEVER bumped, for
+  # the same reason. Pinned by its pinned- tag's digest.
+  MAI1072_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:pinned-e18fee141b9b@sha256:e18fee141b9b54079cc11a9c92ecb04f85d28bcda013471b9d3aec82007dee51
   # 0016's check FAILS on MAI1077_BUG_REFERENCE_IMAGE (-bodycap1, the build that introduced the two holes; every build
   # since carries them unchanged until 0016), so it needs no reference of its own.
 
@@ -460,6 +468,20 @@ jobs:
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
+          # Stage 0017, so the next step's diff under crates/ is 0018 alone.
+          git add -- crates/
+
+      - name: Apply the screening patch, and prove it changed only its own files
+        working-directory: stalwart
+        run: |
+          set -eu
+          P=../patch/patches/0018-screening-verdict-at-delivery.patch
+          git apply --check "$P" && git apply "$P"
+          got=$(git diff --name-only | sort | tr '\n' ' ')
+          [ "$got" = "crates/email/src/message/delivery.rs crates/smtp/src/inbound/data.rs crates/smtp/src/inbound/ehlo.rs crates/smtp/src/inbound/hooks/message.rs crates/smtp/src/inbound/mail.rs crates/smtp/src/inbound/rcpt.rs crates/smtp/src/inbound/spawn.rs " ] \
+            || { echo "::error::changed files: $got"; exit 1; }
+          diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
+            || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
 
       - name: Swap, as Stalwart's own CI adds for its release build
         run: |
@@ -485,7 +507,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ env.STALWART_TAG }}-${{ env.VARIANT }}
-            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with tenant-scoped sharing (JMAP, IMAP, WebDAV), scanned, capped file writes, expired bans replaced, account writes within the caller's grant, admin verbs without impersonate, no logo on calendar mail, and a server-wide cap on large uploads and messages, and a bounded spam-filter text analysis, and a two-step code accepted once, and bounces returning the original's headers as text/rfc822-headers, up to 64 KiB, a byte that is not UTF-8 replaced, and a spam level per account, and turning two-step on proving the new secret
+            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with tenant-scoped sharing (JMAP, IMAP, WebDAV), scanned, capped file writes, expired bans replaced, account writes within the caller's grant, admin verbs without impersonate, no logo on calendar mail, and a server-wide cap on large uploads and messages, and a bounded spam-filter text analysis, and a two-step code accepted once, and bounces returning the original's headers as text/rfc822-headers, up to 64 KiB, a byte that is not UTF-8 replaced, and a spam level per account, and turning two-step on proving the new secret, and a screening verdict acted on at delivery per account
             org.opencontainers.image.licenses=AGPL-3.0-only
           cache-from: type=gha
           # Only main writes the cache: a pull request reads main's, and a Rust build cache written per
@@ -718,6 +740,51 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: The hook is passed the server's headers, and a junk verdict is acted on only by an account that opted in, read from the topmost copy of mail the spam filter scored (end to end, the built image)
+        run: bash patch/scripts/e2e-spam-screen.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
+
+      - name: The same check FAILS on the last image before 0018, on the server headers, each junk verdict and the failed lookup's log, and everything a verdict must not do PASSES there
+        run: |
+          bash patch/scripts/previous-must-fail.sh "${MAI1072_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-spam-screen.sh \
+            'FAIL the hook is passed Authentication-Results' \
+            'FAIL the hook is passed Received-SPF' \
+            'FAIL the hook is passed X-Spam-Result' \
+            'FAIL the hook is passed X-Spam-Score' \
+            "PASS control: the message's own headers carry none of them" \
+            'PASS setup: a low message scores from 4.0 to 5.0' \
+            "FAIL a junk verdict: the spam-screen account's copy goes to Junk, Yes" \
+            'PASS control: a junk verdict: the account with no row keeps its copy in the Inbox, No' \
+            "PASS control: a pass verdict: the spam-screen account's copy stays in the Inbox, No" \
+            'PASS control: a pass verdict: the account with no row keeps its copy in the Inbox, No' \
+            "FAIL the service's junk over two forged passes: Junk, Yes, one verdict stored" \
+            "PASS control: the service's pass over two forged junks: Inbox, No, one verdict stored" \
+            'PASS control: a forged pass changes nothing: a high message still goes to Junk, Yes' \
+            'PASS control: a forged pass changes nothing: a low message stays in the Inbox, No' \
+            'PASS control: a forged junk to an account with no row: Inbox, No' \
+            'PASS control: pass above junk: only the topmost counts: Inbox, No' \
+            'FAIL junk above pass: only the topmost counts: Junk, Yes' \
+            "FAIL the header's name in any case, its value folded: Junk, Yes" \
+            "PASS control: a verdict that cannot be read (no version) leaves Stalwart's decision: Inbox, No" \
+            "PASS control: a verdict that cannot be read (another version) leaves Stalwart's decision: Inbox, No" \
+            "PASS control: a verdict that cannot be read (capitals) leaves Stalwart's decision: Inbox, No" \
+            "PASS control: a verdict that cannot be read (a third tag) leaves Stalwart's decision: Inbox, No" \
+            "PASS control: a verdict that cannot be read (a longer word) leaves Stalwart's decision: Inbox, No" \
+            "PASS control: a verdict that cannot be read (empty) leaves Stalwart's decision: Inbox, No" \
+            'FAIL a junk verdict with a webmail folder rule: Junk, Yes, and the rule does not run' \
+            'PASS control: a pass verdict with a webmail folder rule: the rule files it, No' \
+            'PASS control: a pass verdict at Lenient: a high message stays in the Inbox, No (the level still applies)' \
+            'FAIL a junk verdict at Lenient: the same high message goes to Junk, Yes' \
+            'PASS control: the forwarding account (no row) keeps its copy in the Inbox, No' \
+            'PASS control: the forwarded copy reached the spam-screen account still carrying the old verdict' \
+            'PASS a forward carrying an old junk verdict is ignored: the copy stays in the Inbox' \
+            "PASS control: a signed-in user's message reached the spam-screen account carrying a typed verdict" \
+            "PASS a typed verdict on a signed-in user's message is ignored: Inbox" \
+            'PASS with the lookup store unavailable, the message is delivered at once, not deferred' \
+            'PASS control: and as not opted in, despite the junk verdict: Inbox, No' \
+            'FAIL the failed lookup is logged, once' \
+            "PASS control: the message's body is never logged" \
+            "PASS control: Stalwart's log records deliveries"
 
       - name: Push, only after every check passed
         if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'

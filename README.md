@@ -1,6 +1,6 @@
 # stalwart-r2-patch
 
-[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **sixteen**
+[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **seventeen**
 changes: **sharing never crosses tenants**, stored files
 and mail written into a mailbox are **scanned**, a ban that expired is **enforced again**, a narrow
 key **cannot take over an Admin**, an operator can run **admin verbs on a mailbox without reading
@@ -8,7 +8,7 @@ its mail**, calendar mail carries **no Stalwart logo**, a burst of large uploads
 **bounded start** of each message's text, a two-step code is **accepted once**, and a bounce returns the original's
 headers **as `text/rfc822-headers`**, **up to 64 KiB** of them, none dropped for a byte that is not UTF-8, and each
 account has **its own spam level**, a client that stops sending **holds no budget**, and turning two-step on
-**proves the new secret**. The first change, deleting blobs from **Cloudflare R2**, is upstream's own since
+**proves the new secret**, and an account that opted in to screening **acts on a junk verdict**. The first change, deleting blobs from **Cloudflare R2**, is upstream's own since
 v0.16.26 (below).
 
 ## The problem
@@ -500,9 +500,46 @@ code it is on, and that code does not sign in again; replacing the secret while 
 image before it (`MAI1100_BUG_REFERENCE_IMAGE`, `-stall1`) the four enrolment checks FAIL and the controls and 0012's
 checks pass; the build requires both.
 
-Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-p0017-1`. From 0017 the variant is `p<last patch>-<build of that
-set>`: the list of every patch's suffix it replaced (`…-spamlevel1-stall1`) would have been 133 characters with 0017's,
-past a Docker tag's 128.
+From 0017 the variant is `p<last patch>-<build of that set>`: the list of every patch's suffix it replaced
+(`…-spamlevel1-stall1`) would have been 133 characters with 0017's, past a Docker tag's 128.
+
+## The eighteenth change: the screening hook sees the server's headers, and a junk verdict can act at delivery
+
+MainThrive's opt-in screening is a service called through Stalwart's MTA hook (MAI-1072; its spam design record, § 5.2). Two
+things upstream cannot do stop it working, and neither needs Enterprise.
+
+[`patches/0018-screening-verdict-at-delivery.patch`](patches/0018-screening-verdict-at-delivery.patch):
+
+- **The hook is passed what this server wrote.** Upstream sends `serverHeaders` empty, so the hook sees no authentication
+  result and no spam score. `run_mta_hooks` takes the DATA header buffer (`Received`, `Authentication-Results`, `Received-SPF`,
+  `X-Spam-Result`, `X-Spam-Score`) and splits it as it splits the message's own headers. The earlier stages pass nothing, and
+  have no message to pass it with.
+- **A verdict can act, per account.** A hook can write only message-wide headers. So at delivery, after 0015's level, an
+  account with a row in the `spam-screen` lookup namespace, keyed by its id, takes `v=1; verdict=junk` in the **topmost**
+  `X-MainThrive-Screen` as a percentage of 100, and every reader of the percentage follows: Junk, Sieve's `spamtest`,
+  `X-Spam-Status`. The row's presence is the opt-in; its value is not read.
+
+What it must not do, each checked:
+
+- **A verdict only moves mail into Junk.** `verdict=pass` changes nothing, so a forged one gains nothing, and a forged `junk`
+  only junks the forger's own message.
+- **Only the topmost copy counts**, because the hook inserts its own there. `mail-parser`'s `header_raw()` searches from the
+  last header, the sender's end, so the patch walks the headers in order.
+- **Only an exact value counts.** Another version, capitals or an extra tag read as no verdict, leaving Stalwart's decision.
+- **Only mail the spam filter scored.** The hook runs on the same mail, so a verdict on anything else is old: a forward
+  delivered locally has no percentage, and neither has a signed-in user's message. MainThrive's plan also deletes the header on
+  signed-in and loopback mail, which covers what leaves for another server.
+- **A failed lookup never defers.** It is logged (`Spam screening lookup failed, delivering as not opted in.`) and read as no
+  row. No store under the namespace is no row, silently, as for 0015: that is the state until a first row is written.
+
+Nothing here changes delivery until a row exists, and nothing is passed until a hook is configured. As upstream's other
+overrides do, contact and reply trust and a `fileinto` that already ran still win over the Junk decision.
+
+[`scripts/e2e-spam-screen.sh`](scripts/e2e-spam-screen.sh) runs the pinned spam rules behind a stub that answers as the service
+does. The build requires the server-headers, junk-verdict and failed-lookup checks to FAIL on production's image before it
+(`MAI1072_BUG_REFERENCE_IMAGE`, `-p0017-1`), with every check that a verdict must not act passing there.
+
+Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-p0018-1`.
 
 ## Builds, tags and testing a change before it merges
 
