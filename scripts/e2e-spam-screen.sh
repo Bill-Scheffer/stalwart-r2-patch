@@ -69,7 +69,8 @@ class H(http.server.BaseHTTPRequestHandler):
         q = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         m = q["message"]; subject = next((v.strip() for k, v in m["headers"] if k.lower() == "subject"), "")
         open("/hook/requests.jsonl", "a").write(json.dumps({"subject": subject, "serverHeaders": m.get("serverHeaders"), "headers": m["headers"]}) + "\n")
-        verdict = "junk" if "says-junk" in subject else "pass" if "says-pass" in subject else None
+        said = subject.lower()  # a "high" message has its subject in capitals
+        verdict = "junk" if "says-junk" in said else "pass" if "says-pass" in said else None
         mods = []
         if verdict:
             forged = sum(k.strip().lower() == NAME.lower() for k, _ in m["headers"])
@@ -247,13 +248,13 @@ for label,value in (("no version","verdict=junk"),("another version","v=2; verdi
     at("scr",s,INBOX,f"control: a verdict that cannot be read ({label}) leaves Stalwart's decision: Inbox, No")
 # Every reader of the percentage agrees.
 s=send(["srl"],"says-junk Invoice")
-at("srl",s,JUNK,"a junk verdict with a webmail folder rule: Junk, Yes, and the rule does not run")
+at("srl",s,JUNK,"a junk verdict with a webmail folder rule: Junk, Yes, and the rule does not run",J1)
 s=send(["srl"],"says-pass Invoice")
-at("srl",s,RULED,"control: a pass verdict with a webmail folder rule: the rule files it, No")
+at("srl",s,RULED,"control: a pass verdict with a webmail folder rule: the rule files it, No",P1)
 s=send(["lvl"],"says-pass lenient",high=True)
-at("lvl",s,INBOX,"control: a pass verdict at Lenient: a high message stays in the Inbox, No (the level still applies)")
+at("lvl",s,INBOX,"control: a pass verdict at Lenient: a high message stays in the Inbox, No (the level still applies)",P1)
 s=send(["lvl"],"says-junk lenient",high=True)
-at("lvl",s,JUNK,"a junk verdict at Lenient: the same high message goes to Junk, Yes")
+at("lvl",s,JUNK,"a junk verdict at Lenient: the same high message goes to Junk, Yes",J1)
 
 # Mail the spam filter did not score. A forward of a screened message, delivered here, carries the old verdict.
 s=send(["fwd"],"says-junk forwarded")
