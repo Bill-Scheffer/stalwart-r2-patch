@@ -115,7 +115,7 @@ env:
   # The tag after the Stalwart release: bump it with any change to what is built. p<last patch>-<build of that set>:
   # a new patch resets it (p0018-1), any other change to what is built counts up (p0017-2). Until 0017 it listed every
   # patch's own suffix, and with 0017's it reached 133 characters, past a Docker tag's 128 (MAI-1100).
-  VARIANT: p0018-1
+  VARIANT: p0018-2
   # A FIXED image that HAS the expired-ban bug (the last build before 0006), which the ban-expiry check must FAIL
   # on the bug's own line: that proves the check can fail. ⛔ NEVER bumped with releases: every build after 0006
   # lacks the bug and PASSES the check, so it could never be the reference. Pinned by tag AND digest, because a tag
