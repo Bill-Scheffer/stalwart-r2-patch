@@ -244,9 +244,10 @@ jobs:
       # moved off it). Builds kept working only while the dependency layer stayed cached, and cargo-chef's floating base image
       # moved, so a build then failed at `cargo chef cook` (MainThrive MAI-1072). The locked commit is fetched from a mirror of
       # it under this account (MainThrive MAI-1285), a standalone repo rather than a fork, so it does not depend on GitHub keeping
-      # a deleted fork's commit in open-telemetry/opentelemetry-rust's network, where it was also still served. A commit id names
-      # its content, so this changes where it comes from and nothing else: its tarball hashes to cc9d74ba..., as FreeBSD's
-      # mail/stalwart port recorded it from the fork, a second source if the mirror were ever lost. The count fails on
+      # a deleted fork's commit in open-telemetry/opentelemetry-rust's network (which still serves it by id, if the mirror is
+      # lost). Its opentelemetry-proto submodule still comes from open-telemetry. A commit id names its content, so this changes
+      # where it comes from and nothing else: its tarball hashes to cc9d74ba..., as FreeBSD's mail/stalwart016 port records it
+      # for the fork (a check on the content, not a source cargo can fetch). The count fails on
       # a release that no longer names the fork or names another commit: drop or re-check this step then.
       # The base image goes with it: upstream's Dockerfile builds on a floating tag, which is how the cached layer was lost and
       # what would change the compiler under a security fix. It is pinned here to the digest of the last green build.
