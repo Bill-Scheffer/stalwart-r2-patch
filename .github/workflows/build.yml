@@ -242,9 +242,11 @@ jobs:
 
       # v0.16.27 names a fork that no longer exists (github.com/stalwartlabs/opentelemetry-rust answers 404; upstream's main has
       # moved off it). Builds kept working only while the dependency layer stayed cached, and cargo-chef's floating base image
-      # moved, so a build then failed at `cargo chef cook` (MainThrive MAI-1072). The locked commit is still served by the
-      # network it was forked from, and a commit id names its content, so this changes where it comes from and nothing else: its
-      # tarball from there hashes to cc9d74ba..., as FreeBSD's mail/stalwart port recorded it from the fork. The count fails on
+      # moved, so a build then failed at `cargo chef cook` (MainThrive MAI-1072). The locked commit is fetched from a mirror of
+      # it under this account (MainThrive MAI-1285), a standalone repo rather than a fork, so it does not depend on GitHub keeping
+      # a deleted fork's commit in open-telemetry/opentelemetry-rust's network, where it was also still served. A commit id names
+      # its content, so this changes where it comes from and nothing else: its tarball hashes to cc9d74ba..., as FreeBSD's
+      # mail/stalwart port recorded it from the fork, a second source if the mirror were ever lost. The count fails on
       # a release that no longer names the fork or names another commit: drop or re-check this step then.
       # The base image goes with it: upstream's Dockerfile builds on a floating tag, which is how the cached layer was lost and
       # what would change the compiler under a security fix. It is pinned here to the digest of the last green build.
@@ -253,7 +255,7 @@ jobs:
         run: |
           set -eu
           GONE=github.com/stalwartlabs/opentelemetry-rust
-          HERE=github.com/open-telemetry/opentelemetry-rust
+          HERE=github.com/Bill-Scheffer/opentelemetry-rust
           n=$(grep -c "git+https://$GONE#$OTEL_SHA" Cargo.lock || true)
           [ "$n" = 6 ] || { echo "::error::Cargo.lock names $GONE at $OTEL_SHA $n time(s), not 6"; exit 1; }
           sed -i "s#$GONE#$HERE#" Cargo.lock crates/common/Cargo.toml
