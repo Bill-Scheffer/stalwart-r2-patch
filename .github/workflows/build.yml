@@ -109,13 +109,15 @@ env:
   RUSTS3_VERSION: 0.38.0
   # The commit of opentelemetry-rust that this release's Cargo.lock names (the step that moves its source says why).
   OTEL_SHA: ae66e97b140f70e477ab710686aafce665cc2f8b
+  # The commit of hickory-dns that this release's Cargo.lock names, on stalwartlabs' fork (the same step says why).
+  HICKORY_SHA: f8b92b17fa6c7d09a6959672592106ca1410937b
   # The builder's base image, the digest the last green build used (run 41544013312): upstream's Dockerfile names a floating tag.
   CARGO_CHEF_DIGEST: sha256:f122e3c240d1c05668b07179cf6fa07647db2a79a110f4bb8a91d75f90d5b8e4
   IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch
   # The tag after the Stalwart release: bump it with any change to what is built. p<last patch>-<build of that set>:
   # a new patch resets it (p0018-1), any other change to what is built counts up (p0017-2). Until 0017 it listed every
   # patch's own suffix, and with 0017's it reached 133 characters, past a Docker tag's 128 (MAI-1100).
-  VARIANT: p0018-2
+  VARIANT: p0018-3
   # A FIXED image that HAS the expired-ban bug (the last build before 0006), which the ban-expiry check must FAIL
   # on the bug's own line: that proves the check can fail. ⛔ NEVER bumped with releases: every build after 0006
   # lacks the bug and PASSES the check, so it could never be the reference. Pinned by tag AND digest, because a tag
@@ -249,9 +251,12 @@ jobs:
       # where it comes from and nothing else: its tarball hashes to cc9d74ba..., as FreeBSD's mail/stalwart016 port records it
       # for the fork (a check on the content, not a source cargo can fetch). The count fails on
       # a release that no longer names the fork or names another commit: drop or re-check this step then.
+      # hickory-dns is the same risk one step earlier: v0.16.27 takes it from a fork under the same org, by branch
+      # (stalwartlabs/hickory-dns, stalwart/0.26). It comes from a mirror too (MainThrive MAI-1285), pinned by commit
+      # rather than branch, so cargo resolves the commit the lock names and never a newer one.
       # The base image goes with it: upstream's Dockerfile builds on a floating tag, which is how the cached layer was lost and
       # what would change the compiler under a security fix. It is pinned here to the digest of the last green build.
-      - name: opentelemetry-rust is the commit Stalwart's lock names, from where that commit still exists, and the builder's base is pinned
+      - name: opentelemetry-rust and hickory-dns are the commits Stalwart's lock names, from where those commits still exist, and the builder's base is pinned
         working-directory: stalwart
         run: |
           set -eu
@@ -260,21 +265,35 @@ jobs:
           n=$(grep -c "git+https://$GONE#$OTEL_SHA" Cargo.lock || true)
           [ "$n" = 6 ] || { echo "::error::Cargo.lock names $GONE at $OTEL_SHA $n time(s), not 6"; exit 1; }
           sed -i "s#$GONE#$HERE#" Cargo.lock crates/common/Cargo.toml
+          HGONE=github.com/stalwartlabs/hickory-dns
+          HHERE=github.com/Bill-Scheffer/hickory-dns
+          n=$(grep -c "git+https://$HGONE?branch=stalwart%2F0.26#$HICKORY_SHA" Cargo.lock || true)
+          [ "$n" = 3 ] || { echo "::error::Cargo.lock names $HGONE at $HICKORY_SHA $n time(s), not 3"; exit 1; }
+          n=$(grep -c "git = \"https://$HGONE\", branch = \"stalwart/0.26\"" Cargo.toml || true)
+          [ "$n" = 3 ] || { echo "::error::Cargo.toml patches from $HGONE's stalwart/0.26 $n time(s), not 3"; exit 1; }
+          sed -i "s#git+https://$HGONE?branch=stalwart%2F0.26#git+https://$HHERE?rev=$HICKORY_SHA#" Cargo.lock
+          sed -i "s#git = \"https://$HGONE\", branch = \"stalwart/0.26\"#git = \"https://$HHERE\", rev = \"$HICKORY_SHA\"#" Cargo.toml
+          ! grep -q "$HGONE" Cargo.lock Cargo.toml || { echo "::error::$HGONE is still named"; exit 1; }
+          [ "$(grep -c "git+https://$HHERE?rev=$HICKORY_SHA#$HICKORY_SHA" Cargo.lock)" = 3 ] || { echo "::error::the lock moved off $HICKORY_SHA"; exit 1; }
+          [ "$(grep -c "git = \"https://$HHERE\", rev = \"$HICKORY_SHA\"" Cargo.toml)" = 3 ] || { echo "::error::Cargo.toml does not pin $HICKORY_SHA"; exit 1; }
           got=$(git diff --name-only | sort | tr '\n' ' ')
-          [ "$got" = "Cargo.lock crates/common/Cargo.toml " ] || { echo "::error::changed files: $got"; exit 1; }
+          [ "$got" = "Cargo.lock Cargo.toml crates/common/Cargo.toml " ] || { echo "::error::changed files: $got"; exit 1; }
           ! grep -q "$GONE" Cargo.lock crates/common/Cargo.toml || { echo "::error::$GONE is still named"; exit 1; }
           [ "$(grep -c "git+https://$HERE#$OTEL_SHA" Cargo.lock)" = 6 ] || { echo "::error::the lock moved off $OTEL_SHA"; exit 1; }
           # The commit itself, before a build that would only fail on it later: fetched by id, from there, and compared.
           got=$(git init -q "$RUNNER_TEMP/otel" && git -C "$RUNNER_TEMP/otel" fetch -q --depth=1 "https://$HERE" "$OTEL_SHA" && git -C "$RUNNER_TEMP/otel" rev-parse FETCH_HEAD) \
             || { echo "::error::$HERE no longer serves $OTEL_SHA"; exit 1; }
           [ "$got" = "$OTEL_SHA" ] || { echo "::error::$HERE served $got, not $OTEL_SHA"; exit 1; }
+          got=$(git init -q "$RUNNER_TEMP/hickory" && git -C "$RUNNER_TEMP/hickory" fetch -q --depth=1 "https://$HHERE" "$HICKORY_SHA" && git -C "$RUNNER_TEMP/hickory" rev-parse FETCH_HEAD) \
+            || { echo "::error::$HHERE no longer serves $HICKORY_SHA"; exit 1; }
+          [ "$got" = "$HICKORY_SHA" ] || { echo "::error::$HHERE served $got, not $HICKORY_SHA"; exit 1; }
           n=$(grep -c "^FROM .*cargo-chef:latest-rust-slim-trixie AS chef$" Dockerfile || true)
           [ "$n" = 1 ] || { echo "::error::the Dockerfile's cargo-chef FROM line is not the one this pins ($n match)"; exit 1; }
           sed -i "s#cargo-chef:latest-rust-slim-trixie AS chef#cargo-chef:latest-rust-slim-trixie@$CARGO_CHEF_DIGEST AS chef#" Dockerfile
           grep -qxF "FROM --platform=\$BUILDPLATFORM docker.io/lukemathwalker/cargo-chef:latest-rust-slim-trixie@$CARGO_CHEF_DIGEST AS chef" Dockerfile \
             || { echo "::error::the base image was not pinned"; exit 1; }
           # Stage them, so the next step's diff under crates/ is 0002 alone.
-          git add -- Cargo.lock crates/common/Cargo.toml Dockerfile
+          git add -- Cargo.lock Cargo.toml crates/common/Cargo.toml Dockerfile
 
       - name: Apply the tenant-scoped sharing patch, and prove it changed only its own files
         working-directory: stalwart
