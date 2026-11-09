@@ -44,9 +44,16 @@ VM. The build checks it on the binary: the check's message is absent from this i
 
 ⚠️ v0.16.27's lock names a fork of `opentelemetry-rust` that upstream has since deleted (`stalwartlabs/opentelemetry-rust`, 404),
 so a build with no cached dependency layer cannot fetch it. The workflow takes the same locked commit (`ae66e97b`) from
-`open-telemetry/opentelemetry-rust`, whose network still serves it: the tarball from there hashes to `cc9d74ba…`, as FreeBSD's
-`mail/stalwart` port recorded it from the fork. It changes only where those bytes come from, and it fails on a release that no
-longer names that fork at that commit, when it should go. It also fetches that commit by id before the build and compares it.
+`Bill-Scheffer/opentelemetry-rust`, a standalone, archived (read-only) mirror holding that commit and its history on `main`
+(MainThrive MAI-1285). It is not a fork, so it does not depend on GitHub keeping a deleted fork's commit in
+`open-telemetry/opentelemetry-rust`'s network, which still serves it by id if the mirror is ever lost. The commit's
+`opentelemetry-proto` submodule still comes from open-telemetry. The tarball hashes to `cc9d74ba…`, as FreeBSD's
+`mail/stalwart016` port records it for the fork: a check on the content, not a source cargo can fetch. It changes only where
+those bytes come from, and it fails on a release that no longer names that fork at that commit, when it should go. It also fetches that commit by id before the build and compares it.
+`hickory-dns` carries the same risk from the same org: the lock takes `f8b92b17` from the fork `stalwartlabs/hickory-dns`,
+by its `stalwart/0.26` branch. The workflow takes that commit from `Bill-Scheffer/hickory-dns`, a mirror like the one above,
+and pins it by commit (`rev`, `HICKORY_SHA`) instead of the branch, so cargo cannot move to a newer commit. Its tarball is
+the same bytes as the fork's and as upstream `hickory-dns/hickory-dns`'s, which still serves it by id. The same step checks it the same way.
 The builder's base, `cargo-chef:latest-rust-slim-trixie` in upstream's Dockerfile, floats, which is how the cached dependency
 layer was lost, so the workflow pins it to the digest of the last green build (`CARGO_CHEF_DIGEST`). Moving it is a deliberate
 change: bump `VARIANT`. The final stage's `debian:trixie-slim` still floats, so a build takes that base's current security fixes.
@@ -548,7 +555,7 @@ overrides do, contact and reply trust and a `fileinto` that already ran still wi
 does. The build requires the server-headers, junk-verdict and failed-lookup checks to FAIL on production's image before it
 (`MAI1072_BUG_REFERENCE_IMAGE`, `-p0017-1`), with every check that a verdict must not act passing there.
 
-Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-p0018-1`.
+Image: `ghcr.io/bill-scheffer/stalwart-r2-patch:<stalwart tag>-p0018-3`.
 
 ## Builds, tags and testing a change before it merges
 
