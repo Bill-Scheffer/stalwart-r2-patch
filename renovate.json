@@ -1,0 +1,31 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "description": [
+    "MainThrive MAI-1427. This config exists so that the upstream pin in .github/workflows/build.yml is proposed when upstream moves. Before it nothing did, and MainThrive MAI-1424 found the pin far behind upstream by hand.",
+    "enabledManagers is only the regex manager below, on purpose. This repo's job is one upstream plus our patches; the action SHAs in the workflows are not what this config is for.",
+    "automerge is false and must stay false. A bump means rebasing our patches onto the new upstream and bumping VARIANT, and the build refuses a changed input without a new release tag. So a proposal is red until a person does that work, and a person reviews it.",
+    "There is no minimumReleaseAge. The git datasources publish no release timestamps, so a soak would hold every release forever (MainThrive MAI-1424 measured that failure on quay.io and ghcr.io).",
+    "The pin is a tag and its commit, side by side: STALWART_TAG names the release and STALWART_SHA the commit it resolves to. The git-tags datasource updates both together, so a proposal never pairs a new tag with the old commit. Only the Stalwart pin is read: OTEL_SHA, HICKORY_SHA and CARGO_CHEF_DIGEST follow from the Stalwart release and move with it by hand."
+  ],
+  "enabledManagers": [
+    "custom.regex"
+  ],
+  "automerge": false,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/build\\.yml$/"
+      ],
+      "matchStrings": [
+        "\\n\\s*STALWART_TAG:\\s*(?<currentValue>v\\S+)\\s*\\n\\s*STALWART_SHA:\\s*(?<currentDigest>[0-9a-f]{40})"
+      ],
+      "depNameTemplate": "stalwartlabs/stalwart",
+      "packageNameTemplate": "https://github.com/stalwartlabs/stalwart",
+      "datasourceTemplate": "git-tags"
+    }
+  ]
+}
