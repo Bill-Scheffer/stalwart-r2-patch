@@ -103,8 +103,8 @@ concurrency:
 
 env:
   # Upstream Stalwart release, pinned by commit: a tag can move, a commit cannot.
-  STALWART_TAG: v0.16.27
-  STALWART_SHA: aa47d8ef7bfba7200d3293198ac2592747b20e73
+  STALWART_TAG: v1.1.1
+  STALWART_SHA: 3adead91f3c87e7415b58c9ed8e6ec05a5dda521
   # The first rust-s3 release whose DeleteObject signs no header it never sends (6c97cb9, rust-s3 #466).
   RUSTS3_VERSION: 0.38.0
   # The commit of opentelemetry-rust that this release's Cargo.lock names (the step that moves its source says why).
