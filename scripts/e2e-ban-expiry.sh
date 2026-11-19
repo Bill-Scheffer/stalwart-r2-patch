@@ -65,8 +65,10 @@ if os.environ["PHASE"]=="1":
     check(good()=="blocked", "after 4 failures (limit 3/h) the address is banned")
     time.sleep(25)
     check(good()=="ok", "25 s later (ban period 20 s) the first ban has lifted")
-    bad()   # the hour's counter is still over the limit, so this one failure earns a new ban
-    check(good()=="blocked", "one more failure: the address is banned AGAIN and the ban is ENFORCED")
+    # v1 resets the failure counter when it bans, so the second ban is earned afresh (0.16 kept the hour's count, and one
+    # failure re-banned). Either way 0.16.27 logs that ban and does not enforce it; v1 enforces it (measured, MAI-1441).
+    for _ in range(4): bad()
+    check(good()=="blocked", "the address earns a second ban, and it is ENFORCED")
     time.sleep(3)
     check(good()=="blocked", "3 s later the new ban still holds")
 else:
