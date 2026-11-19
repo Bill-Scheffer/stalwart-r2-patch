@@ -142,8 +142,9 @@ def reset(auth,acc,i,totp=False):
     if totp: u[f"credentials/{ck}/otpUrl"]=None
     r=r1(auth,["x:Account/set",{"accountId":acc,"update":{i:u}},"u"])
     return i in (r[1].get("updated") or {}), r
-G7="This account's permissions exceed yours."
-by0007=lambda r,kind,i: ((r[1].get(kind) or {}).get(i) or {}).get("description")==G7
+# The account half of 0007 is upstream's own since v1 (validate_account_access): it refuses with its grant error.
+G7="You are not authorized to grant permissions"
+by0007=lambda r,kind,i: (((r[1].get(kind) or {}).get(i) or {}).get("description") or "").startswith(G7)
 up,r=reset(K,KA,ID["opsadm"],True); check(not up and by0007(r,"notUpdated",ID["opsadm"]), f"0007: the key cannot reset a TOTP Admin's password and TOTP ({json.dumps(r)[:140]})")
 up,r=reset(K,KA,ID["mailadmin"]); check(not up and by0007(r,"notUpdated",ID["mailadmin"]), f"0007: the key cannot reset its own owner mailadmin's password ({json.dumps(r)[:140]})")
 check(session(MA)[0]==200, "0007: mailadmin's password is unchanged")
