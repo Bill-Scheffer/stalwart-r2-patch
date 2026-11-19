@@ -13,7 +13,7 @@
 # the first -filescan1 build, which missed FileNode/copy, that one check FAILs (both measured).
 set -euo pipefail
 IMG=${1:?usage: $0 <stalwart image>}
-CLI=stalwartlabs/cli:1.0.13
+CLI=stalwartlabs/cli:2.0.0
 CLAM=clamav/clamav:1.4.5_base
 NET=e2e-scan-$$; C=e2e-scan-stalwart-$$; AV=e2e-scan-clamd-$$
 W=$(mktemp -d); mkdir -p "$W/etc" "$W/data"; chmod -R 777 "$W"
@@ -74,7 +74,7 @@ def node(name,payload,user="alice"):
     if st not in (200,201): return f"upload refused {st}: {b[:120]!r}"
     blob=json.loads(b)["blobId"]
     r=json.loads(req("POST","/jmap/",json.dumps({"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:filenode"],
-      "methodCalls":[["FileNode/set",{"accountId":acct,"create":{"f":{"name":name,"blobId":blob,"parentId":None}}},"c"]]}).encode(),"application/json",user)[1])["methodResponses"][0][1]
+      "methodCalls":[["FileNode/set",{"accountId":acct,"create":{"f":{"@type":"File","name":name,"blobId":blob,"parentId":None}}},"c"]]}).encode(),"application/json",user)[1])["methodResponses"][0][1]
     return (r.get("notCreated") or {}).get("f",{}).get("type") or "created"
 if PHASE=="scan":
     check(req("PUT",home+"clean.txt",CLEAN,"text/plain")[0]==201, "WebDAV: a clean file is stored (201)")
@@ -111,8 +111,9 @@ if PHASE=="scan":
     def copy(payload,name):
         blob=json.loads(req("POST",dup,payload,"application/octet-stream","dave")[1])["blobId"]
         # Stalwart keys a copy's create by the SOURCE id (an `id` property is refused as immutable).
-        r=jm([["FileNode/copy",{"fromAccountId":eacct,"accountId":dacct,"create":{orig:{"blobId":blob,"name":name,"parentId":None}}},"c"]])[0][1]
-        return (r.get("notCreated") or {}).get(orig,{}).get("type") or ("created" if (r.get("created") or {}).get(orig) else json.dumps(r)[:120])
+        # RFC 8620 /copy: keyed by a creation id, the source named by "id" (0.16 keyed it by the source id).
+        r=jm([["FileNode/copy",{"fromAccountId":eacct,"accountId":dacct,"create":{"c1":{"id":orig,"blobId":blob,"name":name,"parentId":None}}},"c"]])[0][1]
+        return (r.get("notCreated") or {}).get("c1",{}).get("type") or ("created" if (r.get("created") or {}).get("c1") else json.dumps(r)[:120])
     t=copy(CLEAN,"copy-clean.txt")
     check(t=="created", f"JMAP FileNode/copy: a clean replacement blob is copied ({t})")
     t=copy(EICAR,"copy-eicar.com")

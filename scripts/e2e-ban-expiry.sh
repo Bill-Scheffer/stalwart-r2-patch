@@ -10,7 +10,7 @@
 # exercises the auth one. One client container keeps one address throughout.
 set -euo pipefail
 IMG=${1:?usage: $0 <stalwart image>}
-CLI=stalwartlabs/cli:1.0.13
+CLI=stalwartlabs/cli:2.0.0
 NET=e2e-ban-$$; C=e2e-ban-stalwart-$$; K=e2e-ban-client-$$
 W=$(mktemp -d); mkdir -p "$W/etc" "$W/data"; chmod -R 777 "$W"
 echo '{"@type":"RocksDb","path":"/var/lib/stalwart/"}' > "$W/etc/config.json"
@@ -42,7 +42,7 @@ r=json.load(urllib.request.urlopen(urllib.request.Request(B+"/jmap/",headers=h,d
   "methodCalls":[["x:Security/set",{"accountId":aid,"update":{"singleton":{"authBanRate":{"count":3,"period":3600000},"authBanPeriod":20000}}},"s"]]}).encode())))
 assert "singleton" in (r["methodResponses"][0][1].get("updated") or {}), r
 PY
-cli create action/ReloadSettings >/dev/null
+cli create action/ReloadSettings --json '{}' >/dev/null
 # The client keeps one address throughout. Phase 1 bans it, lets the ban lapse, earns a second ban;
 # phase 2 checks the second one lifts on time. In between, a DIFFERENT container reads the stored list:
 # the client's own address is banned then, HTTP included.
@@ -65,8 +65,10 @@ if os.environ["PHASE"]=="1":
     check(good()=="blocked", "after 4 failures (limit 3/h) the address is banned")
     time.sleep(25)
     check(good()=="ok", "25 s later (ban period 20 s) the first ban has lifted")
-    bad()   # the hour's counter is still over the limit, so this one failure earns a new ban
-    check(good()=="blocked", "one more failure: the address is banned AGAIN and the ban is ENFORCED")
+    # v1 resets the failure counter when it bans, so the second ban is earned afresh (0.16 kept the hour's count, and one
+    # failure re-banned). Either way 0.16.27 logs that ban and does not enforce it; v1 enforces it (measured, MAI-1441).
+    for _ in range(4): bad()
+    check(good()=="blocked", "the address earns a second ban, and it is ENFORCED")
     time.sleep(3)
     check(good()=="blocked", "3 s later the new ban still holds")
 else:

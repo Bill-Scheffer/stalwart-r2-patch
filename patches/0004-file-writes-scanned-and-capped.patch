@@ -121,40 +121,42 @@ index 0000000..b13a49e
 +    }
 +}
 diff --git a/crates/common/src/lib.rs b/crates/common/src/lib.rs
-index a481877..100ac23 100644
+index 0508b0b..569e06e 100644
 --- a/crates/common/src/lib.rs
 +++ b/crates/common/src/lib.rs
-@@ -63,6 +63,7 @@ pub mod auth;
+@@ -89,6 +89,7 @@ pub mod auth;
  pub mod cache;
  pub mod config;
  pub mod expr;
 +pub mod file_scan;
+ pub mod gateway;
  pub mod i18n;
  pub mod ipc;
- pub mod manager;
 diff --git a/crates/dav/src/file/update.rs b/crates/dav/src/file/update.rs
-index 85fffe9..318b388 100644
+index ea7f529..77175c4 100644
 --- a/crates/dav/src/file/update.rs
 +++ b/crates/dav/src/file/update.rs
-@@ -170,6 +170,8 @@ impl FileUpdateRequestHandler for Server {
-                     .await?;
+@@ -193,6 +193,9 @@ impl FileUpdateRequestHandler for Server {
              }
+             // SPDX-SnippetEnd
  
-+            scanned(account_id, &bytes).await?;
++            // MainThrive patch 0004.
++            scanned(account_id, bytes).await?;
 +
              // Write blob
              let (blob_hash, blob_hold) = self
-                 .put_temporary_blob(account_id, &bytes, 60)
-@@ -250,6 +252,8 @@ impl FileUpdateRequestHandler for Server {
-                 .await?;
+                 .hold_blob(account_id, blob_hash, bytes, 60, &self.core.blob.file)
+@@ -282,6 +285,9 @@ impl FileUpdateRequestHandler for Server {
              }
+             // SPDX-SnippetEnd
  
-+            scanned(account_id, &bytes).await?;
++            // MainThrive patch 0004.
++            scanned(account_id, bytes).await?;
 +
              // Write blob
              let (blob_hash, blob_hold) = self
-                 .put_temporary_blob(account_id, &bytes, 60)
-@@ -303,3 +307,16 @@ impl FileUpdateRequestHandler for Server {
+                 .hold_blob(
+@@ -347,3 +353,16 @@ impl FileUpdateRequestHandler for Server {
          }
      }
  }
@@ -171,64 +173,71 @@ index 85fffe9..318b388 100644
 +            })
 +        })
 +}
-diff --git a/crates/jmap/src/file/copy.rs b/crates/jmap/src/file/copy.rs
-index 94f3b40..e2ce688 100644
---- a/crates/jmap/src/file/copy.rs
-+++ b/crates/jmap/src/file/copy.rs
-@@ -189,6 +189,16 @@ impl FileNodeCopy for Server {
-                                 .get_blob(blob_id.hash.as_slice(), 0..usize::MAX)
-                                 .await?
-                             {
-+                                if let Some(err) = super::set::file_write_refusal(
-+                                    self,
-+                                    account_id,
-+                                    &blob_contents,
-+                                )
-+                                .await
-+                                {
-+                                    response.not_created.append(id, err);
-+                                    continue 'create;
-+                                }
-                                 file_details.size = blob_contents.len() as u32;
-                             } else {
-                                 response.not_created.append(
-diff --git a/crates/jmap/src/file/set.rs b/crates/jmap/src/file/set.rs
-index 2d81051..b487e3b 100644
---- a/crates/jmap/src/file/set.rs
-+++ b/crates/jmap/src/file/set.rs
-@@ -109,6 +109,12 @@ impl FileNodeSet for Server {
-                                 .get_blob(blob_id.hash.as_slice(), 0..usize::MAX)
-                                 .await?
-                             {
-+                                if let Some(err) =
-+                                    file_write_refusal(self, account_id, &blob_contents).await
-+                                {
-+                                    response.not_created.append(id, err);
-+                                    continue 'create;
-+                                }
-                                 file_details.size = blob_contents.len() as u32;
-                             } else {
-                                 response.not_created.append(
-@@ -371,6 +377,12 @@ impl FileNodeSet for Server {
-                                 .get_blob(blob_id.hash.as_slice(), 0..usize::MAX)
-                                 .await?
-                             {
-+                                if let Some(err) =
-+                                    file_write_refusal(self, account_id, &blob_contents).await
-+                                {
-+                                    response.not_updated.append(id, err);
-+                                    continue 'update;
-+                                }
-                                 file_details.size = blob_contents.len() as u32;
-                             } else {
-                                 response.not_updated.append(
-@@ -660,6 +672,36 @@ impl ResolveCreatedReference<FileNodeProperty, FileNodeValue> for NoResolver {
-     }
+diff --git a/crates/jmap/src/file/writer.rs b/crates/jmap/src/file/writer.rs
+index ad65ac5..5b15f49 100644
+--- a/crates/jmap/src/file/writer.rs
++++ b/crates/jmap/src/file/writer.rs
+@@ -772,6 +772,9 @@ impl<'x> FileNodeWriter<'x> {
+             else {
+                 return Ok(Err(blob_not_found()));
+             };
++            if let Some(err) = file_write_refusal(self.server, self.account_id, &bytes).await {
++                return Ok(Err(err));
++            }
+             let (hash, hold) = self
+                 .server
+                 .hold_blob(
+@@ -794,6 +797,9 @@ impl<'x> FileNodeWriter<'x> {
+             else {
+                 return Ok(Err(blob_not_found()));
+             };
++            if let Some(err) = file_write_refusal(self.server, self.account_id, &bytes).await {
++                return Ok(Err(err));
++            }
+             let (hash, hold) = self
+                 .server
+                 .hold_blob(
+@@ -808,17 +814,22 @@ impl<'x> FileNodeWriter<'x> {
+             hold.commit(&mut self.batch);
+             (hash, bytes.len() as u64)
+         } else {
+-            match known_size {
+-                Some(size) => (blob_id.hash.clone(), size),
+-                None => match self
+-                    .server
+-                    .fetch_blob(&blob_id.hash, 0..usize::MAX, None)
+-                    .await
+-                    .caused_by(trc::location!())?
+-                {
+-                    Some(bytes) => (blob_id.hash.clone(), bytes.len() as u64),
+-                    None => return Ok(Err(blob_not_found())),
+-                },
++            // MainThrive patch 0004: the contents are read to be checked, even when the size is known.
++            match self
++                .server
++                .fetch_blob(&blob_id.hash, 0..usize::MAX, None)
++                .await
++                .caused_by(trc::location!())?
++            {
++                Some(bytes) => {
++                    if let Some(err) =
++                        file_write_refusal(self.server, self.account_id, &bytes).await
++                    {
++                        return Ok(Err(err));
++                    }
++                    (blob_id.hash.clone(), bytes.len() as u64)
++                }
++                None => return Ok(Err(blob_not_found())),
+             }
+         };
+ 
+@@ -1390,6 +1401,36 @@ fn not_permitted() -> SetError<FileNodeProperty> {
+     SetError::forbidden().with_description("You do not have permission to perform this operation.")
  }
  
-+/// The checks every stored file gets (WebDAV applies the same in crates/dav/src/file/update.rs): the
-+/// groupware file-size cap, which upstream JMAP did not apply, and antivirus (common::file_scan).
-+pub(super) async fn file_write_refusal(
++/// MainThrive patch 0004: the checks every stored file gets (WebDAV applies the same in crates/dav/src/file/update.rs):
++/// the groupware file-size cap, which upstream JMAP does not apply, and antivirus (common::file_scan).
++async fn file_write_refusal(
 +    server: &Server,
 +    account_id: u32,
 +    contents: &[u8],
@@ -256,6 +265,6 @@ index 2d81051..b487e3b 100644
 +    }
 +}
 +
- pub(super) fn update_file_node<R: ResolveCreatedReference<FileNodeProperty, FileNodeValue>>(
-     expected_id: Option<Id>,
-     updates: Value<'_, FileNodeProperty, FileNodeValue>,
+ fn blob_not_found() -> SetError<FileNodeProperty> {
+     SetError::invalid_properties()
+         .with_property(FileNodeProperty::BlobId)

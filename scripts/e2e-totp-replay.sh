@@ -19,7 +19,7 @@
 # runs it (both nodes share it, and Valkey's SET NX is what makes the mark atomic across them).
 set -euo pipefail
 IMG=${1:?usage: $0 <stalwart image>}
-CLI=stalwartlabs/cli:1.0.13
+CLI=stalwartlabs/cli:2.0.0
 VALKEY=valkey/valkey:8.1-alpine
 NET=e2e-totp-$$; C=e2e-totp-stalwart-$$; K=e2e-totp-client-$$; V=e2e-totp-valkey-$$
 W=$(mktemp -d); mkdir -p "$W/etc" "$W/data"; chmod -R 777 "$W"
@@ -92,14 +92,26 @@ def new_seed(): return base64.b32encode(secrets.token_bytes(20)).decode().rstrip
 def fresh(seed):
     # The start of the next 30 s window: a code no earlier check has used.
     time.sleep(30-time.time()%30+1); return totp(seed)
+RU="http://127.0.0.1/oauth/callback"
+# v1 grants a registered client only the scopes it registered; managing app passwords and two-step needs `security`.
+SCOPE="openid offline_access urn:ietf:params:oauth:scope:mail urn:stalwart:oauth:scope:security urn:stalwart:oauth:scope:settings"
+# v1 knows only clients it has registered, so register a public one (RFC 7591) as webmail does; 0.16 takes any id.
+s,reg=req("/auth/register",{"client_name":"e2e","redirect_uris":[RU],"token_endpoint_auth_method":"none",
+    "grant_types":["authorization_code","refresh_token"],"response_types":["code"],"scope":SCOPE})
+CID=reg["client_id"] if s in (200,201) and isinstance(reg,dict) and reg.get("client_id") else "e2e"
 def signin(secret,code):
-    # /api/auth as a two-step client signs in: an authorization code for a PKCE token exchange.
+    # /api/auth as a two-step client signs in: an authorization code for a PKCE token exchange. One body for both
+    # lines, as webmail sends it: 0.16 reads the fields, v1 the `query` (and answers with the redirect `location`).
     v=secrets.token_urlsafe(48); ch=base64.urlsafe_b64encode(hashlib.sha256(v.encode()).digest()).rstrip(b"=").decode()
-    ru="https://webmail.example/oauth/callback"
+    st=secrets.token_urlsafe(12)
+    q=urllib.parse.urlencode({"response_type":"code","client_id":CID,"redirect_uri":RU,"state":st,
+        "scope":SCOPE,"code_challenge":ch,"code_challenge_method":"S256"})
     s,b=req("/api/auth",{"type":"authCode","accountName":USER,"accountSecret":secret,"mfaToken":code,
-        "clientId":"e2e","redirectUri":ru,"codeChallenge":ch,"codeChallengeMethod":"S256"})
+        "clientId":CID,"redirectUri":RU,"codeChallenge":ch,"codeChallengeMethod":"S256","query":q,"consent":True})
     if not (isinstance(b,dict) and b.get("type")=="authenticated"): return None
-    s,t=req("/auth/token",{"grant_type":"authorization_code","code":b["client_code"],"client_id":"e2e","redirect_uri":ru,"code_verifier":v},form=True)
+    c=b.get("client_code") or (urllib.parse.parse_qs(urllib.parse.urlparse(b.get("location") or "").query).get("code") or [None])[0]
+    if not c: return None
+    s,t=req("/auth/token",{"grant_type":"authorization_code","code":c,"client_id":CID,"redirect_uri":RU,"code_verifier":v},form=True)
     return "Bearer "+t["access_token"] if s==200 else None
 ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE
 def imap(user,secret):
@@ -120,9 +132,11 @@ check(st!=200, f"[{STORE}] control: JMAP Basic with the password alone opens no 
 code=fresh(seed); tok=signin(pw,code)
 check(tok is not None, f"[{STORE}] a two-step sign-in through /api/auth with a fresh code succeeds")
 s,ses=req("/jmap/session",auth=tok); aid=ses["primaryAccounts"]["urn:stalwart:jmap"]
-s,b=jmap(tok,[["x:AppPassword/set",{"accountId":aid,"create":{"a":{"description":"e2e"}}},"a"]])
+# Replace, not Inherit: v1 lets a token scoped to mail, security and settings grant only what it holds (IMAP sign-in).
+IMAP_PERMS={p:True for p in ["authenticate","imapAuthenticate","imapCapability","imapId","imapList","imapSelect","imapFetch"]}
+s,b=jmap(tok,[["x:AppPassword/set",{"accountId":aid,"create":{"a":{"description":"e2e","permissions":{"@type":"Replace","permissions":IMAP_PERMS}}}},"a"]])
 app=((b["methodResponses"][0][1].get("created") or {}).get("a") or {}).get("secret")
-check(bool(app) and imap(USER,app)=="ok", f"[{STORE}] control: an app password signs in to IMAP")
+check(bool(app) and imap(USER,app)=="ok", f"[{STORE}] control: an app password signs in to IMAP ({json.dumps(b['methodResponses'][0])[:300] if not app else 'issued'})")
 
 # 1. The same code twice in one window.
 reuse(signin(pw,code) is None, "the same code a second time, in the same window, is refused")
@@ -207,14 +221,25 @@ checks bob "$(mkuser bob)" valkey || rc=1
 # And it took: the same failed sign-in answers "failure" with Valkey up, and cannot answer that with it paused (the
 # auth-failure counter lives in the in-memory store).
 probe() { docker exec "$K" python3 -c "
-import json,urllib.request,urllib.error
-r=urllib.request.Request('http://stalwart:8080/api/auth',data=json.dumps({'type':'authCode','accountName':'nobody@one.test','accountSecret':'x','clientId':'e2e','redirectUri':'https://webmail.example/cb'}).encode(),headers={'Content-Type':'application/json'})
-try: print(json.load(urllib.request.urlopen(r,timeout=30)).get('type'))
+import json,urllib.parse,urllib.request,urllib.error
+B='http://stalwart:8080'; ru='http://127.0.0.1/cb'
+# v1 checks the client before the credentials, so the failed sign-in needs a client it knows (0.16 takes any id).
+sc='openid offline_access urn:ietf:params:oauth:scope:mail'
+try: cid=json.load(urllib.request.urlopen(urllib.request.Request(B+'/auth/register',data=json.dumps({'client_name':'probe','redirect_uris':[ru],'token_endpoint_auth_method':'none','grant_types':['authorization_code','refresh_token'],'response_types':['code'],'scope':sc}).encode(),headers={'Content-Type':'application/json'}),timeout=30))['client_id']
+except urllib.error.HTTPError as e:
+    cid='e2e'
+    if e.code!=404: print('register:'+str(e.code)+':'+e.read()[:200].decode(errors='replace')); raise SystemExit
+q=urllib.parse.urlencode({'response_type':'code','client_id':cid,'redirect_uri':ru,'scope':sc,'code_challenge':'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM','code_challenge_method':'S256'})
+r=urllib.request.Request(B+'/api/auth',data=json.dumps({'type':'authCode','accountName':'nobody@one.test','accountSecret':'x','clientId':cid,'redirectUri':ru,'query':q,'consent':True}).encode(),headers={'Content-Type':'application/json'})
+try:
+    a=json.load(urllib.request.urlopen(r,timeout=30)); t=a.get('type'); print(t if t!='invalid' else 'invalid:'+str(a.get('error'))+':'+str(a.get('description')))
 except urllib.error.HTTPError as e: print(e.code)
 except Exception as e: print(type(e).__name__)"; }
 up=$(probe); docker pause "$V" >/dev/null; paused=$(probe); docker unpause "$V" >/dev/null
 # A fixed line, so the reference run can be required to print it too (its reuse FAILs are Valkey's, not RocksDB's).
 echo "   (a failed sign-in: $up; with Valkey paused: $paused)"
-if [ "$up" = failure ] && [ "$paused" != failure ]; then echo "PASS [valkey] control: the in-memory store is Valkey"
+# 0.16 answers a refused sign-in "failure"; v1 answers "redirect" (the error rides the client's redirect URI). With
+# Valkey paused, either line fails on the server instead (v1: a 500, at the client registration that needs it already).
+if { [ "$up" = failure ] || [ "$up" = redirect ]; } && [ "$paused" != failure ] && [ "$paused" != redirect ]; then echo "PASS [valkey] control: the in-memory store is Valkey"
 else echo "FAIL [valkey] control: the in-memory store is Valkey"; rc=1; fi
 exit $rc

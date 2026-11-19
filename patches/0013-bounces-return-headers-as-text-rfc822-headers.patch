@@ -1,51 +1,59 @@
 diff --git a/crates/smtp/src/queue/dsn.rs b/crates/smtp/src/queue/dsn.rs
-index c08271be..33caed49 100644
+index a4006dc..07a7e8f 100644
 --- a/crates/smtp/src/queue/dsn.rs
 +++ b/crates/smtp/src/queue/dsn.rs
-@@ -149,6 +149,34 @@ impl SendDsn for Server {
+@@ -379,7 +379,11 @@ impl PropagateDsn for Server {
+     }
+ }
  
- const MAX_HEADER_SIZE: usize = 4096;
+-const MAX_HEADER_SIZE: usize = 4096;
++// MainThrive patch 0014: a bounce returns the original's header block, read to its blank line. 4096 bytes cut a real
++// Gmail message before its From, Subject and Message-ID: our own trace headers and Gmail's ARC and DKIM blocks come
++// first and fill it (MainThrive MAI-1131). 64 KiB is over ten times that block and still bounds what a pathological
++// message makes one bounce scan and return; a block past it is cut at its last whole line, as before.
++const MAX_HEADER_SIZE: usize = 64 * 1024;
+ const MAX_DKIM2_HEADER_SIZE: usize = 1024 * 1024;
+ const MAX_DSN_DOMAINS: usize = 8;
  
-+// The DSN returns the original's headers only, which is RFC 6522's text/rfc822-headers. Sent as
-+// message/rfc822, a relay that parses the part as a message (Amazon SES) refuses the bounce: a
-+// header-only message whose Content-Type names a multipart has no boundary, and quoted-printable
-+// breaks the headers it encodes. So 7bit, or 8bit for UTF-8 headers. Neither may carry a lone CR or LF or
-+// a NUL, which mail-builder would pass through as 7bit, so every line ends in CRLF and NULs are dropped;
-+// a line past SMTP's 998 octets is left to mail-builder to encode.
-+fn returned_headers(headers: String) -> MimePart<'static> {
-+    let headers = headers
+@@ -420,10 +424,7 @@ impl ReturnedPart {
+ 
+     fn into_mime_part(self) -> MimePart<'static> {
+         match self {
+-            ReturnedPart::Headers(headers) => MimePart::new(
+-                ContentType::new("message/rfc822"),
+-                BodyPart::Text(String::from_utf8(headers).unwrap_or_default().into()),
+-            ),
++            ReturnedPart::Headers(headers) => returned_headers(headers),
+             ReturnedPart::Dkim2Headers { headers, .. } => rfc822_headers_part(headers.into()),
+         }
+     }
+@@ -1266,6 +1267,29 @@ fn strip_brackets(address: &str) -> &str {
+     address.trim_start_matches('<').trim_end_matches('>')
+ }
+ 
++// MainThrive patch 0013: the DSN returns the original's headers only, which is RFC 6522's text/rfc822-headers, as
++// upstream already sends them for a DKIM2 message. Sent as message/rfc822, a relay that parses the part as a message
++// (Amazon SES) refuses the bounce: a header-only message whose Content-Type names a multipart has no boundary, and
++// quoted-printable breaks the headers it encodes. So 7bit, or 8bit for UTF-8 headers. Neither may carry a lone CR or
++// LF, which mail-builder would pass through as 7bit, so every line ends in CRLF; a line past SMTP's 998 octets is left
++// to mail-builder to encode. Patch 0014: a header byte that is not UTF-8 (legacy or spam mail) used to empty the whole
++// part; it is replaced instead, and everything else returned (MAI-1131).
++fn returned_headers(headers: Vec<u8>) -> MimePart<'static> {
++    let headers = String::from_utf8(headers)
++        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
 +        .replace("\r\n", "\n")
 +        .replace(['\r', '\n'], "\r\n")
 +        .replace('\0', "");
-+    let encoding = if headers.split("\r\n").any(|line| line.len() > 998) {
-+        None
-+    } else if headers.is_ascii() {
-+        Some("7bit")
++    if headers.split("\r\n").any(|line| line.len() > 998) {
++        MimePart::new(
++            ContentType::new("text/rfc822-headers"),
++            BodyPart::Text(headers.into()),
++        )
 +    } else {
-+        Some("8bit")
-+    };
-+    let part = MimePart::new(
-+        ContentType::new("text/rfc822-headers"),
-+        BodyPart::Text(headers.into()),
-+    );
-+    match encoding {
-+        Some(encoding) => part.transfer_encoding(encoding),
-+        None => part,
++        rfc822_headers_part(Cow::Owned(headers.into_bytes()))
 +    }
 +}
 +
- impl MessageWrapper {
-     pub async fn build_dsn(&self, server: &Server) -> Option<Vec<u8>> {
-         let config = &server.core.smtp.queue;
-@@ -362,10 +390,7 @@ impl MessageWrapper {
-                         ContentType::new("message/delivery-status"),
-                         BodyPart::Text(dsn.into()),
-                     ),
--                    MimePart::new(
--                        ContentType::new("message/rfc822"),
--                        BodyPart::Text(headers.into()),
--                    ),
-+                    returned_headers(headers),
-                 ]),
-             ))
-             .write_to_vec()
+ fn rfc822_headers_part(headers: Cow<'_, [u8]>) -> MimePart<'_> {
+     let encoding = if headers.is_ascii() { "7bit" } else { "8bit" };
+     MimePart::new(
