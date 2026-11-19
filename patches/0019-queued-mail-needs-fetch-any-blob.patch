@@ -1,0 +1,17 @@
+diff --git a/crates/jmap/src/blob/download.rs b/crates/jmap/src/blob/download.rs
+index 01e7408..3713543 100644
+--- a/crates/jmap/src/blob/download.rs
++++ b/crates/jmap/src/blob/download.rs
+@@ -322,8 +322,12 @@ impl BlobDownload for Server {
+             }
+             BlobClass::Reserved { account_id, .. } => access_token.is_member(*account_id),
+             BlobClass::Embedded { .. } => false,
++            // MainThrive patch 0019: a queued message's contents need `fetchAnyBlob` too, as reading any other
++            // account's mail does. `sysQueuedMessageGet` alone is what holding and releasing the queue needs (its
++            // metadata), and in 0.16 it read no message (MAI-950, MAI-1441).
+             BlobClass::Queued { queue_id } => {
+                 access_token.has_permission(Permission::SysQueuedMessageGet)
++                    && access_token.has_permission(Permission::FetchAnyBlob)
+                     && is_queued_blob_visible(self, access_token, *queue_id).await?
+             }
+         };

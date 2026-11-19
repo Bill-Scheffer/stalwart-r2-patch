@@ -1,13 +1,13 @@
 # stalwart-r2-patch
 
-[Stalwart](https://github.com/stalwartlabs/stalwart) **v1.1.1** built from its own release source with **thirteen**
+[Stalwart](https://github.com/stalwartlabs/stalwart) **v1.1.1** built from its own release source with **fourteen**
 patches: stored files and mail written into a mailbox are **scanned**, a narrow key **cannot put a user into a group
 beyond its grant**, an operator can run **admin verbs on a mailbox without reading its mail**, calendar mail carries **no
 Stalwart logo**, a burst of large uploads or messages is **refused, not an OOM**, and a client that stops sending
 **holds no budget**, a large inline image **leaves the spam filter's text budget alone**, a two-step code is **accepted
 once** and turning two-step on **proves the new secret**, a bounce returns the original's headers **as
 `text/rfc822-headers`**, **up to 64 KiB** of them, each account has **its own spam level**, and an account that opted in
-to screening **acts on a junk verdict**.
+to screening **acts on a junk verdict**, and the key that manages the mail queue **cannot read the mail in it**.
 
 ## On Stalwart v1 (MainThrive MAI-1441)
 
@@ -31,6 +31,7 @@ passes there **and** still fails on plain 0.16.27 (so the script can still tell 
 | 13, 14. bounce headers | 14 **folded into** 13 (v1's DSN code puts both on the same lines) |
 | 15. spam level | re-authored |
 | 18. screening verdict | re-authored |
+| 19. queued mail needs `fetchAnyBlob` | **new on v1**: v1 lets `sysQueuedMessageGet` alone download a queued message, so the key that holds and releases the queue read all outbound mail; on 0.16 it read none |
 
 The sections below describe each change as it was made on the 0.16 line, with what was measured then. The build proves
 every remaining patch on each release against plain upstream at that release (`UPSTREAM_IMAGE` in `build.yml`): its

@@ -1,4 +1,4 @@
-# Builds Stalwart from its own release source with THIRTEEN patches, each pinned to its exact files. Since v1.1.1
+# Builds Stalwart from its own release source with FOURTEEN patches, each pinned to its exact files. Since v1.1.1
 # (MainThrive MAI-1441) the numbers below are the 0.16 line's, kept so the history reads; the gaps are upstream's own now.
 # Retired, each measured to pass on plain v1.1.1 and to fail on plain 0.16.27:
 #  1. rust-s3's DELETE signing for R2 (rust-s3 #466): v1 has its own S3 client, which signs only what it sends.
@@ -47,6 +47,10 @@
 # 18. patches/0018-screening-verdict-at-delivery.patch: the MTA hook is passed the server's own headers (authentication
 #    results, spam score), which upstream leaves empty, and at delivery an account with a `spam-screen` lookup row takes
 #    a junk verdict in the topmost X-MainThrive-Screen, for mail the spam filter scored (MAI-1072).
+# 19. patches/0019-queued-mail-needs-fetch-any-blob.patch: a queued message's contents download only for a caller that
+#    holds fetchAnyBlob as well as sysQueuedMessageGet. v1 lets sysQueuedMessageGet alone read them, which made the
+#    key that holds and releases the queue (MainThrive's mail-ops, MAI-950) a reader of every queued outbound email;
+#    on 0.16 it read none (measured, MAI-1441).
 # Everything else is upstream: the tag's source, its Dockerfile, its features.
 # The release tag is pushed only from main; a dispatch from another branch pushes branch-<short sha>
 # instead, and a pull request runs every step but the registry login and the push (MAI-1019). A release tag is
@@ -89,7 +93,7 @@ env:
   # The tag after the Stalwart release: bump it with any change to what is built. p<last patch>-<build of that set>:
   # a new patch resets it (p0018-1), any other change to what is built counts up (p0017-2). Until 0017 it listed every
   # patch's own suffix, and with 0017's it reached 133 characters, past a Docker tag's 128 (MAI-1100).
-  VARIANT: p0018-1
+  VARIANT: p0019-1
   # The bug reference for every patch: plain upstream at the same release, which lacks them all, so each patch's check
   # must FAIL there on its own bug lines (and its controls PASS), or its pass here proves nothing. One reference, bumped
   # with STALWART_TAG, replaces the per-patch images of the 0.16 line (MAI-1441): every patch is re-proved on each
@@ -400,7 +404,21 @@ jobs:
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
-          # Stage 0018, the last.
+          # Stage 0018, so the next step's diff is 0019 alone.
+          git add -- crates/
+
+      - name: Apply the queued-mail patch, and prove it changed only its own file
+        working-directory: stalwart
+        run: |
+          set -eu
+          P=../patch/patches/0019-queued-mail-needs-fetch-any-blob.patch
+          git apply --check "$P" && git apply "$P"
+          got=$(git diff --name-only | sort | tr '\n' ' ')
+          [ "$got" = "crates/jmap/src/blob/download.rs " ] \
+            || { echo "::error::changed files: $got"; exit 1; }
+          diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
+            || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
+          # Stage 0019, the last.
           git add -- crates/
 
       - name: Swap, as Stalwart's own CI adds for its release build
@@ -427,7 +445,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ env.STALWART_TAG }}-${{ env.VARIANT }}
-            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with scanned, capped file writes and scanned mail writes, account writes and group joins within the caller's grant, admin verbs without impersonate, no logo on calendar mail, a server-wide cap on large uploads and messages that stalled bodies cannot hold, a data: image that leaves the spam filter's text budget alone, a two-step code accepted once and turning two-step on proving the new secret, bounces returning the original's headers as text/rfc822-headers up to 64 KiB, a spam level per account, and a screening verdict acted on at delivery per account
+            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with scanned, capped file writes and scanned mail writes, account writes and group joins within the caller's grant, admin verbs without impersonate, no logo on calendar mail, a server-wide cap on large uploads and messages that stalled bodies cannot hold, a data: image that leaves the spam filter's text budget alone, a two-step code accepted once and turning two-step on proving the new secret, bounces returning the original's headers as text/rfc822-headers up to 64 KiB, a spam level per account, a screening verdict acted on at delivery per account, and queued mail readable only with fetchAnyBlob
             org.opencontainers.image.licenses=AGPL-3.0-only
           cache-from: type=gha
           # Only main writes the cache: a pull request reads main's, and a Rust build cache written per
@@ -638,6 +656,16 @@ jobs:
             'FAIL a junk verdict with a webmail folder rule: Junk, Yes, and the rule does not run' \
             'FAIL control: a pass verdict at Lenient: a high message stays in the Inbox, No (the level still applies)' \
             'FAIL the failed lookup is logged, once'
+
+      - name: A key that manages the mail queue cannot read the mail in it (end to end, the built image)
+        run: bash patch/scripts/e2e-queued-mail.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
+
+      - name: The same check FAILS on plain upstream at the same release, on 0019's own lines
+        run: |
+          bash patch/scripts/previous-must-fail.sh "${UPSTREAM_IMAGE}" patch/scripts/e2e-queued-mail.sh \
+            "FAIL the queue key cannot download a queued message's contents" \
+            'PASS control: the queue key reads the queue' \
+            "PASS control: an admin downloads the queued message's contents"
 
       - name: Push, only after every check passed
         if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
