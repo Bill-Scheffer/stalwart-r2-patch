@@ -132,9 +132,11 @@ check(st!=200, f"[{STORE}] control: JMAP Basic with the password alone opens no 
 code=fresh(seed); tok=signin(pw,code)
 check(tok is not None, f"[{STORE}] a two-step sign-in through /api/auth with a fresh code succeeds")
 s,ses=req("/jmap/session",auth=tok); aid=ses["primaryAccounts"]["urn:stalwart:jmap"]
-s,b=jmap(tok,[["x:AppPassword/set",{"accountId":aid,"create":{"a":{"description":"e2e"}}},"a"]])
+# Replace, not Inherit: v1 lets a token scoped to mail, security and settings grant only what it holds (IMAP sign-in).
+IMAP_PERMS={p:True for p in ["authenticate","imapAuthenticate","imapCapability","imapId","imapList","imapSelect","imapFetch"]}
+s,b=jmap(tok,[["x:AppPassword/set",{"accountId":aid,"create":{"a":{"description":"e2e","permissions":{"@type":"Replace","permissions":IMAP_PERMS}}}},"a"]])
 app=((b["methodResponses"][0][1].get("created") or {}).get("a") or {}).get("secret")
-check(bool(app) and imap(USER,app)=="ok", f"[{STORE}] control: an app password signs in to IMAP")
+check(bool(app) and imap(USER,app)=="ok", f"[{STORE}] control: an app password signs in to IMAP ({json.dumps(b['methodResponses'][0])[:300] if not app else 'issued'})")
 
 # 1. The same code twice in one window.
 reuse(signin(pw,code) is None, "the same code a second time, in the same window, is refused")
@@ -219,14 +221,25 @@ checks bob "$(mkuser bob)" valkey || rc=1
 # And it took: the same failed sign-in answers "failure" with Valkey up, and cannot answer that with it paused (the
 # auth-failure counter lives in the in-memory store).
 probe() { docker exec "$K" python3 -c "
-import json,urllib.request,urllib.error
-r=urllib.request.Request('http://stalwart:8080/api/auth',data=json.dumps({'type':'authCode','accountName':'nobody@one.test','accountSecret':'x','clientId':'e2e','redirectUri':'https://webmail.example/cb'}).encode(),headers={'Content-Type':'application/json'})
-try: print(json.load(urllib.request.urlopen(r,timeout=30)).get('type'))
+import json,urllib.parse,urllib.request,urllib.error
+B='http://stalwart:8080'; ru='http://127.0.0.1/cb'
+# v1 checks the client before the credentials, so the failed sign-in needs a client it knows (0.16 takes any id).
+sc='openid offline_access urn:ietf:params:oauth:scope:mail'
+try: cid=json.load(urllib.request.urlopen(urllib.request.Request(B+'/auth/register',data=json.dumps({'client_name':'probe','redirect_uris':[ru],'token_endpoint_auth_method':'none','grant_types':['authorization_code','refresh_token'],'response_types':['code'],'scope':sc}).encode(),headers={'Content-Type':'application/json'}),timeout=30))['client_id']
+except urllib.error.HTTPError as e:
+    cid='e2e'
+    if e.code!=404: print('register:'+str(e.code)+':'+e.read()[:200].decode(errors='replace')); raise SystemExit
+q=urllib.parse.urlencode({'response_type':'code','client_id':cid,'redirect_uri':ru,'scope':sc,'code_challenge':'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM','code_challenge_method':'S256'})
+r=urllib.request.Request(B+'/api/auth',data=json.dumps({'type':'authCode','accountName':'nobody@one.test','accountSecret':'x','clientId':cid,'redirectUri':ru,'query':q,'consent':True}).encode(),headers={'Content-Type':'application/json'})
+try:
+    a=json.load(urllib.request.urlopen(r,timeout=30)); t=a.get('type'); print(t if t!='invalid' else 'invalid:'+str(a.get('error'))+':'+str(a.get('description')))
 except urllib.error.HTTPError as e: print(e.code)
 except Exception as e: print(type(e).__name__)"; }
 up=$(probe); docker pause "$V" >/dev/null; paused=$(probe); docker unpause "$V" >/dev/null
 # A fixed line, so the reference run can be required to print it too (its reuse FAILs are Valkey's, not RocksDB's).
 echo "   (a failed sign-in: $up; with Valkey paused: $paused)"
-if [ "$up" = failure ] && [ "$paused" != failure ]; then echo "PASS [valkey] control: the in-memory store is Valkey"
+# 0.16 answers a refused sign-in "failure"; v1 answers "redirect" (the error rides the client's redirect URI). With
+# Valkey paused, either line fails on the server instead (v1: a 500, at the client registration that needs it already).
+if { [ "$up" = failure ] || [ "$up" = redirect ]; } && [ "$paused" != failure ] && [ "$paused" != redirect ]; then echo "PASS [valkey] control: the in-memory store is Valkey"
 else echo "FAIL [valkey] control: the in-memory store is Valkey"; rc=1; fi
 exit $rc

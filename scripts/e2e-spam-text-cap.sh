@@ -180,8 +180,11 @@ cases={
       "a URL past the first 512 KiB of a text part is not analysed"),
   "url early in a large part": ("text/plain; charset=utf-8",URL+prose(2*MiB),True,
       "the same URL at the start of a 2 MiB part still is"),
-  "url in a third part": ("multipart/mixed; boundary=b",mixed(prose(600*KiB),prose(600*KiB),URL+prose(KiB)),False,
-      "a URL at the start of a third text part, past the first 1 MiB of the message, is not analysed"),
+  # v1 analyses at most 1 MiB of text per message (upstream's SpamSettings), 256 KiB of a body part and 64 KiB of any
+  # other: in multipart/mixed only the first text part is body, so it and thirteen more 600 KiB parts use up the budget
+  # (256 KiB + 13 x 64 KiB > 1 MiB), and the part after them is not analysed (0.16's patch cut parts at 512 KiB).
+  "url in a fifth part": ("multipart/mixed; boundary=b",mixed(*[prose(600*KiB)]*14,URL+prose(KiB)),False,
+      "a URL at the start of a text part past the message's 1 MiB of analysed text is not analysed"),
   "url in a second part": ("multipart/mixed; boundary=b",mixed(prose(600*KiB),URL+prose(KiB)),True,
       "and one at the start of the second part still is"),
   "url past the html bound": ("text/html; charset=utf-8",html_of(prose(600*KiB)+URL),False,
