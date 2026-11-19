@@ -13,7 +13,7 @@
 # the first -filescan1 build, which missed FileNode/copy, that one check FAILs (both measured).
 set -euo pipefail
 IMG=${1:?usage: $0 <stalwart image>}
-CLI=stalwartlabs/cli:1.0.13
+CLI=stalwartlabs/cli:2.0.0
 CLAM=clamav/clamav:1.4.5_base
 NET=e2e-scan-$$; C=e2e-scan-stalwart-$$; AV=e2e-scan-clamd-$$
 W=$(mktemp -d); mkdir -p "$W/etc" "$W/data"; chmod -R 777 "$W"

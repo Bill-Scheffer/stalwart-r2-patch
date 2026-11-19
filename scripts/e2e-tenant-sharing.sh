@@ -8,7 +8,7 @@
 # account that does not exist, and leave sharing inside a tenant working. Every assertion runs in both directions: refused across tenants, allowed within.
 set -euo pipefail
 IMG=${1:?usage: $0 <stalwart image>}
-CLI=stalwartlabs/cli:1.0.13
+CLI=stalwartlabs/cli:2.0.0
 NET=e2e-tenant-$$; C=e2e-tenant-stalwart-$$
 W=$(mktemp -d); mkdir -p "$W/etc" "$W/data"; chmod -R 777 "$W"
 echo '{"@type":"RocksDb","path":"/var/lib/stalwart/"}' > "$W/etc/config.json"

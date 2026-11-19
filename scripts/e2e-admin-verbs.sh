@@ -139,7 +139,7 @@ def creds(i): return r1(ADM,["x:Account/get",{"accountId":A,"ids":[i],"propertie
 def pwcred(i): return [k for k,v in creds(i).items() if v["@type"]=="Password"][0]
 def reset(auth,acc,i,totp=False):
     ck=pwcred(i); u={f"credentials/{ck}/secret":secrets.token_urlsafe(16)}
-    if totp: u[f"credentials/{ck}/otpAuth"]=None
+    if totp: u[f"credentials/{ck}/otpUrl"]=None
     r=r1(auth,["x:Account/set",{"accountId":acc,"update":{i:u}},"u"])
     return i in (r[1].get("updated") or {}), r
 G7="This account's permissions exceed yours."
@@ -176,7 +176,7 @@ r=join(ADM,A,ID["gus"],ID["privg"]); check(ID["gus"] in (r[1].get("updated") or 
 r=join(K,KA,ID["gus"],ID["privg"],None); check(ID["gus"] in (r[1].get("updated") or {}), f"0007: the key still removes a member from that group ({json.dumps(r)[:140]})")
 
 # 0008: the nine verbs, on alice, through the key; each refused for the refusal targets.
-refused=lambda r: r[0]=="error" and r[1].get("type")=="forbidden"
+refused=lambda r: r[0]=="error" and r[1].get("type") in ("forbidden","accountNotFound")   # v1 answers accountNotFound for an account the caller cannot reach
 # (The key's own owner is not a target here: a key is one of mailadmin's credentials, so upstream
 # already lets it act on mailadmin's own Sieve and identities. 0007's rows cover the owner.)
 TARGETS=[("an Admin (opsadm)",K,OPS),("alice without sysAccountUpdate",KN,ALICE)]
@@ -201,9 +201,9 @@ s,_=req(f"/jmap/download/{ALICE}/{FB}/f",KN); check(s==404, f"0008 download: ref
 # mail reach, still refused
 m=r1(AL,["Email/query",{"accountId":ALICE},"q"])[1]["ids"][0]
 mb=r1(AL,["Email/get",{"accountId":ALICE,"ids":[m],"properties":["blobId"]},"g"])[1]["list"][0]["blobId"]
-r=r1(K,["Email/get",{"accountId":ALICE,"ids":[m]},"g"]); check(refused(r), "mail reach: Email/get on alice refused")
-r=r1(K,["Email/query",{"accountId":ALICE},"q"]); check(refused(r), "mail reach: Email/query on alice refused")
-r=r1(K,["Blob/get",{"accountId":ALICE,"ids":[mb]},"b"]); check(refused(r), "mail reach: Blob/get on alice's mail blob refused")
+r=r1(K,["Email/get",{"accountId":ALICE,"ids":[m]},"g"]); check(refused(r), f"mail reach: Email/get on alice refused ({json.dumps(r)[:160]})")
+r=r1(K,["Email/query",{"accountId":ALICE},"q"]); check(refused(r), f"mail reach: Email/query on alice refused ({json.dumps(r)[:160]})")
+r=r1(K,["Blob/get",{"accountId":ALICE,"ids":[mb]},"b"]); check(refused(r), f"mail reach: Blob/get on alice's mail blob refused ({json.dumps(r)[:160]})")
 r=r1(K,["Blob/get",{"accountId":MAA,"ids":[mb]},"b"]); check(r[0]=="Blob/get" and mb in (r[1].get("notFound") or []), f"mail reach: Blob/get of alice's mail blob from the key's own account: notFound ({json.dumps(r)[:100]})")
 s,_=req(f"/jmap/download/{ALICE}/{mb}/m",K); check(s==404, f"mail reach: /jmap/download of alice's mail blob refused ({s})")
 # 5. edit a script: the key uploads to its OWN account, validates and sets it on alice's

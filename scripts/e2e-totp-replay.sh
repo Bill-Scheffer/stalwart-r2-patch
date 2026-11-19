@@ -19,7 +19,7 @@
 # runs it (both nodes share it, and Valkey's SET NX is what makes the mark atomic across them).
 set -euo pipefail
 IMG=${1:?usage: $0 <stalwart image>}
-CLI=stalwartlabs/cli:1.0.13
+CLI=stalwartlabs/cli:2.0.0
 VALKEY=valkey/valkey:8.1-alpine
 NET=e2e-totp-$$; C=e2e-totp-stalwart-$$; K=e2e-totp-client-$$; V=e2e-totp-valkey-$$
 W=$(mktemp -d); mkdir -p "$W/etc" "$W/data"; chmod -R 777 "$W"
