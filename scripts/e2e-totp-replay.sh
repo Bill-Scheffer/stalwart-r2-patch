@@ -92,14 +92,26 @@ def new_seed(): return base64.b32encode(secrets.token_bytes(20)).decode().rstrip
 def fresh(seed):
     # The start of the next 30 s window: a code no earlier check has used.
     time.sleep(30-time.time()%30+1); return totp(seed)
+RU="http://127.0.0.1/oauth/callback"
+# v1 grants a registered client only the scopes it registered; managing app passwords and two-step needs `security`.
+SCOPE="openid offline_access urn:ietf:params:oauth:scope:mail urn:stalwart:oauth:scope:security urn:stalwart:oauth:scope:settings"
+# v1 knows only clients it has registered, so register a public one (RFC 7591) as webmail does; 0.16 takes any id.
+s,reg=req("/auth/register",{"client_name":"e2e","redirect_uris":[RU],"token_endpoint_auth_method":"none",
+    "grant_types":["authorization_code","refresh_token"],"response_types":["code"],"scope":SCOPE})
+CID=reg["client_id"] if s in (200,201) and isinstance(reg,dict) and reg.get("client_id") else "e2e"
 def signin(secret,code):
-    # /api/auth as a two-step client signs in: an authorization code for a PKCE token exchange.
+    # /api/auth as a two-step client signs in: an authorization code for a PKCE token exchange. One body for both
+    # lines, as webmail sends it: 0.16 reads the fields, v1 the `query` (and answers with the redirect `location`).
     v=secrets.token_urlsafe(48); ch=base64.urlsafe_b64encode(hashlib.sha256(v.encode()).digest()).rstrip(b"=").decode()
-    ru="https://webmail.example/oauth/callback"
+    st=secrets.token_urlsafe(12)
+    q=urllib.parse.urlencode({"response_type":"code","client_id":CID,"redirect_uri":RU,"state":st,
+        "scope":SCOPE,"code_challenge":ch,"code_challenge_method":"S256"})
     s,b=req("/api/auth",{"type":"authCode","accountName":USER,"accountSecret":secret,"mfaToken":code,
-        "clientId":"e2e","redirectUri":ru,"codeChallenge":ch,"codeChallengeMethod":"S256"})
+        "clientId":CID,"redirectUri":RU,"codeChallenge":ch,"codeChallengeMethod":"S256","query":q,"consent":True})
     if not (isinstance(b,dict) and b.get("type")=="authenticated"): return None
-    s,t=req("/auth/token",{"grant_type":"authorization_code","code":b["client_code"],"client_id":"e2e","redirect_uri":ru,"code_verifier":v},form=True)
+    c=b.get("client_code") or (urllib.parse.parse_qs(urllib.parse.urlparse(b.get("location") or "").query).get("code") or [None])[0]
+    if not c: return None
+    s,t=req("/auth/token",{"grant_type":"authorization_code","code":c,"client_id":CID,"redirect_uri":RU,"code_verifier":v},form=True)
     return "Bearer "+t["access_token"] if s==200 else None
 ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE
 def imap(user,secret):
