@@ -1,77 +1,52 @@
-# Builds Stalwart from its own release source with SEVENTEEN changes, each pinned to its exact files:
-# 1. (retired) rust-s3 used to be taken from the commit of rust-s3 PR #467, which stops DeleteObject signing
-#    headers it never sends; without it every blob DELETE against Cloudflare R2 failed with SignatureDoesNotMatch
-#    (rust-s3 #466, Stalwart #3185). rust-s3 0.38.0 carries the fix (6c97cb9) and Stalwart v0.16.26 moved to it,
-#    so the build now only asserts the lock still names it.
-# 2. patches/0002-tenant-scoped-sharing.patch: a JMAP `shareWith` or IMAP `SETACL` may only name an
-#    account in the caller's own tenant, as the JMAP directory already requires.
-#    Upstream v0.16.24 accepts any account on the server, so one customer could share with another.
-#    This is open (AGPL) code, identical with or without an Enterprise licence.
-# 3. patches/0003-tenant-scoped-dav-acl.patch: the same rule for a WebDAV `ACL` request (calendars,
-#    address books, file folders). Upstream resolves the grantee by name and checks no tenant (its
-#    principal check is commented out), which 0002 wrongly assumed it did.
-# 4. patches/0004-file-writes-scanned-and-capped.patch: every file stored through WebDAV PUT or JMAP
-#    FileNode/set or FileNode/copy (a replacement blobId) is streamed to clamd (STALWART_FILE_SCAN_CLAMD) first and refused if infected, or
-#    if it could not be scanned (fail closed); and JMAP gets the file-size cap WebDAV already has.
-#    Upstream scans mail (the milter) but never files, and JMAP checked no file size (both measured).
-# 5. patches/0005-mail-written-into-a-mailbox-scanned.patch: mail written straight into a mailbox (IMAP
-#    APPEND, JMAP Email/import, a JMAP draft) never passes the SMTP milter; email_ingest now scans it
-#    with 0004's clamd client and refuses it if infected or unscannable (measured: all three stored EICAR).
-# 6. patches/0006-expired-ban-replaced.patch: a ban that has EXPIRED is replaced when the same address
-#    earns a new one, in memory and in the stored list, here and on every node. Upstream keeps the
-#    expired entry (a set compared by address alone; a conflicting insert), so with a ban period set
-#    every ban after the first is logged and never enforced (measured). All four ban kinds use it.
-# 7. patches/0007-account-writes-within-the-callers-grant.patch: an account may be updated or destroyed only
-#    by a caller that holds every permission it has (the grant rule, applied to the target as stored), and
-#    may join a group only if the caller holds every permission the group has.
-# 8. patches/0008-admin-verbs-without-impersonate.patch: Sieve, out-of-office, identities and issuing or revoking an
-#    app password on another account, for a caller with sysAccountUpdate that 0007's rule admits. Upstream passes
-#    them only for the account itself or `impersonate`, which also reads all mail. Nothing that reads mail widens.
-#    Revoking by id came in -verbs2 (MainThrive MAI-1018): before it the API nulled a credential's positional key,
-#    which Stalwart renumbers, so two revokes at once could remove a third app password.
-# 9. patches/0009-no-logo-on-calendar-mail-and-rsvp.patch: no Stalwart logo on a calendar invitation, a reminder
-#    or the guest RSVP page. The templates are compiled in (both editions; Enterprise can only swap the image), and
-#    upstream attaches its built-in logo to every invitation and reminder (measured).
+# Builds Stalwart from its own release source with THIRTEEN patches, each pinned to its exact files. Since v1.1.1
+# (MainThrive MAI-1441) the numbers below are the 0.16 line's, kept so the history reads; the gaps are upstream's own now.
+# Retired, each measured to pass on plain v1.1.1 and to fail on plain 0.16.27:
+#  1. rust-s3's DELETE signing for R2 (rust-s3 #466): v1 has its own S3 client, which signs only what it sends.
+#  2, 3. patches 0002/0003, sharing never crosses tenants (JMAP, IMAP, WebDAV ACL): v1 refuses another tenant's grantee.
+#  6. patch 0006, an expired ban replaced and the next one enforced: v1's BlockedIps::block, and its registry update.
+#  14. patch 0014, the whole header block in a bounce: folded into 0013 (v1's DSN code puts both on the same lines).
+# The thirteen:
+# 4. patches/0004-file-writes-scanned-and-capped.patch: every file stored through WebDAV PUT or JMAP FileNode/set or
+#    FileNode/copy (a replacement blobId; v1's FileNodeWriter::resolve_blob) is streamed to clamd
+#    (STALWART_FILE_SCAN_CLAMD) first and refused if infected or unscannable (fail closed), and JMAP gets the file-size
+#    cap WebDAV already has. Upstream scans mail (the milter) but never files.
+# 5. patches/0005-mail-written-into-a-mailbox-scanned.patch: mail written straight into a mailbox (IMAP APPEND, JMAP
+#    Email/import, a JMAP draft) is scanned with 0004's client and refused if infected or unscannable.
+# 7. patches/0007-account-writes-within-the-callers-grant.patch: a User may join a group, or be created inside one, only
+#    if the caller holds every permission the group has. (The account half, updating or destroying an account beyond the
+#    caller's grant, is v1's own validate_account_access.)
+# 8. patches/0008-admin-verbs-without-impersonate.patch: Sieve, out-of-office, identities and issuing or revoking (by id)
+#    an app password on another account, for a caller with sysAccountUpdate whose grant covers it. Upstream passes them
+#    only for the account itself or `impersonate`, which also reads all mail. Nothing that reads mail widens.
+# 9. patches/0009-no-logo-on-calendar-mail-and-rsvp.patch: no Stalwart logo on a calendar invitation or a reminder.
+#    (v1's guest RSVP page carries none.)
 # 10. patches/0010-server-wide-cap-on-large-bodies.patch: the request bodies past 1 MiB held at once stay within
 #    STALWART_MAX_LARGE_UPLOAD_MIB, and the messages past 5 MiB (SMTP DATA and BDAT, IMAP APPEND) within
-#    STALWART_MAX_LARGE_MESSAGE_MIB, in bytes, server-wide; one past its budget is refused retryably (WebDAV 429 + Retry-After, JMAP 429, SMTP 452, IMAP NO
-#    [UNAVAILABLE]). Upstream bounds each account, or each sender IP, only, so a burst across them could OOM-kill the
-#    process (measured, MAI-1000).
-# 11. patches/0011-spam-filter-analyses-a-bounded-start-of-each-text.patch: the inbound spam filter analyses the first
-#    512 KiB of each part's text, plain or extracted from HTML, 1 MiB per message, and reads up to 2 MiB of HTML markup.
-#    Upstream tokenizes all of it, at ~40 times the text in memory, so a 10 MiB text/plain message cost 280-466 MiB by
-#    SMTP, past what 0010's budgets count (measured, MAI-1077).
-# 12. patches/0012-a-two-step-code-is-accepted-once.patch: a two-step (TOTP) code is accepted once, at sign-in and to
-#    confirm a password or two-step change. Upstream keeps no record, so the same code signed in again until its window
-#    closed (measured, MAI-989/MAI-997; RFC 6238 § 5.2). The mark is per account and time step, in the in-memory store
-#    every node shares, set with SET NX.
-# 13. patches/0013-bounces-return-headers-as-text-rfc822-headers.patch: a bounce returns the original's headers as
-#    text/rfc822-headers (RFC 6522), 7bit or 8bit, not as message/rfc822. Amazon SES parses a message/rfc822 part as a
-#    whole message and refused Stalwart's header-only one (554, measured through real SES, MainThrive MAI-1036).
-# 14. patches/0014-bounces-return-the-whole-header-block.patch: a bounce returns the original's header block up to 64 KiB,
-#    not 4 KiB. A real Gmail message's trace, ARC and DKIM headers filled upstream's 4096 bytes before its From, Subject and
-#    Message-ID, and that bounce went to Gmail's Spam (measured in production, MainThrive MAI-1127/MAI-1131). A header byte
-#    that is not UTF-8 is replaced, where upstream returned nothing at all.
+#    STALWART_MAX_LARGE_MESSAGE_MIB, server-wide; one past its budget is refused retryably (WebDAV 429 + Retry-After,
+#    JMAP 429, SMTP 452, IMAP NO [UNAVAILABLE]), and ordinary mail is never counted. It sits beside v1's own
+#    buffered-memory budget, which counts all mail and bounds no HTTP upload (measured, MAI-1000, MAI-1441).
+# 11. patches/0011-spam-filter-analyses-a-bounded-start-of-each-text.patch: a data: URI's payload in an HTML part's src or
+#    href is left out of the text the spam filter analyses, so a large inline image does not use up the part's budget
+#    and score the message as all image. v1's MessageTexts bounds the rest (MAI-1077, MAI-1441).
+# 12. patches/0012-a-two-step-code-is-accepted-once.patch: a two-step (TOTP) code is accepted once, at sign-in, to confirm
+#    a password or two-step change, and to register a passkey (RFC 6238 § 5.2). The mark is per account and time step,
+#    in the in-memory store every node shares, set with SET NX.
+# 13. patches/0013-bounces-return-headers-as-text-rfc822-headers.patch: a bounce returns the original's header block up
+#    to 64 KiB as text/rfc822-headers (RFC 6522), 7bit or 8bit, a lone CR or LF ended as a line and a byte that is not
+#    UTF-8 replaced, not as message/rfc822 cut at 4 KiB (Amazon SES refused it, MAI-1036; Gmail's headers outran 4 KiB,
+#    MAI-1127/MAI-1131). v1 sends text/rfc822-headers only for a DKIM2 message.
 # 15. patches/0015-spam-level-moves-the-junk-line.patch: an account's spam level, one optional `spam-level` lookup row
-#    keyed by its id, moves where its mail turns to Junk by rescaling its spam percentage at delivery, so the line maps to
-#    50 for every reader (Junk, Sieve's spamtest, X-Spam-Status). Upstream has one global line (MainThrive MAI-1070). A
+#    keyed by its id, moves where its mail turns to Junk by rescaling its spam percentage at delivery (MAI-1070). A
 #    lookup that fails, or a value that is not a line, delivers at Normal and is logged: never a deferral.
-# 16. patches/0016-stalled-bodies-hold-no-budget.patch: a logged-in client that stops sending holds none of 0010's budgets
-#    beyond the bytes it sent. An IMAP APPEND literal is counted as its bytes arrive, not at its declared {n} (one that
-#    would not fit now is still refused before "+"; one that runs out partway is read, dropped and answered NO
-#    [UNAVAILABLE]), and a body holding budget that sends nothing for STALWART_BODY_IDLE_SECS (60 unset) is ended: HTTP
-#    with 408, an IMAP literal with its session; one that trickles below 16 KiB/s past that grace is refused (HTTP 408,
-#    IMAP read, dropped and NO). 0010 held a declared literal's whole size until the IMAP timeout (30 min), and upstream
-#    reads an HTTP body with no timeout (MainThrive MAI-1078).
-# 17. patches/0017-turning-two-step-on-proves-the-new-secret.patch: turning two-step on (x:AccountPassword/set with a new
-#    otpUrl) needs a code from the NEW secret, and that code is then used, as 0012 marks a sign-in's. Upstream checks the
-#    code only against the old secret, and turning it on there is none, so a secret the user's authenticator never
-#    stored was enabled on the password alone and locked them out (MainThrive MAI-1100). Replacing a secret that is
-#    already on is refused: it would need a code from each, and a change carries one, so it goes off, then on again.
-# 18. patches/0018-screening-verdict-at-delivery.patch: the MTA hook is passed the server's own headers (authentication results,
-#    spam score), which upstream leaves empty, and at delivery an account with a `spam-screen` lookup row takes a junk verdict
-#    in the topmost X-MainThrive-Screen as a percentage of 100, for mail the spam filter scored. Any other copy or value, or no
-#    row, changes nothing, and a failed lookup reads as no row and is logged: never a deferral (MainThrive MAI-1072).
+# 16. patches/0016-stalled-bodies-hold-no-budget.patch: a client that stops sending holds none of 0010's budgets beyond
+#    the bytes it sent: an IMAP literal is counted as it arrives, and a body holding budget that sends nothing for
+#    STALWART_BODY_IDLE_SECS (60 unset), or trickles below 16 KiB/s past that grace, is ended (HTTP 408, IMAP NO
+#    [UNAVAILABLE] and the rest read and dropped, MAI-1078).
+# 17. patches/0017-turning-two-step-on-proves-the-new-secret.patch: turning two-step on needs a code from the NEW secret,
+#    which is then used, as 0012 marks a sign-in's; replacing a secret that is already on is refused (MAI-1100).
+# 18. patches/0018-screening-verdict-at-delivery.patch: the MTA hook is passed the server's own headers (authentication
+#    results, spam score), which upstream leaves empty, and at delivery an account with a `spam-screen` lookup row takes
+#    a junk verdict in the topmost X-MainThrive-Screen, for mail the spam filter scored (MAI-1072).
 # Everything else is upstream: the tag's source, its Dockerfile, its features.
 # The release tag is pushed only from main; a dispatch from another branch pushes branch-<short sha>
 # instead, and a pull request runs every step but the registry login and the push (MAI-1019). A release tag is
@@ -103,62 +78,23 @@ concurrency:
 
 env:
   # Upstream Stalwart release, pinned by commit: a tag can move, a commit cannot.
-  STALWART_TAG: v0.16.27
-  STALWART_SHA: aa47d8ef7bfba7200d3293198ac2592747b20e73
-  # The first rust-s3 release whose DeleteObject signs no header it never sends (6c97cb9, rust-s3 #466).
-  RUSTS3_VERSION: 0.38.0
-  # The commit of opentelemetry-rust that this release's Cargo.lock names (the step that moves its source says why).
-  OTEL_SHA: ae66e97b140f70e477ab710686aafce665cc2f8b
+  STALWART_TAG: v1.1.1
+  STALWART_SHA: 3adead91f3c87e7415b58c9ed8e6ec05a5dda521
   # The commit of hickory-dns that this release's Cargo.lock names, on stalwartlabs' fork (the same step says why).
   HICKORY_SHA: f8b92b17fa6c7d09a6959672592106ca1410937b
-  # The builder's base image, the digest the last green build used (run 41544013312): upstream's Dockerfile names a floating tag.
-  CARGO_CHEF_DIGEST: sha256:f122e3c240d1c05668b07179cf6fa07647db2a79a110f4bb8a91d75f90d5b8e4
+  # The builder's base image (rustc 1.100.0), the digest the v1.1.1 stack was first built and tested with (MAI-1441):
+  # upstream's Dockerfile names a floating tag.
+  CARGO_CHEF_DIGEST: sha256:4d92a0744e1fc09016839c7658af38a00157c8d542a1684b32ce60f9a364fd31
   IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch
   # The tag after the Stalwart release: bump it with any change to what is built. p<last patch>-<build of that set>:
   # a new patch resets it (p0018-1), any other change to what is built counts up (p0017-2). Until 0017 it listed every
   # patch's own suffix, and with 0017's it reached 133 characters, past a Docker tag's 128 (MAI-1100).
-  VARIANT: p0018-3
-  # A FIXED image that HAS the expired-ban bug (the last build before 0006), which the ban-expiry check must FAIL
-  # on the bug's own line: that proves the check can fail. ⛔ NEVER bumped with releases: every build after 0006
-  # lacks the bug and PASSES the check, so it could never be the reference. Pinned by tag AND digest, because a tag
-  # could be re-pushed (until MAI-1021 every main build re-pushed the current tag, which untagged this digest).
-  BAN_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:v0.16.24-rusts3-505aded-tenantacl2-filescan3@sha256:6d15a5ade004aadec046b10541dccce7135122d3c8cd5361df61ec6e3822f9db
-  # The same for 0007, 0008 and 0009: the last build before them, which the admin-verbs and no-logo checks must
-  # FAIL on their bugs' own lines. ⛔ NEVER bumped, for the same reason.
-  MAI970_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:v0.16.25-rusts3-505aded-tenantacl2-filescan3-banexpiry1@sha256:e3e1e06a762ef80c4fae432df6a41a6e48bef2648e1cd2f9a9fe38c0bc171324
-  # The same for 0010: the last build before it (production's image until then), which the upload-cap check must FAIL
-  # on its refusals. ⛔ NEVER bumped, for the same reason.
-  MAI1000_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:v0.16.25-rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1@sha256:3386cb1f6a498a2b2a2a18886d566bd4db74bf184d1fcf8738da4d401a9ecc4e
-  # The same for 0011: the last build before it (production's image until then), which the spam-text check must FAIL on
-  # its memory and on the bound itself, and pass on its control set. ⛔ NEVER bumped, for the same reason.
-  MAI1077_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:v0.16.25-rusts3-505aded-tenantacl2-filescan3-banexpiry1-grant2-verbs1-nologo1-bodycap1@sha256:31bb44037de8136c188b22f7ec6b144b846d852f166c7525d5705b7066879ab5
-  # The same for 0012: the last build before it (production's image until then), which the two-step check must FAIL on
-  # each reuse, and pass on its controls. ⛔ NEVER bumped, for the same reason. Pinned by its pinned- tag's digest.
-  MAI997_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:pinned-bee5bddff49d@sha256:bee5bddff49d91a8acec978b85f93541fd91dcf8eccc4d7d8caa326d61e635d0
-  # The same for 0013: the last build before it (production's image until then), which the bounce check must FAIL on the
-  # returned part's type and encoding, and pass on its controls. ⛔ NEVER bumped, for the same reason. Pinned by the tag
-  # that names that digest: production ran MAI-997's branch build, not the release tag's.
-  MAI1127_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:branch-a88e016@sha256:dabddb17455449a4eabc0578ee1ecaddda166b93cadc27355cc001dad7c10e5b
-  # The same for 0014: the last build before it (production's image until then), which the bounce check must FAIL on the
-  # headers past 4 KiB, and pass on its controls. ⛔ NEVER bumped, for the same reason. Pinned by its pinned- tag's digest.
-  MAI1131_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:pinned-8343456bc29d@sha256:8343456bc29d04d0cf8f285d433f73a4a6228d2e5eee1f3119ff0ae14cbef3df
-  # The same for 0015: the last build before it (production's image until then), which reads no level, so the spam-level
-  # check must FAIL on Strict and Lenient and on what 0015 logs, and pass on Normal. ⛔ NEVER bumped, for the same reason.
-  MAI1070_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:pinned-782dcfbd03bb@sha256:782dcfbd03bbd9b75126f5ac25b8cb3a4d6541dfbe1ee5ff116fff15b272060e
-  # The same for -verbs2 (0008 admits revoking an app password by id): the last build before it (production's image
-  # until then), on which the key's revoke is refused, so the admin-verbs check must FAIL on the revoke rows.
-  # ⛔ NEVER bumped, for the same reason. Pinned by its pinned- tag's digest.
-  MAI1018_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:pinned-cc7bd828cb08@sha256:cc7bd828cb08b2482ec4223a8f8b751047e6b68431bd19991b8d6f39f755e506
-  # The same for 0017: the last build before it (production's image until then), on which turning two-step on proves
-  # nothing about the new secret, so the enrolment checks must FAIL. ⛔ NEVER bumped, for the same reason. Pinned by its
-  # pinned- tag's digest.
-  MAI1100_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:pinned-d412c4cdf5e8@sha256:d412c4cdf5e8c4873aea88ef3b80578b91aca2ff76839de52bfb900420f4aca3
-  # The same for 0018: the last build before it (production's image until then), which passes the hook no server headers and
-  # reads no verdict, so the screening check must FAIL on both, and pass on everything a verdict must not do. ⛔ NEVER bumped, for
-  # the same reason. Pinned by its pinned- tag's digest.
-  MAI1072_BUG_REFERENCE_IMAGE: ghcr.io/bill-scheffer/stalwart-r2-patch:pinned-e18fee141b9b@sha256:e18fee141b9b54079cc11a9c92ecb04f85d28bcda013471b9d3aec82007dee51
-  # 0016's check FAILS on MAI1077_BUG_REFERENCE_IMAGE (-bodycap1, the build that introduced the two holes; every build
-  # since carries them unchanged until 0016), so it needs no reference of its own.
+  VARIANT: p0018-1
+  # The bug reference for every patch: plain upstream at the same release, which lacks them all, so each patch's check
+  # must FAIL there on its own bug lines (and its controls PASS), or its pass here proves nothing. One reference, bumped
+  # with STALWART_TAG, replaces the per-patch images of the 0.16 line (MAI-1441): every patch is re-proved on each
+  # release, rather than once against the build before it. Pinned by digest.
+  UPSTREAM_IMAGE: docker.io/stalwartlabs/stalwart:v1.1.1@sha256:5ebdf474b237161742fe4309396af4ae8797c938e8e6eb7e2d4837332c4f9851
 
 jobs:
   build:
@@ -192,7 +128,7 @@ jobs:
       # the first thing a registry cleanup deletes. So a tag that already exists is never re-pushed, and a change to
       # what goes into the image must bump VARIANT; this fails a pull request that makes one without the bump. What
       # goes in: patches/**, any other file of this repo that a step up to the image build names (patch/<path>),
-      # the env: values (the upstream commit, rust-s3, the tag itself), and every step up to and
+      # the env: values (the upstream commit, the tag itself), and every step up to and
       # including the image build, comments aside. The CI-only reference images and this step itself are left out.
       # The package is public, so this reads it without logging in.
       - name: The release tag is new, or already names this content (it is never re-pushed)
@@ -215,7 +151,7 @@ jobs:
             git -C patch show "$1:.github/workflows/build.yml" | awk '
               /^env:/ { on = 1 }
               /^      - / { if (build) exit; skip = /name: The release tag is new/; build = /name: Build with/ }
-              on && !skip && !/^[[:space:]]*(#|$)/ && !/REFERENCE_IMAGE/'
+              on && !skip && !/^[[:space:]]*(#|$)/ && !/(REFERENCE|UPSTREAM)_IMAGE/'
           }
           # This repo's files those steps name: patches/** today. A script added before the build is then covered too.
           refs=$(inputs_of HEAD | { grep -oE '(^|[^[:alnum:]_-])patch/[[:alnum:]_./-]+' || true; } | sed -E 's#^[^p]?patch/##' | sort -u)
@@ -228,43 +164,30 @@ jobs:
           echo "${tag} already names ${digest}, built from ${rev}; nothing that goes into the image changed, so it is not re-pushed"
           echo publish=false >> "$GITHUB_OUTPUT"
 
-      # The R2 DELETE fix is upstream's own now: rust-s3 0.38.0 from crates.io, which Stalwart's lock names. If a later
-      # release moves rust-s3, this fails, and whether the new version still signs DELETE correctly is checked then.
-      - name: rust-s3 is the release carrying the R2 DELETE fix, and the checkout is upstream's, untouched
+      # v1 has its own S3 client (crates/s3), which signs exactly the headers it sends, so no DELETE signs a header it
+      # never sends (rust-s3 #466, this repository's first patch, cannot recur); rust-s3 is gone from the lock. What is
+      # left to hold here is that the checkout is upstream's commit, untouched. R2 deletes are proven on a copy bucket
+      # in MainThrive's rehearsal (MAI-1441), not here: CI holds no R2 credentials.
+      - name: The checkout is upstream's, untouched, and names no rust-s3
         working-directory: stalwart
         run: |
           set -eu
-          got=$(python3 -c '
-          import re
-          s = open("Cargo.lock").read()
-          print(" ".join(f"{v}|{src}" for v, src in re.findall(r"\[\[package\]\]\nname = \"rust-s3\"\nversion = \"([^\"]+)\"\nsource = \"([^\"]+)\"", s)))')
-          [ "$got" = "${RUSTS3_VERSION}|registry+https://github.com/rust-lang/crates.io-index" ] \
-            || { echo "::error::Cargo.lock's rust-s3 is '${got}', not ${RUSTS3_VERSION} from crates.io"; exit 1; }
+          ! grep -q '^name = "rust-s3"$' Cargo.lock || { echo "::error::Cargo.lock names rust-s3 again: re-check R2 DELETE signing"; exit 1; }
           [ -z "$(git status --porcelain)" ] || { echo "::error::the checkout is not upstream's commit as tagged"; git status --porcelain; exit 1; }
 
-      # v0.16.27 names a fork that no longer exists (github.com/stalwartlabs/opentelemetry-rust answers 404; upstream's main has
-      # moved off it). Builds kept working only while the dependency layer stayed cached, and cargo-chef's floating base image
-      # moved, so a build then failed at `cargo chef cook` (MainThrive MAI-1072). The locked commit is fetched from a mirror of
-      # it under this account (MainThrive MAI-1285), a standalone repo rather than a fork, so it does not depend on GitHub keeping
-      # a deleted fork's commit in open-telemetry/opentelemetry-rust's network (which still serves it by id, if the mirror is
-      # lost). Its opentelemetry-proto submodule still comes from open-telemetry. A commit id names its content, so this changes
-      # where it comes from and nothing else: its tarball hashes to cc9d74ba..., as FreeBSD's mail/stalwart016 port records it
-      # for the fork (a check on the content, not a source cargo can fetch). The count fails on
-      # a release that no longer names the fork or names another commit: drop or re-check this step then.
-      # hickory-dns is the same risk one step earlier: v0.16.27 takes it from a fork under the same org, by branch
-      # (stalwartlabs/hickory-dns, stalwart/0.26). It comes from a mirror too (MainThrive MAI-1285), pinned by commit
-      # rather than branch, so cargo resolves the commit the lock names and never a newer one.
+      # hickory-dns comes from a fork under stalwartlabs, by branch (stalwartlabs/hickory-dns, stalwart/0.26), which v1.1.1
+      # still names at the same commit as v0.16.27. It comes from a mirror under this account (MainThrive MAI-1285), pinned by
+      # commit rather than branch, so a deleted or moved fork cannot break a cold-cache build (0.16.27's opentelemetry fork
+      # did, MAI-1072) and cargo resolves the commit the lock names, never a newer one. v1 names no opentelemetry fork: it
+      # dropped those crates for its own exporters. The counts fail on a release that names hickory differently: re-check
+      # this step then.
       # The base image goes with it: upstream's Dockerfile builds on a floating tag, which is how the cached layer was lost and
-      # what would change the compiler under a security fix. It is pinned here to the digest of the last green build.
-      - name: opentelemetry-rust and hickory-dns are the commits Stalwart's lock names, from where those commits still exist, and the builder's base is pinned
+      # what would change the compiler under a security fix. It is pinned here.
+      - name: hickory-dns is the commit Stalwart's lock names, from where that commit still exists, and the builder's base is pinned
         working-directory: stalwart
         run: |
           set -eu
-          GONE=github.com/stalwartlabs/opentelemetry-rust
-          HERE=github.com/Bill-Scheffer/opentelemetry-rust
-          n=$(grep -c "git+https://$GONE#$OTEL_SHA" Cargo.lock || true)
-          [ "$n" = 6 ] || { echo "::error::Cargo.lock names $GONE at $OTEL_SHA $n time(s), not 6"; exit 1; }
-          sed -i "s#$GONE#$HERE#" Cargo.lock crates/common/Cargo.toml
+          ! grep -q 'opentelemetry-rust' Cargo.lock || { echo "::error::Cargo.lock names an opentelemetry-rust fork again: mirror it"; exit 1; }
           HGONE=github.com/stalwartlabs/hickory-dns
           HHERE=github.com/Bill-Scheffer/hickory-dns
           n=$(grep -c "git+https://$HGONE?branch=stalwart%2F0.26#$HICKORY_SHA" Cargo.lock || true)
@@ -277,13 +200,8 @@ jobs:
           [ "$(grep -c "git+https://$HHERE?rev=$HICKORY_SHA#$HICKORY_SHA" Cargo.lock)" = 3 ] || { echo "::error::the lock moved off $HICKORY_SHA"; exit 1; }
           [ "$(grep -c "git = \"https://$HHERE\", rev = \"$HICKORY_SHA\"" Cargo.toml)" = 3 ] || { echo "::error::Cargo.toml does not pin $HICKORY_SHA"; exit 1; }
           got=$(git diff --name-only | sort | tr '\n' ' ')
-          [ "$got" = "Cargo.lock Cargo.toml crates/common/Cargo.toml " ] || { echo "::error::changed files: $got"; exit 1; }
-          ! grep -q "$GONE" Cargo.lock crates/common/Cargo.toml || { echo "::error::$GONE is still named"; exit 1; }
-          [ "$(grep -c "git+https://$HERE#$OTEL_SHA" Cargo.lock)" = 6 ] || { echo "::error::the lock moved off $OTEL_SHA"; exit 1; }
+          [ "$got" = "Cargo.lock Cargo.toml " ] || { echo "::error::changed files: $got"; exit 1; }
           # The commit itself, before a build that would only fail on it later: fetched by id, from there, and compared.
-          got=$(git init -q "$RUNNER_TEMP/otel" && git -C "$RUNNER_TEMP/otel" fetch -q --depth=1 "https://$HERE" "$OTEL_SHA" && git -C "$RUNNER_TEMP/otel" rev-parse FETCH_HEAD) \
-            || { echo "::error::$HERE no longer serves $OTEL_SHA"; exit 1; }
-          [ "$got" = "$OTEL_SHA" ] || { echo "::error::$HERE served $got, not $OTEL_SHA"; exit 1; }
           got=$(git init -q "$RUNNER_TEMP/hickory" && git -C "$RUNNER_TEMP/hickory" fetch -q --depth=1 "https://$HHERE" "$HICKORY_SHA" && git -C "$RUNNER_TEMP/hickory" rev-parse FETCH_HEAD) \
             || { echo "::error::$HHERE no longer serves $HICKORY_SHA"; exit 1; }
           [ "$got" = "$HICKORY_SHA" ] || { echo "::error::$HHERE served $got, not $HICKORY_SHA"; exit 1; }
@@ -292,53 +210,27 @@ jobs:
           sed -i "s#cargo-chef:latest-rust-slim-trixie AS chef#cargo-chef:latest-rust-slim-trixie@$CARGO_CHEF_DIGEST AS chef#" Dockerfile
           grep -qxF "FROM --platform=\$BUILDPLATFORM docker.io/lukemathwalker/cargo-chef:latest-rust-slim-trixie@$CARGO_CHEF_DIGEST AS chef" Dockerfile \
             || { echo "::error::the base image was not pinned"; exit 1; }
-          # Stage them, so the next step's diff under crates/ is 0002 alone.
-          git add -- Cargo.lock Cargo.toml crates/common/Cargo.toml Dockerfile
+          # Stage them, so the next step's diff under crates/ is 0004 alone.
+          git add -- Cargo.lock Cargo.toml Dockerfile
 
-      - name: Apply the tenant-scoped sharing patch, and prove it changed only its own files
-        working-directory: stalwart
-        run: |
-          set -eu
-          P=../patch/patches/0002-tenant-scoped-sharing.patch
-          git apply --check "$P" && git apply "$P"
-          want="crates/imap/src/op/acl.rs crates/jmap/src/addressbook/set.rs crates/jmap/src/api/acl.rs crates/jmap/src/calendar/set.rs crates/jmap/src/file/copy.rs crates/jmap/src/file/set.rs crates/jmap/src/mailbox/set.rs "
-          got=$(git diff --name-only | sort | tr '\n' ' ')
-          [ "$got" = "$want" ] || { echo "::error::changed files: $got"; exit 1; }
-          # The source change is the patch, byte for byte (index lines aside).
-          diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
-            || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
-          # Stage 0002, so the next step's working-tree diff under crates/ is 0003 alone.
-          git add -- crates/
-
-      - name: Apply the tenant-scoped DAV ACL patch, and prove it changed only its own file
-        working-directory: stalwart
-        run: |
-          set -eu
-          P=../patch/patches/0003-tenant-scoped-dav-acl.patch
-          git apply --check "$P" && git apply "$P"
-          # Unstaged: 0003's one file, nothing else.
-          got=$(git diff --name-only | sort | tr '\n' ' ')
-          [ "$got" = "crates/dav/src/common/acl.rs " ] \
-            || { echo "::error::changed files: $got"; exit 1; }
-          diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
-            || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
-          # Stage 0003, so the next step's working-tree diff under crates/ is 0004 alone.
-          git add -- crates/
-
+      # Patches 0002, 0003 and 0006 are upstream's own since v1 and 0014 is folded into 0013 (MAI-1441): their numbers are
+      # left as gaps so the history and README still read. Each step applies one patch to the tree the previous ones left,
+      # requires it to change exactly its own files, and requires the diff to be the patch, byte for byte (index lines
+      # aside), then stages it so the next step's diff is that patch alone.
       - name: Apply the file-write patch (scan and cap), and prove it changed only its own files
         working-directory: stalwart
         run: |
           set -eu
           P=../patch/patches/0004-file-writes-scanned-and-capped.patch
           git apply --check "$P" && git apply "$P"
-          # Its one new file is untracked until marked, and the diff below must see it.
+          # Its new file is untracked until marked, and the diff below must see it.
           git add -N -- crates/common/src/file_scan.rs
           got=$(git diff --name-only | sort | tr '\n' ' ')
-          [ "$got" = "crates/common/src/file_scan.rs crates/common/src/lib.rs crates/dav/src/file/update.rs crates/jmap/src/file/copy.rs crates/jmap/src/file/set.rs " ] \
+          [ "$got" = "crates/common/src/file_scan.rs crates/common/src/lib.rs crates/dav/src/file/update.rs crates/jmap/src/file/writer.rs " ] \
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
-          # Stage 0004 (its new file included), so the next step's diff under crates/ is 0005 alone.
+          # Stage 0004, so the next step's diff is 0005 alone.
           git add -- crates/
 
       - name: Apply the mail-ingest scan patch, and prove it changed only its own files
@@ -352,21 +244,7 @@ jobs:
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
-          # Stage 0005, so the next step's diff under crates/ is 0006 alone.
-          git add -- crates/
-
-      - name: Apply the expired-ban patch, and prove it changed only its own files
-        working-directory: stalwart
-        run: |
-          set -eu
-          P=../patch/patches/0006-expired-ban-replaced.patch
-          git apply --check "$P" && git apply "$P"
-          got=$(git diff --name-only | sort | tr '\n' ' ')
-          [ "$got" = "crates/common/src/cache/reload.rs crates/common/src/network/security.rs " ] \
-            || { echo "::error::changed files: $got"; exit 1; }
-          diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
-            || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
-          # Stage 0006, so the next step's diff under crates/ is 0007 alone.
+          # Stage 0005, so the next step's diff is 0007 alone.
           git add -- crates/
 
       - name: Apply the account-write grant patch, and prove it changed only its own files
@@ -376,11 +254,11 @@ jobs:
           P=../patch/patches/0007-account-writes-within-the-callers-grant.patch
           git apply --check "$P" && git apply "$P"
           got=$(git diff --name-only | sort | tr '\n' ' ')
-          [ "$got" = "crates/jmap/src/registry/mapping/principal.rs crates/jmap/src/registry/set.rs " ] \
+          [ "$got" = "crates/jmap/src/registry/mapping/principal.rs " ] \
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
-          # Stage 0007, so the next step's diff under crates/ is 0008 alone.
+          # Stage 0007, so the next step's diff is 0008 alone.
           git add -- crates/
 
       - name: Apply the admin-verbs patch, and prove it changed only its own files
@@ -404,15 +282,10 @@ jobs:
           P=../patch/patches/0009-no-logo-on-calendar-mail-and-rsvp.patch
           git apply --check "$P" && git apply "$P"
           got=$(git diff --name-only | sort | tr '\n' ' ')
-          T=resources/html-templates
-          [ "$got" = "crates/services/src/task_manager/alarm.rs crates/services/src/task_manager/imip.rs $T/calendar-alarm.html $T/calendar-alarm.html.min $T/calendar-invite.html $T/calendar-invite.html.min $T/calendar-rsvp.html $T/calendar-rsvp.html.min $T/calendar-rsvp.html.min.gz " ] \
+          [ "$got" = "crates/services/src/task_manager/tasks/alarm.rs crates/services/src/task_manager/tasks/imip.rs resources/html-templates/calendar-alarm.html resources/html-templates/calendar-alarm.html.min resources/html-templates/calendar-invite.html resources/html-templates/calendar-invite.html.min " ] \
             || { echo "::error::changed files: $got"; exit 1; }
-          # Binary too: the RSVP page is served from its .min.gz.
-          diff <(git diff --binary -- crates/ resources/ | grep -v '^index ') <(grep -v '^index ' "$P") \
+          diff <(git diff -- crates/ resources/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ and resources/ diff is not exactly the patch"; exit 1; }
-          # Stalwart's own test holds the .gz to the .min; hold it here too, before the long build.
-          cmp <(gzip -dc $T/calendar-rsvp.html.min.gz) $T/calendar-rsvp.html.min \
-            || { echo "::error::calendar-rsvp.html.min.gz does not decompress to calendar-rsvp.html.min"; exit 1; }
           # Stage 0009, so the next step's diff is 0010 alone.
           git add -- crates/ resources/
 
@@ -422,28 +295,28 @@ jobs:
           set -eu
           P=../patch/patches/0010-server-wide-cap-on-large-bodies.patch
           git apply --check "$P" && git apply "$P"
-          # Its one new file is untracked until marked, and the diff below must see it.
+          # Its new file is untracked until marked, and the diff below must see it.
           git add -N -- crates/utils/src/in_flight.rs
           got=$(git diff --name-only | sort | tr '\n' ' ')
           [ "$got" = "crates/dav/src/request.rs crates/http-proto/Cargo.toml crates/http-proto/src/request.rs crates/http/src/request.rs crates/imap-proto/src/parser/mod.rs crates/imap-proto/src/receiver.rs crates/imap/src/core/client.rs crates/imap/src/op/append.rs crates/main/src/main.rs crates/smtp/src/core/mod.rs crates/smtp/src/inbound/session.rs crates/utils/src/in_flight.rs crates/utils/src/lib.rs " ] \
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
-          # Stage 0010 (its new file included), so the next step's diff under crates/ is 0011 alone.
+          # Stage 0010, so the next step's diff is 0011 alone.
           git add -- crates/
 
-      - name: Apply the spam-filter text bound patch, and prove it changed only its own file
+      - name: Apply the spam-filter text bound patch, and prove it changed only its own files
         working-directory: stalwart
         run: |
           set -eu
           P=../patch/patches/0011-spam-filter-analyses-a-bounded-start-of-each-text.patch
           git apply --check "$P" && git apply "$P"
           got=$(git diff --name-only | sort | tr '\n' ' ')
-          [ "$got" = "crates/spam-filter/src/analysis/init.rs " ] \
+          [ "$got" = "crates/spam-filter/src/texts.rs " ] \
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
-          # Stage 0011, so the next step's diff under crates/ is 0012 alone.
+          # Stage 0011, so the next step's diff is 0012 alone.
           git add -- crates/
 
       - name: Apply the two-step code patch, and prove it changed only its own files
@@ -453,14 +326,14 @@ jobs:
           P=../patch/patches/0012-a-two-step-code-is-accepted-once.patch
           git apply --check "$P" && git apply "$P"
           got=$(git diff --name-only | sort | tr '\n' ' ')
-          [ "$got" = "crates/common/src/auth/authentication.rs crates/common/src/lib.rs crates/directory/src/core/secret.rs crates/jmap/src/registry/mapping/account.rs " ] \
+          [ "$got" = "crates/common/src/auth/authentication.rs crates/common/src/lib.rs crates/directory/src/core/secret.rs crates/jmap/src/registry/mapping/account.rs crates/jmap/src/registry/mapping/passkey.rs " ] \
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
-          # Stage 0012, so the next step's diff under crates/ is 0013 alone.
+          # Stage 0012, so the next step's diff is 0013 alone.
           git add -- crates/
 
-      - name: Apply the bounce returned-headers patch, and prove it changed only its own file
+      - name: Apply the bounce returned-headers patch (0014's header block folded in), and prove it changed only its own files
         working-directory: stalwart
         run: |
           set -eu
@@ -471,24 +344,10 @@ jobs:
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
-          # Stage 0013, so the next step's diff under crates/ is 0014 alone.
+          # Stage 0013, so the next step's diff is 0015 alone.
           git add -- crates/
 
-      - name: Apply the bounce header-block patch, and prove it changed only its own file
-        working-directory: stalwart
-        run: |
-          set -eu
-          P=../patch/patches/0014-bounces-return-the-whole-header-block.patch
-          git apply --check "$P" && git apply "$P"
-          got=$(git diff --name-only | sort | tr '\n' ' ')
-          [ "$got" = "crates/smtp/src/queue/dsn.rs " ] \
-            || { echo "::error::changed files: $got"; exit 1; }
-          diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
-            || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
-          # Stage 0014, so the next step's diff under crates/ is 0015 alone.
-          git add -- crates/
-
-      - name: Apply the spam-level patch, and prove it changed only its own file
+      - name: Apply the spam-level patch, and prove it changed only its own files
         working-directory: stalwart
         run: |
           set -eu
@@ -499,7 +358,7 @@ jobs:
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
-          # Stage 0015, so the next step's diff under crates/ is 0016 alone.
+          # Stage 0015, so the next step's diff is 0016 alone.
           git add -- crates/
 
       - name: Apply the stalled-body patch, and prove it changed only its own files
@@ -513,7 +372,7 @@ jobs:
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
-          # Stage 0016, so the next step's diff under crates/ is 0017 alone.
+          # Stage 0016, so the next step's diff is 0017 alone.
           git add -- crates/
 
       - name: Apply the two-step enrolment patch, and prove it changed only its own files
@@ -527,7 +386,7 @@ jobs:
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
-          # Stage 0017, so the next step's diff under crates/ is 0018 alone.
+          # Stage 0017, so the next step's diff is 0018 alone.
           git add -- crates/
 
       - name: Apply the screening patch, and prove it changed only its own files
@@ -541,6 +400,8 @@ jobs:
             || { echo "::error::changed files: $got"; exit 1; }
           diff <(git diff -- crates/ | grep -v '^index ') <(grep -v '^index ' "$P") \
             || { echo "::error::the crates/ diff is not exactly the patch"; exit 1; }
+          # Stage 0018, the last.
+          git add -- crates/
 
       - name: Swap, as Stalwart's own CI adds for its release build
         run: |
@@ -566,7 +427,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ env.STALWART_TAG }}-${{ env.VARIANT }}
-            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with tenant-scoped sharing (JMAP, IMAP, WebDAV), scanned, capped file writes, expired bans replaced, account writes within the caller's grant, admin verbs without impersonate, no logo on calendar mail, and a server-wide cap on large uploads and messages, and a bounded spam-filter text analysis, and a two-step code accepted once, and bounces returning the original's headers as text/rfc822-headers, up to 64 KiB, a byte that is not UTF-8 replaced, and a spam level per account, and turning two-step on proving the new secret, and a screening verdict acted on at delivery per account
+            org.opencontainers.image.description=Stalwart ${{ env.STALWART_TAG }} with scanned, capped file writes and scanned mail writes, account writes and group joins within the caller's grant, admin verbs without impersonate, no logo on calendar mail, a server-wide cap on large uploads and messages that stalled bodies cannot hold, a data: image that leaves the spam filter's text budget alone, a two-step code accepted once and turning two-step on proving the new secret, bounces returning the original's headers as text/rfc822-headers up to 64 KiB, a spam level per account, and a screening verdict acted on at delivery per account
             org.opencontainers.image.licenses=AGPL-3.0-only
           cache-from: type=gha
           # Only main writes the cache: a pull request reads main's, and a Rust build cache written per
@@ -598,196 +459,156 @@ jobs:
           [ "$ours" = 0 ] || { echo "::error::the built image carries the x86-64-v2 start-up check (grep: '${ours}')"; exit 1; }
           echo "upstream's image carries the check (${up}); this build does not"
 
+      # Each check runs on the built image, then on UPSTREAM_IMAGE, plain upstream at the same release, where it must FAIL on
+      # its patch's own lines: the lines plain v1.1.1 printed (MAI-1441), less those that carry a run's own values. A
+      # check that cannot fail there proves nothing about the patch.
+      # 0002 and 0003 retired: upstream's own since v1 (it passes on UPSTREAM_IMAGE too). Kept as a guard against upstream.
       - name: Sharing never crosses tenants (end to end, the built image)
         run: bash patch/scripts/e2e-tenant-sharing.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
 
       - name: Every stored file and every message written into a mailbox is scanned (end to end, a real clamd)
         run: bash patch/scripts/e2e-file-scan.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
 
+      - name: The same check FAILS on plain upstream at the same release, on 0004 and 0005's own lines
+        run: |
+          bash patch/scripts/previous-must-fail.sh "${UPSTREAM_IMAGE}" patch/scripts/e2e-file-scan.sh \
+            'FAIL WebDAV: and nothing was stored' \
+            'FAIL JMAP: and nothing was stored'
+
+      # 0006 retired: upstream's own since v1 (it passes on UPSTREAM_IMAGE too; it fails on plain 0.16.27, measured in MAI-1441). Kept as a guard against upstream.
       - name: A ban that expired is enforced again on the next one (end to end, the built image)
         run: bash patch/scripts/e2e-ban-expiry.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
-
-      - name: The same check FAILS on the fixed bug-reference image, on the bug itself, so it can tell the two apart
-        run: bash patch/scripts/previous-must-fail.sh "${BAN_BUG_REFERENCE_IMAGE}"
 
       - name: No takeover through a narrow key, and the admin verbs without mail reach (end to end, the built image)
         run: bash patch/scripts/e2e-admin-verbs.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
 
-      - name: The same check FAILS on the last image before 0007 and 0008, on both bugs, so it can tell the two apart
+      - name: The same check FAILS on plain upstream at the same release, on 0007 and 0008's own lines
         run: |
-          bash patch/scripts/previous-must-fail.sh "${MAI970_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-admin-verbs.sh \
-            'FAIL 0007: the key cannot destroy an Admin' \
+          bash patch/scripts/previous-must-fail.sh "${UPSTREAM_IMAGE}" patch/scripts/e2e-admin-verbs.sh \
             'FAIL 0007: the key cannot add a User to a group holding a permission it lacks' \
-            'FAIL forward proof: carol got NO copy: the forward stopped'
-
-      - name: The same check FAILS on the last image before -verbs2, on the revoke by id and the concurrent pair
-        run: |
-          bash patch/scripts/previous-must-fail.sh "${MAI1018_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-admin-verbs.sh \
+            "FAIL 0008 SieveScript/get: shows alice's forward as the active script" \
+            'FAIL 0008 SieveScript/query: the untenanted key reaches bob in tenant two too (any tenant)' \
+            "FAIL 0008 SieveScript/set update: alice's spare script takes the key's upload" \
+            "FAIL 0008: the key cannot read back an upload it did not make (alice's own)" \
+            "FAIL 0008 SieveScript/set destroy: the ACTIVE forward cannot be deleted (upstream's rule)" \
+            'FAIL 0008: alice has no active script now' \
+            'FAIL forward proof: carol got NO copy: the forward stopped' \
+            'FAIL 0008 SieveScript/set activate: allowed on alice' \
+            'FAIL 0008 SieveScript/set destroy: the deactivated forward is deleted' \
+            'FAIL 0008 VacationResponse/set: alice reads the out-of-office the key set' \
+            'FAIL 0008 Identity/set: allowed on alice' \
             'FAIL 0008 x:AppPassword/set destroy: the key revokes an app password on alice by id' \
-            'FAIL 0008: two concurrent revokes remove exactly the two named app passwords, five rounds' \
-            'PASS 0008 x:AppPassword/set create: the import credential is issued on alice' \
-            'PASS 0008 x:AppPassword/set destroy: refused on an Admin (opsadm)' \
-            'PASS 0008 x:AppPassword/set destroy: refused on alice without sysAccountUpdate' \
-            'PASS 0008: x:AppPassword/set update on alice is still refused (issue and revoke only)'
+            'FAIL 0008: two concurrent revokes remove exactly the two named app passwords, five rounds'
 
-      - name: No logo on a calendar invitation, a reminder or the RSVP page (end to end, the built image)
+      - name: No logo on a calendar invitation or a reminder (end to end, the built image)
         run: bash patch/scripts/e2e-no-logo.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
 
-      - name: The same check FAILS on the last image before 0009, on the logo itself, so it can tell the two apart
+      - name: The same check FAILS on plain upstream at the same release, on 0009's own lines
         run: |
-          bash patch/scripts/previous-must-fail.sh "${MAI970_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-no-logo.sh \
+          bash patch/scripts/previous-must-fail.sh "${UPSTREAM_IMAGE}" patch/scripts/e2e-no-logo.sh \
             'FAIL the invitation references no cid:logo' \
-            'FAIL the reminder references no cid:logo' \
-            'FAIL the RSVP page carries no Stalwart logo SVG'
+            'FAIL the reminder references no cid:logo'
 
       - name: Large bodies and large messages held at once stay within their byte budgets, server-wide, refused retryably past them (end to end, the built image)
         run: bash patch/scripts/e2e-upload-cap.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
 
-      - name: The same check FAILS on the last image before 0010, on its refusals, so it can tell the two apart
+      - name: The same check FAILS on plain upstream at the same release, on 0010's own lines
         run: |
-          bash patch/scripts/previous-must-fail.sh "${MAI1000_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-upload-cap.sh \
+          bash patch/scripts/previous-must-fail.sh "${UPSTREAM_IMAGE}" patch/scripts/e2e-upload-cap.sh \
             'FAIL first: with 2 large uploads in flight, a third WebDAV PUT from another account is refused retryably' \
+            'FAIL first: the WebDAV refusal says when to retry' \
             'FAIL first: and a third JMAP upload from another account too' \
+            'FAIL again: with 2 large uploads in flight, a third WebDAV PUT from another account is refused retryably' \
+            'FAIL again: the WebDAV refusal says when to retry' \
+            'FAIL again: and a third JMAP upload from another account too' \
             'FAIL with 2 large messages in flight, a third by SMTP DATA is refused with 452 (the sender retries)' \
             'FAIL and one by SMTP BDAT' \
             'FAIL and an IMAP APPEND, before its literal is sent' \
-            'FAIL and an IMAP APPEND with a LITERAL+ literal, read and dropped'
+            'FAIL and an IMAP APPEND with a LITERAL+ literal, read and dropped' \
+            'FAIL after a 452, the same session starts a new message' \
+            'FAIL a pipelined BDAT after a refused chunk is refused too' \
+            'FAIL a MULTIAPPEND refused mid-way runs none of the rest of its line'
 
       - name: The spam filter analyses a bounded start of each message's text, and ordinary mail scores as before (end to end, the built image)
         run: bash patch/scripts/e2e-spam-text-cap.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
 
-      # The control set's verdict is required too: it scores the same on the image before 0011 (each control is listed
-      # in the log).
-      - name: The same check FAILS on the last image before 0011, on its memory and its bounds, and its control set PASSES there
+      - name: The same check FAILS on plain upstream at the same release, on 0011's own lines
         run: |
-          bash patch/scripts/previous-must-fail.sh "${MAI1077_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-spam-text-cap.sh \
-            'FAIL and receiving, filtering and delivering it costs under 150 MiB, not ~40 times its text' \
-            'FAIL a URL past the first 512 KiB of a text part is not analysed' \
-            'FAIL a URL at the start of a third text part, past the first 1 MiB of the message, is not analysed' \
-            "FAIL a URL past the first 512 KiB of an HTML part's text is not analysed" \
-            'PASS the control set scores as it did before the patch'
+          bash patch/scripts/previous-must-fail.sh "${UPSTREAM_IMAGE}" patch/scripts/e2e-spam-text-cap.sh \
+            "FAIL control 'the newsletter with an inline image' scores as it did before the patch" \
+            'FAIL the control set scores as it did before the patch'
 
       - name: A two-step code is accepted once, at sign-in and to confirm a change, and turning two-step on proves the new secret, with the in-memory store in the data store and in Valkey (end to end, the built image)
         run: bash patch/scripts/e2e-totp-replay.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
 
-      - name: The same check FAILS on the last image before 0012, on each reuse in both stores, and its controls PASS there
+      - name: The same check FAILS on plain upstream at the same release, on 0012 and 0017's own lines
         run: |
-          bash patch/scripts/previous-must-fail.sh "${MAI997_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-totp-replay.sh \
+          bash patch/scripts/previous-must-fail.sh "${UPSTREAM_IMAGE}" patch/scripts/e2e-totp-replay.sh \
             'FAIL [rocksdb] the same code a second time, in the same window, is refused' \
             'FAIL [rocksdb] a code that confirmed a password change does not sign in again' \
             'FAIL [rocksdb] a code already used does not confirm a password change, and says why' \
-            'PASS [rocksdb] every control passes' \
-            'FAIL [valkey] the same code a second time, in the same window, is refused' \
-            'FAIL [valkey] a code that confirmed a password change does not sign in again' \
-            'FAIL [valkey] a code already used does not confirm a password change, and says why' \
-            'PASS [valkey] every control passes' \
-            'PASS [valkey] control: the in-memory store is Valkey'
-
-      - name: The same check FAILS on the last image before 0017, on each enrolment check in both stores, and its controls PASS there
-        run: |
-          bash patch/scripts/previous-must-fail.sh "${MAI1100_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-totp-replay.sh \
             'FAIL [rocksdb] turning two-step on with no code is refused, and says why' \
             'FAIL [rocksdb] turning two-step on with a code from another secret is refused, and says why' \
             'FAIL [rocksdb] the code that turned two-step on does not sign in again' \
             'FAIL [rocksdb] replacing a secret that is on is refused, and says why' \
-            'PASS [rocksdb] the same code a second time, in the same window, is refused' \
-            'PASS [rocksdb] every control passes' \
+            'FAIL [valkey] the same code a second time, in the same window, is refused' \
+            'FAIL [valkey] a code that confirmed a password change does not sign in again' \
+            'FAIL [valkey] a code already used does not confirm a password change, and says why' \
             'FAIL [valkey] turning two-step on with no code is refused, and says why' \
             'FAIL [valkey] turning two-step on with a code from another secret is refused, and says why' \
             'FAIL [valkey] the code that turned two-step on does not sign in again' \
-            'FAIL [valkey] replacing a secret that is on is refused, and says why' \
-            'PASS [valkey] the same code a second time, in the same window, is refused' \
-            'PASS [valkey] every control passes' \
-            'PASS [valkey] control: the in-memory store is Valkey'
+            'FAIL [valkey] replacing a secret that is on is refused, and says why'
 
       - name: A bounce returns the original's headers as text/rfc822-headers, byte for byte, 7bit or 8bit, a lone CR ended as a line, past 4 KiB up to 64 KiB (end to end, the built image)
         run: bash patch/scripts/e2e-dsn-headers.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
 
-      - name: The same check FAILS on the last image before 0013, on the part's type and encoding, and its controls PASS there
+      - name: The same check FAILS on plain upstream at the same release, on 0013's own lines
         run: |
-          bash patch/scripts/previous-must-fail.sh "${MAI1127_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-dsn-headers.sh \
+          bash patch/scripts/previous-must-fail.sh "${UPSTREAM_IMAGE}" patch/scripts/e2e-dsn-headers.sh \
             'FAIL the ascii bounce returns the headers as text/rfc822-headers, not message/rfc822' \
             'FAIL the ascii bounce returns every header byte for byte, in 7bit' \
-            "PASS control: the ascii bounce's third part carries the original's Message-ID" \
             'FAIL the utf8 bounce returns the headers as text/rfc822-headers, not message/rfc822' \
             'FAIL the utf8 bounce returns every header byte for byte, in 8bit' \
-            "PASS control: the utf8 bounce's third part carries the original's Message-ID" \
             'FAIL the longline bounce returns the headers as text/rfc822-headers, not message/rfc822' \
-            "PASS control: the longline bounce's third part carries the original's Message-ID" \
             'FAIL the lonecr bounce returns the headers as text/rfc822-headers, not message/rfc822' \
             'FAIL the lonecr bounce ends a lone CR as a line: every CR and LF in its 7bit part is a CRLF' \
-            "PASS control: the lonecr bounce's third part carries the original's Message-ID"
-
-      - name: The same check FAILS on the last image before 0014, on the headers past 4 KiB and a byte that is not UTF-8, and its controls PASS there
-        run: |
-          bash patch/scripts/previous-must-fail.sh "${MAI1131_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-dsn-headers.sh \
-            "PASS setup: the gmail original's From, Subject and Message-ID start past byte 4096 of its headers" \
-            "PASS control: the gmail bounce's third part starts with the original's first header" \
             "FAIL the gmail bounce returns the original's From, Subject and Message-ID" \
+            'FAIL the gmail bounce returns the headers as text/rfc822-headers, not message/rfc822' \
             'FAIL the gmail bounce returns every header byte for byte, in 7bit' \
-            "PASS setup: the big original's From, Subject and Message-ID start past byte 4096 of its headers" \
-            "PASS control: the big bounce's third part starts with the original's first header" \
             "FAIL the big bounce returns the original's From, Subject and Message-ID" \
+            'FAIL the big bounce returns the headers as text/rfc822-headers, not message/rfc822' \
             'FAIL the big bounce returns every header byte for byte, in 7bit' \
-            "PASS control: the huge bounce's third part carries the original's Message-ID" \
+            'FAIL the huge bounce returns the headers as text/rfc822-headers, not message/rfc822' \
             'FAIL the huge bounce returns its headers up to the 64 KiB cap, cut at a whole line' \
-            "PASS control: the latin1 bounce reports its own recipient" \
-            'FAIL the latin1 bounce returns its headers, the byte that is not UTF-8 replaced, in 8bit' \
-            'PASS the ascii bounce returns every header byte for byte, in 7bit' \
-            'PASS the lonecr bounce ends a lone CR as a line: every CR and LF in its 7bit part is a CRLF'
+            'FAIL the latin1 bounce returns the headers as text/rfc822-headers, not message/rfc822' \
+            'FAIL the latin1 bounce returns its headers, the byte that is not UTF-8 replaced, in 8bit'
 
       - name: An account's spam level moves its Junk line, with a webmail rule and without one, and a level that cannot be read delivers at Normal (end to end, the built image)
         run: bash patch/scripts/e2e-spam-level.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
 
-      - name: The same check FAILS on the last image before 0015, on Strict, Lenient and what 0015 logs, and Normal PASSES there
+      - name: The same check FAILS on plain upstream at the same release, on 0015's own lines
         run: |
-          bash patch/scripts/previous-must-fail.sh "${MAI1070_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-spam-level.sh \
-            "PASS setup: every low message scores from 4.0 to 5.0, between Strict's line and Normal's" \
-            "PASS setup: every high message scores from 5.0 to 7.0, between Normal's line and Lenient's" \
+          bash patch/scripts/previous-must-fail.sh "${UPSTREAM_IMAGE}" patch/scripts/e2e-spam-level.sh \
             'FAIL Strict (40): the low message goes to Junk, Yes, and the folder rule does not run' \
-            'PASS control: Strict (40): the high message goes to Junk, Yes' \
-            'PASS control: Normal (no row): the low message is filed by the rule, No' \
-            'PASS control: Normal (no row): the high message goes to Junk, Yes' \
-            'PASS control: Lenient (70): the low message is filed by the rule, No' \
             'FAIL Lenient (70): the high message is filed by the rule, No, not Junk' \
             'FAIL Strict (40) with no script: the low message goes to Junk, Yes' \
-            'PASS control: Strict (40) with no script: the high message goes to Junk, Yes' \
-            'PASS control: Lenient (70) with no script: the low message stays in the Inbox, No' \
             'FAIL Lenient (70) with no script: the high message stays in the Inbox, No, not Junk' \
-            'PASS a row that is not a line (0) delivers at Normal: the low message is filed by the rule, No' \
-            'PASS a row that is not a line (0) delivers at Normal: the high message goes to Junk, Yes' \
-            'PASS a row that is not a line (100) delivers at Normal: the low message is filed by the rule, No' \
-            'PASS a row that is not a line (100) delivers at Normal: the high message goes to Junk, Yes' \
-            'PASS a row that is not a line (strict) delivers at Normal: the low message is filed by the rule, No' \
-            'PASS a row that is not a line (strict) delivers at Normal: the high message goes to Junk, Yes' \
-            'PASS with the lookup store unavailable, the message is delivered at once, not deferred' \
-            'PASS control: and at Normal: the low message is filed by the rule, No' \
-            "PASS control: Stalwart's log records every delivery" \
             'FAIL the failed lookup is logged' \
             'FAIL a row that is not a line is logged'
 
       - name: A client that stops sending holds no budget beyond what it sent, an IMAP literal refused partway leaves its session usable, and a body or literal idle 5 s, or trickling below 16 KiB/s, is ended (end to end, the built image)
         run: bash patch/scripts/e2e-stalled-bodies.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
 
-      # The controls are required too: they pass on -bodycap1, so the failures are the two holes and not a broken rig.
-      - name: The same check FAILS on -bodycap1, on each hold, and its controls PASS there
+      - name: The same check FAILS on plain upstream at the same release, on 0016's own lines
         run: |
-          bash patch/scripts/previous-must-fail.sh "${MAI1077_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-stalled-bodies.sh \
-            'PASS two clients each declare a 48 MiB sync literal and are told to send it' \
-            'FAIL while two 48 MiB sync literals are declared and send nothing, a 52 MiB message is accepted' \
-            'FAIL the literal refused partway gave back what it held at once, and the one still declared holds nothing: a 97 MiB message is accepted' \
+          bash patch/scripts/previous-must-fail.sh "${UPSTREAM_IMAGE}" patch/scripts/e2e-stalled-bodies.sh \
             'FAIL a stalled literal sent later, while the budget is full, is refused partway and read to its end' \
-            'PASS and its session is still usable' \
             'FAIL a literal that stops partway is ended after 5 s, with its session' \
-            'FAIL and what it held comes back: a 97 MiB message is accepted' \
             'FAIL a literal that trickles below 16 KiB/s after the 5 s grace is refused, read to its end' \
-            'PASS and its session is still usable after the trickle' \
-            'PASS while two stalled uploads hold 26 MiB, a third is refused (the budget is held)' \
-            'FAIL and its budget comes back: a following WebDAV upload is accepted' \
+            'FAIL while two stalled uploads hold 26 MiB, a third is refused (the budget is held)' \
             'FAIL an HTTP body that sends nothing for longer than 5 s is ended' \
             'FAIL a stalled JMAP upload is ended the same way' \
-            'FAIL an HTTP body that trickles below 16 KiB/s after the 5 s grace is ended with 408' \
-            'PASS a slow body that keeps sending (1 MiB every 3 s) is not ended'
+            'FAIL an HTTP body that trickles below 16 KiB/s after the 5 s grace is ended with 408'
 
       # ⛔ The release tag is pushed only from main (a push, or a dispatch on main). A dispatch from any
       # other branch pushes the same tested image under branch-<short sha> alone, never the release tag,
@@ -803,47 +624,20 @@ jobs:
       - name: The hook is passed the server's headers, and a junk verdict is acted on only by an account that opted in, read from the topmost copy of mail the spam filter scored (end to end, the built image)
         run: bash patch/scripts/e2e-spam-screen.sh "${IMAGE}:${STALWART_TAG}-${VARIANT}"
 
-      - name: The same check FAILS on the last image before 0018, on the server headers, each junk verdict and the failed lookup's log, and everything a verdict must not do PASSES there
+      - name: The same check FAILS on plain upstream at the same release, on 0018's own lines
         run: |
-          bash patch/scripts/previous-must-fail.sh "${MAI1072_BUG_REFERENCE_IMAGE}" patch/scripts/e2e-spam-screen.sh \
+          bash patch/scripts/previous-must-fail.sh "${UPSTREAM_IMAGE}" patch/scripts/e2e-spam-screen.sh \
             'FAIL the hook is passed Authentication-Results' \
             'FAIL the hook is passed Received-SPF' \
             'FAIL the hook is passed X-Spam-Result' \
             'FAIL the hook is passed X-Spam-Score' \
-            "PASS control: the message's own headers carry none of them" \
-            'PASS setup: a low message scores from 4.0 to 5.0' \
             "FAIL a junk verdict: the spam-screen account's copy goes to Junk, Yes" \
-            'PASS control: a junk verdict: the account with no row keeps its copy in the Inbox, No' \
-            "PASS control: a pass verdict: the spam-screen account's copy stays in the Inbox, No" \
-            'PASS control: a pass verdict: the account with no row keeps its copy in the Inbox, No' \
             "FAIL the service's junk over two forged passes: Junk, Yes, one verdict stored" \
-            "PASS control: the service's pass over two forged junks: Inbox, No, one verdict stored" \
-            'PASS control: a forged pass changes nothing: a high message still goes to Junk, Yes' \
-            'PASS control: a forged pass changes nothing: a low message stays in the Inbox, No' \
-            'PASS control: a forged junk to an account with no row: Inbox, No' \
-            'PASS control: pass above junk: only the topmost counts: Inbox, No' \
             'FAIL junk above pass: only the topmost counts: Junk, Yes' \
             "FAIL the header's name in any case, its value folded: Junk, Yes" \
-            "PASS control: a verdict that cannot be read (no version) leaves Stalwart's decision: Inbox, No" \
-            "PASS control: a verdict that cannot be read (another version) leaves Stalwart's decision: Inbox, No" \
-            "PASS control: a verdict that cannot be read (capitals) leaves Stalwart's decision: Inbox, No" \
-            "PASS control: a verdict that cannot be read (a third tag) leaves Stalwart's decision: Inbox, No" \
-            "PASS control: a verdict that cannot be read (a longer word) leaves Stalwart's decision: Inbox, No" \
-            "PASS control: a verdict that cannot be read (empty) leaves Stalwart's decision: Inbox, No" \
             'FAIL a junk verdict with a webmail folder rule: Junk, Yes, and the rule does not run' \
-            'PASS control: a pass verdict with a webmail folder rule: the rule files it, No' \
-            'PASS control: a pass verdict at Lenient: a high message stays in the Inbox, No (the level still applies)' \
-            'FAIL a junk verdict at Lenient: the same high message goes to Junk, Yes' \
-            'PASS control: the forwarding account (no row) keeps its copy in the Inbox, No' \
-            'PASS control: the forwarded copy reached the spam-screen account still carrying the old verdict' \
-            'PASS a forward carrying an old junk verdict is ignored: the copy stays in the Inbox' \
-            "PASS control: a signed-in user's message reached the spam-screen account carrying a typed verdict" \
-            "PASS a typed verdict on a signed-in user's message is ignored: Inbox" \
-            'PASS with the lookup store unavailable, the message is delivered at once, not deferred' \
-            'PASS control: and as not opted in, despite the junk verdict: Inbox, No' \
-            'FAIL the failed lookup is logged, once' \
-            "PASS control: the message's body is never logged" \
-            "PASS control: Stalwart's log records deliveries"
+            'FAIL control: a pass verdict at Lenient: a high message stays in the Inbox, No (the level still applies)' \
+            'FAIL the failed lookup is logged, once'
 
       - name: Push, only after every check passed
         if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
@@ -868,5 +662,4 @@ jobs:
             echo "- tag: \`${tag}\` (from \`${GITHUB_REF}\` @ \`${GITHUB_SHA}\`)"
             echo "- digest: \`${digest#*@}\`"
             echo "- stalwart: \`${STALWART_TAG}\` @ \`${STALWART_SHA}\`"
-            echo "- rust-s3: \`${RUSTS3_VERSION}\` (crates.io)"
           } >> "$GITHUB_STEP_SUMMARY"

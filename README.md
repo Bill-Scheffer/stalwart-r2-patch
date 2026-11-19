@@ -1,15 +1,40 @@
 # stalwart-r2-patch
 
-[Stalwart](https://github.com/stalwartlabs/stalwart) built from its own release source with **seventeen**
-changes: **sharing never crosses tenants**, stored files
-and mail written into a mailbox are **scanned**, a ban that expired is **enforced again**, a narrow
-key **cannot take over an Admin**, an operator can run **admin verbs on a mailbox without reading
-its mail**, calendar mail carries **no Stalwart logo**, a burst of large uploads or messages is **refused, not an OOM**, the spam filter reads a
-**bounded start** of each message's text, a two-step code is **accepted once**, and a bounce returns the original's
-headers **as `text/rfc822-headers`**, **up to 64 KiB** of them, none dropped for a byte that is not UTF-8, and each
-account has **its own spam level**, a client that stops sending **holds no budget**, and turning two-step on
-**proves the new secret**, and an account that opted in to screening **acts on a junk verdict**. The first change, deleting blobs from **Cloudflare R2**, is upstream's own since
-v0.16.26 (below).
+[Stalwart](https://github.com/stalwartlabs/stalwart) **v1.1.1** built from its own release source with **thirteen**
+patches: stored files and mail written into a mailbox are **scanned**, a narrow key **cannot put a user into a group
+beyond its grant**, an operator can run **admin verbs on a mailbox without reading its mail**, calendar mail carries **no
+Stalwart logo**, a burst of large uploads or messages is **refused, not an OOM**, and a client that stops sending
+**holds no budget**, a large inline image **leaves the spam filter's text budget alone**, a two-step code is **accepted
+once** and turning two-step on **proves the new secret**, a bounce returns the original's headers **as
+`text/rfc822-headers`**, **up to 64 KiB** of them, each account has **its own spam level**, and an account that opted in
+to screening **acts on a junk verdict**.
+
+## On Stalwart v1 (MainThrive MAI-1441)
+
+Stalwart v1.0 (2026-10-26) changed the storage layout, the settings schema and much of the code under every patch, so
+the stack was re-authored onto v1.1.1 rather than rebased: on the 0.16.27 stack, 111 of 164 hunks did not apply. Every
+patch's own end-to-end script was run against **plain upstream v1.1.1** first. A patch is retired only where its script
+passes there **and** still fails on plain 0.16.27 (so the script can still tell the two apart):
+
+| Change | On v1 |
+|---|---|
+| 1. R2 DELETE signing (rust-s3 #466) | **retired**: v1 has its own S3 client, which signs only the headers it sends |
+| 2, 3. sharing never crosses tenants (JMAP, IMAP, WebDAV ACL) | **retired**: upstream refuses another tenant's grantee, with or without a licence (23/23 on plain v1.1.1; 13 fail on plain 0.16.27) |
+| 4, 5. files and mail written into a mailbox scanned | re-authored; JMAP's file checks moved to v1's `FileNodeWriter::resolve_blob` |
+| 6. an expired ban enforced again | **retired**: upstream's own. v1 resets the failure count on a ban, so a second ban is earned afresh |
+| 7. writes within the caller's grant | **narrowed** to the group half; the account half is v1's `validate_account_access` |
+| 8. admin verbs without `impersonate` | re-authored |
+| 9. no logo on calendar mail | **narrowed** to invitations and reminders; v1's RSVP page carries no logo |
+| 10, 16. budgets for large bodies, and stalled bodies hold none | re-authored beside v1's own buffered-memory budget, which counts all mail and bounds no HTTP upload |
+| 11. the spam filter's text bound | **narrowed** to a data: image payload leaving an HTML part's budget alone; v1's `MessageTexts` bounds the rest |
+| 12, 17. a two-step code accepted once; turning two-step on proves the secret | re-authored; registering a passkey (new in v1.1) spends a code too |
+| 13, 14. bounce headers | 14 **folded into** 13 (v1's DSN code puts both on the same lines) |
+| 15. spam level | re-authored |
+| 18. screening verdict | re-authored |
+
+The sections below describe each change as it was made on the 0.16 line, with what was measured then. The build proves
+every remaining patch on each release against plain upstream at that release (`UPSTREAM_IMAGE` in `build.yml`): its
+script must fail there on its own lines.
 
 ## The problem
 
