@@ -1,8 +1,8 @@
 diff --git a/crates/common/src/auth/permissions.rs b/crates/common/src/auth/permissions.rs
-index b02f11a..e0d8494 100644
+index 6ea2d9b..8761b14 100644
 --- a/crates/common/src/auth/permissions.rs
 +++ b/crates/common/src/auth/permissions.rs
-@@ -145,6 +145,47 @@ impl Server {
+@@ -165,6 +165,47 @@ impl Server {
      }
  }
  
@@ -51,18 +51,18 @@ index b02f11a..e0d8494 100644
      pub fn can_grant_permissions(
          &self,
 diff --git a/crates/jmap/src/api/request.rs b/crates/jmap/src/api/request.rs
-index 8ccd544..c58c225 100644
+index 59a3f9c..35fc52e 100644
 --- a/crates/jmap/src/api/request.rs
 +++ b/crates/jmap/src/api/request.rs
-@@ -47,6 +47,7 @@ use crate::{
- };
- use common::{Server, auth::AccessToken};
+@@ -51,6 +51,7 @@ use crate::{
+ use common::{Server, auth::AccessToken, network::memory::MemoryReservation};
+ use compact_str::format_compact;
  use http_proto::HttpSessionData;
 +use registry::schema::prelude::ObjectType;
  use jmap_proto::{
      request::{
          Call, CopyRequestMethod, GetRequestMethod, INVALID_ACCOUNT_ID, ParseRequestMethod,
-@@ -270,7 +271,7 @@ impl RequestHandler for Server {
+@@ -303,7 +304,7 @@ impl RequestHandler for Server {
                  }
                  GetRequestMethod::Identity(mut req) => {
                      resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
@@ -71,14 +71,16 @@ index 8ccd544..c58c225 100644
  
                      self.identity_get(*req).await?.into()
                  }
-@@ -286,13 +287,13 @@ impl RequestHandler for Server {
+@@ -319,7 +320,7 @@ impl RequestHandler for Server {
                  }
                  GetRequestMethod::Sieve(mut req) => {
                      resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
 -                    access_token.assert_is_member(req.account_id)?;
 +                    assert_can_administer(self, access_token, req.account_id).await?;
  
-                     self.sieve_script_get(*req).await?.into()
+                     self.sieve_script_get(*req, access_token, using)
+                         .await?
+@@ -327,7 +328,7 @@ impl RequestHandler for Server {
                  }
                  GetRequestMethod::VacationResponse(mut req) => {
                      resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
@@ -87,16 +89,16 @@ index 8ccd544..c58c225 100644
  
                      self.vacation_response_get(*req).await?.into()
                  }
-@@ -399,7 +400,7 @@ impl RequestHandler for Server {
+@@ -441,7 +442,7 @@ impl RequestHandler for Server {
                  }
                  QueryRequestMethod::Sieve(mut req) => {
                      resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
 -                    access_token.assert_is_member(req.account_id)?;
 +                    assert_can_administer(self, access_token, req.account_id).await?;
  
-                     self.sieve_script_query(*req).await?.into()
-                 }
-@@ -484,7 +485,7 @@ impl RequestHandler for Server {
+                     self.sieve_script_query(*req, access_token, using)
+                         .await?
+@@ -535,7 +536,7 @@ impl RequestHandler for Server {
                  }
                  SetRequestMethod::Identity(mut req) => {
                      resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
@@ -105,16 +107,16 @@ index 8ccd544..c58c225 100644
  
                      self.identity_set(*req).await?.into()
                  }
-@@ -502,7 +503,7 @@ impl RequestHandler for Server {
+@@ -553,7 +554,7 @@ impl RequestHandler for Server {
                  }
                  SetRequestMethod::Sieve(mut req) => {
                      resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
 -                    access_token.assert_is_member(req.account_id)?;
 +                    assert_can_administer(self, access_token, req.account_id).await?;
  
-                     self.sieve_script_set(*req, access_token, session)
+                     self.sieve_script_set(*req, access_token, session, using)
                          .await?
-@@ -510,7 +511,7 @@ impl RequestHandler for Server {
+@@ -561,7 +562,7 @@ impl RequestHandler for Server {
                  }
                  SetRequestMethod::VacationResponse(mut req) => {
                      resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
@@ -123,7 +125,7 @@ index 8ccd544..c58c225 100644
  
                      self.vacation_response_set(*req, access_token).await?.into()
                  }
-@@ -574,7 +575,15 @@ impl RequestHandler for Server {
+@@ -629,7 +630,15 @@ impl RequestHandler for Server {
                  }
                  SetRequestMethod::Registry(mut req) => {
                      resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
@@ -140,7 +142,7 @@ index 8ccd544..c58c225 100644
  
                      Box::pin(self.registry_set(
                          method_name.obj.unwrap_registry(),
-@@ -684,7 +693,7 @@ impl RequestHandler for Server {
+@@ -767,7 +776,7 @@ impl RequestHandler for Server {
              }
              RequestMethod::ValidateScript(mut req) => {
                  resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
@@ -149,8 +151,8 @@ index 8ccd544..c58c225 100644
  
                  self.sieve_script_validate(*req, access_token).await?.into()
              }
-@@ -716,6 +725,28 @@ impl RequestHandler for Server {
-     }
+@@ -821,6 +830,28 @@ pub(crate) fn resolve_from_account_id(
+     })
  }
  
 +/// MainThrive patch 0008: `assert_is_member`, or an admin verb's caller that
@@ -179,22 +181,22 @@ index 8ccd544..c58c225 100644
      account_id: &mut Id,
      obj: MethodObject,
 diff --git a/crates/jmap/src/blob/download.rs b/crates/jmap/src/blob/download.rs
-index 741aa9a..845f57f 100644
+index 1c95092..01e7408 100644
 --- a/crates/jmap/src/blob/download.rs
 +++ b/crates/jmap/src/blob/download.rs
-@@ -136,6 +136,15 @@ impl BlobDownload for Server {
-                                         .caused_by(trc::location!())?
-                                         .shared_items(access_token, [Acl::ReadItems], true)
-                                         .contains(*document_id),
-+                                    // MainThrive patch 0008: a script's content, for an admin
-+                                    // verb's caller. No other collection widens.
-+                                    Collection::SieveScript => {
-+                                        access_token.has_permission(Permission::JmapSieveScriptGet)
-+                                            && self
-+                                                .can_administer_account(access_token, *account_id)
-+                                                .await
-+                                                .caused_by(trc::location!())?
-+                                    }
-                                     _ => false,
-                                 }
-                             }
+@@ -307,6 +307,15 @@ impl BlobDownload for Server {
+                                 is_shared_item_readable(&resources, item, access_token)
+                             })
+                         }
++                        // MainThrive patch 0008: a script's content, for an admin verb's caller.
++                        // No other collection widens.
++                        Collection::SieveScript => {
++                            access_token.has_permission(Permission::JmapSieveScriptGet)
++                                && self
++                                    .can_administer_account(access_token, *account_id)
++                                    .await
++                                    .caused_by(trc::location!())?
++                        }
+                         _ => false,
+                     }
+                 }

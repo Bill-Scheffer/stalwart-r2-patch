@@ -1,15 +1,15 @@
 diff --git a/crates/email/src/message/ingest.rs b/crates/email/src/message/ingest.rs
-index 7538ee4..f4f13ac 100644
+index ebdc9aa..1f3a74e 100644
 --- a/crates/email/src/message/ingest.rs
 +++ b/crates/email/src/message/ingest.rs
-@@ -160,6 +160,28 @@ impl EmailIngest for Server {
+@@ -334,6 +334,28 @@ impl EmailIngest for Server {
                  .ctx(trc::Key::Reason, "Failed to parse e-mail message.")
          })?;
  
-+        // Antivirus (common::file_scan): mail written straight into a mailbox (JMAP Email/import, a
-+        // JMAP draft, IMAP APPEND) never passes the SMTP milter, so it is scanned here and refused if
-+        // infected or if it could not be scanned (fail closed). Every source is named, so a new one
-+        // must decide: SMTP mail was scanned by the milter; Restore re-stores our own backups.
++        // MainThrive patch 0005: antivirus (common::file_scan). Mail written straight into a mailbox (JMAP
++        // Email/import, a JMAP draft, IMAP APPEND) never passes the SMTP milter, so it is scanned here and refused if
++        // infected or if it could not be scanned (fail closed). Every source is named, so a new one must decide: SMTP
++        // mail was scanned by the milter; Restore re-stores our own backups.
 +        let scan = match params.source {
 +            IngestSource::Jmap { .. } | IngestSource::Imap { .. } => true,
 +            IngestSource::Smtp { .. } | IngestSource::Restore => false,
@@ -29,47 +29,43 @@ index 7538ee4..f4f13ac 100644
 +        }
 +
          // Obtain message references and thread name
-         let mut message_id = None;
-         let mut message_ids = Vec::new();
+         let fields = ThreadFields::scan(message);
+         let mut thread_result = self
 diff --git a/crates/imap/src/op/append.rs b/crates/imap/src/op/append.rs
-index beadb15..a9c4c8d 100644
+index a752d5d..07b46fb 100644
 --- a/crates/imap/src/op/append.rs
 +++ b/crates/imap/src/op/append.rs
-@@ -154,6 +154,11 @@ impl<T: SessionStream> SessionData<T> {
-                         } else if err.matches(trc::EventType::Limit(trc::LimitEvent::TenantQuota)) {
-                             err.details("Organization disk quota exceeded.")
-                                 .code(ResponseCode::OverQuota)
-+                        } else if err.matches(trc::EventType::MessageIngest(
-+                            trc::MessageIngestEvent::Error,
-+                        )) {
-+                            // A refused message (e.g. malware); its details carry the reason.
-+                            err.code(ResponseCode::Cannot)
-                         } else {
-                             err
-                         }
+@@ -359,6 +359,9 @@ fn append_error(err: trc::Error) -> trc::Error {
+     } else if is_tenant_quota {
+         err.details("Organization disk quota exceeded.")
+             .code(ResponseCode::OverQuota)
++    } else if err.matches(trc::EventType::MessageIngest(trc::MessageIngestEvent::Error)) {
++        // MainThrive patch 0005: a refused message (e.g. malware); its details carry the reason.
++        err.code(ResponseCode::Cannot)
+     } else {
+         err
+     }
 diff --git a/crates/jmap/src/email/set.rs b/crates/jmap/src/email/set.rs
-index 57d245e..8f3c1d3 100644
+index 617028a..b668a83 100644
 --- a/crates/jmap/src/email/set.rs
 +++ b/crates/jmap/src/email/set.rs
-@@ -797,6 +797,21 @@ impl EmailSet for Server {
-                             .with_description("You have exceeded your disk quota."),
-                     );
-                 }
-+                // A refused message (e.g. malware in an attachment), as Email/import answers it.
-+                Err(mut err)
-+                    if err.matches(trc::EventType::MessageIngest(
-+                        trc::MessageIngestEvent::Error,
-+                    )) =>
-+                {
-+                    response.not_created.append(
-+                        id,
-+                        SetError::new(SetErrorType::InvalidEmail).with_description(
-+                            err.take_value(trc::Key::Reason)
-+                                .and_then(|v| v.into_string())
-+                                .unwrap_or_default(),
-+                        ),
-+                    );
-+                }
-                 Err(err) => return Err(err),
+@@ -1800,6 +1800,19 @@ fn record(
+                         .with_description("You have exceeded your account quota."),
+                 );
              }
++            // MainThrive patch 0005: a refused message (e.g. malware in an attachment), as Email/import answers it.
++            Err(mut err)
++                if err.matches(trc::EventType::MessageIngest(trc::MessageIngestEvent::Error)) =>
++            {
++                response.not_created.append(
++                    id,
++                    SetError::new(SetErrorType::InvalidEmail).with_description(
++                        err.take_value(trc::Key::Reason)
++                            .and_then(|v| v.into_string())
++                            .unwrap_or_default(),
++                    ),
++                );
++            }
+             Err(err) => return Err(err),
          }
+     }

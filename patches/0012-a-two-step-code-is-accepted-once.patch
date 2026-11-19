@@ -1,46 +1,46 @@
 diff --git a/crates/common/src/auth/authentication.rs b/crates/common/src/auth/authentication.rs
-index 1ce0829..0294067 100644
+index 3fd8c0a..1995df3 100644
 --- a/crates/common/src/auth/authentication.rs
 +++ b/crates/common/src/auth/authentication.rs
-@@ -205,15 +205,27 @@ impl Server {
-                                 .reason("Password credential not found for account"));
-                         };
+@@ -278,16 +278,27 @@ impl Server {
+                         .reason("Password credential not found for account"));
+                 };
  
--                        match verify_mfa_secret_hash(
-+                        let verification = verify_mfa_secret_hash(
-                             credential.otp_auth.as_deref(),
-                             mfa_token.as_deref(),
-                             credential.secret.as_str(),
-                             secret,
-                         )
--                        .await?
-+                        .await?;
-+                        if let SecretVerificationResult::ValidTotp { step, valid_for } = verification
-+                            && !self.accept_totp_step_once(account_id, step, valid_for).await?
-                         {
--                            SecretVerificationResult::Valid => {
-+                            return Err(trc::AuthEvent::Failed
-+                                .into_err()
-+                                .ctx(trc::Key::AccountName, auth_as_address.to_string())
-+                                .ctx(trc::Key::AccountId, account_id)
-+                                .ctx(trc::Key::SpanId, req.session_id)
-+                                .reason("TOTP code already used"));
-+                        }
+-                match verify_mfa_secret_hash(
++                let verification = verify_mfa_secret_hash(
+                     &self.inner.data.password_verifier,
+                     credential.otp_url.as_deref(),
+                     mfa_token,
+                     credential.secret.as_str(),
+                     secret,
+                 )
+-                .await?
++                .await?;
++                if let SecretVerificationResult::ValidTotp { step, valid_for } = verification
++                    && !self.accept_totp_step_once(account_id, step, valid_for).await?
+                 {
+-                    SecretVerificationResult::Valid => {
++                    return Err(trc::AuthEvent::Failed
++                        .into_err()
++                        .ctx(trc::Key::AccountName, CompactString::from(auth_as_address))
++                        .ctx(trc::Key::AccountId, account_id)
++                        .ctx(trc::Key::SpanId, req.session_id)
++                        .reason("TOTP code already used"));
++                }
 +
-+                        match verification {
-+                            SecretVerificationResult::Valid
-+                            | SecretVerificationResult::ValidTotp { .. } => {
-                                 is_alias_login = account.name != auth_as_local;
-                                 self.access_token(account_id)
-                                     .await
-@@ -582,6 +594,24 @@ impl Server {
++                match verification {
++                    SecretVerificationResult::Valid | SecretVerificationResult::ValidTotp { .. } => {
+                         is_alias_login = account.name != auth_as_local;
+                         self.access_token(account_id)
+                             .await
+@@ -813,6 +824,24 @@ impl Server {
  
          self.get_default_directory()
      }
 +
-+    /// True the first time an account's two-step code for `step` is accepted, false every time after.
-+    /// The mark lives in the in-memory store, which every node shares, and is set atomically (Valkey
-+    /// `SET NX`), so two nodes cannot both accept the same code.
++    /// MainThrive patch 0012: true the first time an account's two-step code for `step` is accepted, false
++    /// every time after. The mark lives in the in-memory store, which every node shares, and is set
++    /// atomically (Valkey `SET NX`), so two nodes cannot both accept the same code.
 +    pub async fn accept_totp_step_once(
 +        &self,
 +        account_id: u32,
@@ -59,55 +59,47 @@ index 1ce0829..0294067 100644
  
  #[derive(Deserialize)]
 diff --git a/crates/common/src/lib.rs b/crates/common/src/lib.rs
-index 16b2c69..03acc84 100644
+index 569e06e..b52369a 100644
 --- a/crates/common/src/lib.rs
 +++ b/crates/common/src/lib.rs
-@@ -128,6 +128,9 @@ pub const KV_LOCK_QUEUE_MESSAGE: u8 = 21;
- pub const KV_LOCK_TASK: u8 = 23;
- pub const KV_LOCK_DAV: u8 = 25;
- pub const KV_SIEVE_ID: u8 = 26;
-+// A two-step code's time step, marked when the code is accepted so it is accepted once (RFC 6238 § 5.2).
-+// Far from upstream's prefixes, so a later upstream one cannot collide with it.
+@@ -166,6 +166,9 @@ pub const KV_LOCK_SEARCH_INDEX: u8 = 17;
+ pub const KV_OAUTH_CIMD: u8 = 18;
+ pub const KV_RATE_LIMIT_CIMD: u8 = 19;
+ pub const KV_KEY_LOOKUP: u8 = 20;
++// MainThrive patch 0012: a two-step code's time step, marked when the code is accepted so it is accepted once
++// (RFC 6238 § 5.2). Far from upstream's prefixes, so a later upstream one cannot collide with it.
 +pub const KV_TOTP_STEP_USED: u8 = 200;
  
  #[derive(Clone)]
  pub struct Server {
 diff --git a/crates/directory/src/core/secret.rs b/crates/directory/src/core/secret.rs
-index f0d2c8f..973f039 100644
+index 79987ea..e16f71f 100644
 --- a/crates/directory/src/core/secret.rs
 +++ b/crates/directory/src/core/secret.rs
-@@ -24,6 +24,10 @@ use totp_rs::Totp;
+@@ -25,6 +25,10 @@ use super::verifier::PasswordVerifier;
  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
  pub enum SecretVerificationResult {
      Valid,
-+    // The password and the two-step code are correct. The caller accepts the code only once: it marks
-+    // `step` used for `valid_for` seconds, the time it can still be accepted (totp-rs leaves this to the
-+    // caller, RFC 6238 § 5.2).
++    // MainThrive patch 0012: the password and the two-step code are correct. The caller accepts the code
++    // only once: it marks `step` used for `valid_for` seconds, the time it can still be accepted (totp-rs
++    // leaves this to the caller, RFC 6238 § 5.2).
 +    ValidTotp { step: u64, valid_for: u64 },
      Invalid,
      MissingMfaToken,
  }
-@@ -36,19 +40,23 @@ pub async fn verify_mfa_secret_hash(
+@@ -38,15 +42,19 @@ pub async fn verify_mfa_secret_hash(
  ) -> trc::Result<SecretVerificationResult> {
      if let Some(totp_uri) = totp_uri {
          if let Some(totp_token) = totp_token {
--            let result = verify_secret_hash(hashed_secret, secret.as_bytes()).await?
+-            let result = verify_secret_hash(verifier, hashed_secret, secret.as_bytes()).await?
 -                && Totp::from_url(totp_uri)
--                    .map_err(|err| {
--                        trc::AuthEvent::Error
--                            .reason(err)
--                            .details(totp_uri.to_string())
--                    })?
+-                    .map_err(|err| trc::AuthEvent::Error.reason(err))?
 -                    .check_current(totp_token)
 -                    .is_some();
 -            Ok(if result {
 -                SecretVerificationResult::Valid
-+            let step = if verify_secret_hash(hashed_secret, secret.as_bytes()).await? {
-+                let totp = Totp::from_url(totp_uri).map_err(|err| {
-+                    trc::AuthEvent::Error
-+                        .reason(err)
-+                        .details(totp_uri.to_string())
-+                })?;
++            let step = if verify_secret_hash(verifier, hashed_secret, secret.as_bytes()).await? {
++                let totp = Totp::from_url(totp_uri).map_err(|err| trc::AuthEvent::Error.reason(err))?;
 +                totp.check_current(totp_token).map(|step| (totp.next_step(0), step))
              } else {
 -                SecretVerificationResult::Invalid
@@ -124,7 +116,7 @@ index f0d2c8f..973f039 100644
          } else if !hashed_secret.is_empty()
              && !secret.is_empty()
 diff --git a/crates/jmap/src/registry/mapping/account.rs b/crates/jmap/src/registry/mapping/account.rs
-index 4a67652..3e04462 100644
+index 390105d..f346c7c 100644
 --- a/crates/jmap/src/registry/mapping/account.rs
 +++ b/crates/jmap/src/registry/mapping/account.rs
 @@ -231,7 +231,7 @@ pub(crate) async fn account_set(
@@ -133,10 +125,10 @@ index 4a67652..3e04462 100644
                              if let Some(current_secret) = account_pass.current_secret {
 -                                match verify_mfa_secret_hash(
 +                                let totp_step = match verify_mfa_secret_hash(
-                                     old_credential.otp_auth.as_deref(),
+                                     &set.server.inner.data.password_verifier,
+                                     old_credential.otp_url.as_deref(),
                                      current_otp_code.as_deref(),
-                                     &old_credential.secret,
-@@ -239,7 +239,10 @@ pub(crate) async fn account_set(
+@@ -240,7 +240,10 @@ pub(crate) async fn account_set(
                                  )
                                  .await?
                                  {
@@ -148,7 +140,7 @@ index 4a67652..3e04462 100644
                                      SecretVerificationResult::Invalid => {
                                          let account = set.server.account(set.account_id).await?;
                                          if set.server.has_auth_fail2ban()
-@@ -280,21 +283,39 @@ pub(crate) async fn account_set(
+@@ -281,21 +284,39 @@ pub(crate) async fn account_set(
                                              );
                                          continue 'outer;
                                      }
@@ -157,8 +149,8 @@ index 4a67652..3e04462 100644
  
 -                                if user_provided_secret != old_credential.secret {
 -                                    if let Err(err) =
-+                                // Checked before the code is marked used, so a refused new password
-+                                // does not spend the code.
++                                // MainThrive patch 0012: checked before the code is marked used, so a
++                                // refused new password does not spend the code.
 +                                if user_provided_secret != old_credential.secret
 +                                    && let Err(err) =
                                          set.server.is_secure_password(user_provided_secret, &[])
@@ -200,3 +192,22 @@ index 4a67652..3e04462 100644
                                      if let Some(expires_at) =
                                          set.server.core.network.security.password_default_expiration
                                      {
+diff --git a/crates/jmap/src/registry/mapping/passkey.rs b/crates/jmap/src/registry/mapping/passkey.rs
+index 1531939..a0afda8 100644
+--- a/crates/jmap/src/registry/mapping/passkey.rs
++++ b/crates/jmap/src/registry/mapping/passkey.rs
+@@ -91,6 +91,14 @@ impl PasskeyRegistrationOptions for Server {
+         .await?
+         {
+             SecretVerificationResult::Valid => {}
++            // MainThrive patch 0012: a two-step code confirms one action, this one included.
++            SecretVerificationResult::ValidTotp { step, valid_for } => {
++                if !self.accept_totp_step_once(account_id, step, valid_for).await? {
++                    return Err(forbidden(
++                        "This two-step code was already used. Wait for the next one.",
++                    ));
++                }
++            }
+             SecretVerificationResult::Invalid => {
+                 return Err(
+                     if self.has_auth_fail2ban()

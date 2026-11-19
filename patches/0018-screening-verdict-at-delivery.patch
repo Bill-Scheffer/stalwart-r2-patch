@@ -1,8 +1,8 @@
 diff --git a/crates/email/src/message/delivery.rs b/crates/email/src/message/delivery.rs
-index 05abc4e..6fad944 100644
+index 36ec9f5..b02da53 100644
 --- a/crates/email/src/message/delivery.rs
 +++ b/crates/email/src/message/delivery.rs
-@@ -177,6 +177,17 @@ impl MailDelivery for Server {
+@@ -212,6 +212,17 @@ impl MailDelivery for Server {
                  rcpt.spam_percentage = Some(rescale_spam_percentage(percentage, level));
              }
  
@@ -20,7 +20,7 @@ index 05abc4e..6fad944 100644
              // Obtain access token
              let status = match self.access_token(account_id).await.and_then(|token| {
                  token
-@@ -342,6 +353,65 @@ async fn spam_level(
+@@ -395,6 +406,65 @@ async fn spam_level(
      level
  }
  
@@ -68,9 +68,9 @@ index 05abc4e..6fad944 100644
 +            message
 +                .headers()
 +                .iter()
-+                .find(|header| header.name.as_str().eq_ignore_ascii_case(SCREEN_HEADER))
++                .find(|header| header.raw_name().eq_ignore_ascii_case(SCREEN_HEADER))
 +                .and_then(|header| {
-+                    raw_message.get(header.offset_start as usize..header.offset_end as usize)
++                    raw_message.get(header.offset_start() as usize..header.offset_end() as usize)
 +                })
 +                .is_some_and(screen_value_is_junk)
 +        })
@@ -87,10 +87,10 @@ index 05abc4e..6fad944 100644
  /// below the level onto 0-49, from it onto 50-100. 0 and 100 are kept, so a definite ham or
  /// spam stays one.
 diff --git a/crates/smtp/src/inbound/data.rs b/crates/smtp/src/inbound/data.rs
-index 94b2c1e..9ba41aa 100644
+index 75cb8e0..53ab2b8 100644
 --- a/crates/smtp/src/inbound/data.rs
 +++ b/crates/smtp/src/inbound/data.rs
-@@ -607,7 +607,7 @@ impl<T: SessionStream> Session<T> {
+@@ -678,7 +678,7 @@ impl<T: SessionStream> Session<T> {
  
          // Run MTA Hooks
          match self
@@ -100,10 +100,10 @@ index 94b2c1e..9ba41aa 100644
          {
              Ok(modifications_) => {
 diff --git a/crates/smtp/src/inbound/ehlo.rs b/crates/smtp/src/inbound/ehlo.rs
-index d82d46b..d486f5e 100644
+index 17cf13e..ab3d09a 100644
 --- a/crates/smtp/src/inbound/ehlo.rs
 +++ b/crates/smtp/src/inbound/ehlo.rs
-@@ -123,7 +123,7 @@ impl<T: SessionStream> Session<T> {
+@@ -109,7 +109,7 @@ impl<T: SessionStream> Session<T> {
              }
  
              // MTAHook filtering
@@ -113,10 +113,10 @@ index d82d46b..d486f5e 100644
                  self.data.helo_domain = prev_helo_domain;
                  self.data.spf_ehlo = None;
 diff --git a/crates/smtp/src/inbound/hooks/message.rs b/crates/smtp/src/inbound/hooks/message.rs
-index eebb470..39cb389 100644
+index 33bcabd..c7f42d6 100644
 --- a/crates/smtp/src/inbound/hooks/message.rs
 +++ b/crates/smtp/src/inbound/hooks/message.rs
-@@ -32,6 +32,7 @@ impl<T: SessionStream> Session<T> {
+@@ -29,6 +29,7 @@ impl<T: SessionStream> Session<T> {
          stage: Stage,
          message: Option<&AuthenticatedMessage<'_>>,
          queue_id: Option<QueueId>,
@@ -124,58 +124,44 @@ index eebb470..39cb389 100644
      ) -> Result<Vec<Modification>, FilterResponse> {
          let mta_hooks = &self.server.core.smtp.session.hooks;
          if mta_hooks.is_empty() {
-@@ -51,7 +52,10 @@ impl<T: SessionStream> Session<T> {
-             }
- 
-             let time = Instant::now();
--            match self.run_mta_hook(stage, mta_hook, message, queue_id).await {
-+            match self
-+                .run_mta_hook(stage, mta_hook, message, queue_id, server_headers)
-+                .await
-+            {
-                 Ok(response) => {
-                     trc::event!(
-                         MtaHook(match response.action {
-@@ -174,6 +178,7 @@ impl<T: SessionStream> Session<T> {
-         mta_hook: &MTAHook,
+@@ -56,7 +57,7 @@ impl<T: SessionStream> Session<T> {
+                 .iter()
+                 .any(|next| next.run_on_stage.contains(&stage));
+             let result = match payload
+-                .get_or_insert_with(|| self.mta_hook_payload(stage, message, queue_id))
++                .get_or_insert_with(|| self.mta_hook_payload(stage, message, queue_id, server_headers))
+             {
+                 Ok(body) if has_next => send_mta_hook_request(mta_hook, body.clone()).await,
+                 Ok(body) => send_mta_hook_request(mta_hook, std::mem::take(body)).await,
+@@ -195,6 +196,7 @@ impl<T: SessionStream> Session<T> {
+         stage: Stage,
          message: Option<&AuthenticatedMessage<'_>>,
          queue_id: Option<QueueId>,
 +        server_headers: &[u8],
-     ) -> Result<Response, String> {
-         // Build request
+     ) -> Result<Vec<u8>, String> {
          let (tls_version, tls_cipher) = self.stream.tls_version_and_cipher();
-@@ -231,17 +236,13 @@ impl<T: SessionStream> Session<T> {
+         let request = Request {
+@@ -256,7 +258,12 @@ impl<T: SessionStream> Session<T> {
+                     .iter()
+                     .map(|(k, v)| (String::from_utf8_lossy(k), String::from_utf8_lossy(v)))
                      .collect(),
-             }),
-             message: message.map(|message| Message {
--                headers: message
--                    .raw_parsed_headers()
--                    .iter()
--                    .map(|(k, v)| {
--                        (
--                            String::from_utf8_lossy(k).into_owned(),
--                            String::from_utf8_lossy(v).into_owned(),
--                        )
--                    })
--                    .collect(),
 -                server_headers: vec![],
-+                headers: header_pairs(message),
-+                // What this server wrote about the message, which its own headers do not carry:
-+                // the trace, authentication results and spam score (MainThrive MAI-1072).
++                // MainThrive patch 0018: what this server wrote about the message, which its own headers do not
++                // carry: the trace, authentication results and spam score (MainThrive MAI-1072).
 +                server_headers: AuthenticatedMessage::parse(server_headers)
 +                    .as_ref()
 +                    .map(header_pairs)
 +                    .unwrap_or_default(),
-                 contents: String::from_utf8_lossy(message.raw_body()).into_owned(),
+                 contents: String::from_utf8_lossy(message.raw_body()),
                  size: message.raw_message().len(),
              }),
-@@ -251,6 +252,19 @@ impl<T: SessionStream> Session<T> {
+@@ -270,6 +277,19 @@ impl<T: SessionStream> Session<T> {
      }
  }
  
 +fn header_pairs(message: &AuthenticatedMessage<'_>) -> Vec<(String, String)> {
 +    message
-+        .raw_parsed_headers()
++        .headers()
 +        .iter()
 +        .map(|(k, v)| {
 +            (
@@ -190,10 +176,10 @@ index eebb470..39cb389 100644
      let mut arguments = String::new();
      for (key, value) in parameters {
 diff --git a/crates/smtp/src/inbound/mail.rs b/crates/smtp/src/inbound/mail.rs
-index 482f191..2fe06a6 100644
+index ce45218..c126a54 100644
 --- a/crates/smtp/src/inbound/mail.rs
 +++ b/crates/smtp/src/inbound/mail.rs
-@@ -194,7 +194,7 @@ impl<T: SessionStream> Session<T> {
+@@ -182,7 +182,7 @@ impl<T: SessionStream> Session<T> {
          }
  
          // MTAHook filtering
@@ -203,10 +189,10 @@ index 482f191..2fe06a6 100644
              return self.write(message.message.as_bytes()).await;
          }
 diff --git a/crates/smtp/src/inbound/rcpt.rs b/crates/smtp/src/inbound/rcpt.rs
-index 1eb25e0..abce2c6 100644
+index 4d47a9c..86d0423 100644
 --- a/crates/smtp/src/inbound/rcpt.rs
 +++ b/crates/smtp/src/inbound/rcpt.rs
-@@ -146,7 +146,7 @@ impl<T: SessionStream> Session<T> {
+@@ -143,7 +143,7 @@ impl<T: SessionStream> Session<T> {
              }
  
              // MTAHook filtering
@@ -216,10 +202,10 @@ index 1eb25e0..abce2c6 100644
                  return self.write(message.message.as_bytes()).await;
              }
 diff --git a/crates/smtp/src/inbound/spawn.rs b/crates/smtp/src/inbound/spawn.rs
-index 7849224..75bf57f 100644
+index d68e923..17b641e 100644
 --- a/crates/smtp/src/inbound/spawn.rs
 +++ b/crates/smtp/src/inbound/spawn.rs
-@@ -104,7 +104,7 @@ impl<T: SessionStream> Session<T> {
+@@ -102,7 +102,7 @@ impl<T: SessionStream> Session<T> {
          }
  
          // MTAHook filtering
