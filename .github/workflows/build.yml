@@ -82,8 +82,8 @@ concurrency:
 
 env:
   # Upstream Stalwart release, pinned by commit: a tag can move, a commit cannot.
-  STALWART_TAG: v1.1.1
-  STALWART_SHA: 3adead91f3c87e7415b58c9ed8e6ec05a5dda521
+  STALWART_TAG: v1.2.1
+  STALWART_SHA: 0b1342eda2eb8a211f44e1d6308cbf9d7ed61aeb
   # The commit of hickory-dns that this release's Cargo.lock names, on stalwartlabs' fork (the same step says why).
   HICKORY_SHA: f8b92b17fa6c7d09a6959672592106ca1410937b
   # The builder's base image (rustc 1.100.0), the digest the v1.1.1 stack was first built and tested with (MAI-1441):
